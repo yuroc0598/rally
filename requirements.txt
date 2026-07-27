@@ -1,0 +1,9 @@
+# Core runtime (Phase-1 pipeline)
+numpy>=1.24
+scipy>=1.10
+opencv-python-headless>=4.8
+
+# System dependency (not pip-installable): ffmpeg + ffprobe on PATH
+
+# Optional — enables the YOLO player-geometry channel:
+#   pip install ultralytics
