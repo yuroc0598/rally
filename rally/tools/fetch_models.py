@@ -99,7 +99,10 @@ def main(argv=None) -> int:
 
     if not args.url and not args.drive_id and not args.verify:
         p.print_help()
-        print("\n[fetch_models] nothing to do: pass --drive-id, --url, or --verify", file=sys.stderr)
+        print("\n[fetch_models] nothing to do: pass --drive-id, --url, or --verify.\n"
+              "  Known TrackNet weights (yastrebksv/TrackNet, unlicensed — personal use):\n"
+              "    python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl",
+              file=sys.stderr)
         return 2
 
     try:

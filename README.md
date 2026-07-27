@@ -35,14 +35,37 @@ Audio is first-class here: the racket impact train is cheap, camera-angle invari
 and highly discriminative — the pipeline produces sensible output from **audio +
 motion alone** when YOLO isn't installed.
 
-## Install
+## Setup
+
+One command installs every dependency **and** fetches the ball-tracking weights, so
+ball-arbiter mode works out of the box:
 
 ```bash
-pip install -r requirements.txt      # numpy, scipy, opencv-python-headless
-# ffmpeg + ffprobe must be on PATH
-# optional player-geometry channel:
-pip install ultralytics
+./setup.sh
 ```
+
+It's idempotent (safe to re-run) and honours `PYTHON=<interpreter>` if you need a specific
+Python. That's all a fresh clone needs — then launch `python -m rally.web.app` or use the CLI.
+
+<details>
+<summary>What setup.sh does / manual steps</summary>
+
+```bash
+pip install -r requirements.txt        # core: numpy, scipy, opencv, bundled ffmpeg, web
+pip install torch gdown ultralytics    # ball-arbiter (torch), weight fetch (gdown), players
+python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl
+```
+
+The TrackNet weights are **not in the repo** (large, externally hosted, and unlicensed —
+`*.pt` is gitignored). They download to `models/tracknet.pt`, which the pipeline
+auto-discovers; the fetch verifies the checkpoint loads into `BallTrackerNet` first. The repo
+still runs without them — ball-arbiter auto-falls-back to the audio-primary detector.
+
+The weights come from `yastrebksv/TrackNet`, which has **no license** — fine for
+personal/research use, but don't redistribute them (that's why they aren't committed or in a
+release). For a durable/shippable setup, host a properly-licensed model at the same
+architecture and set `WEIGHTS_DRIVE_ID` (or `--url`) accordingly.
+</details>
 
 ## Usage
 
