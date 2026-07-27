@@ -75,8 +75,8 @@ Viterbi (duration + transition + audio-bigram) → {SERVE,RALLY} intervals`. Lea
 observations (robust) + structured decoding (interpretable, duration/rhythm-aware).
 
 **Phase-1 implementation in this repo** replaces the learned observation model with a
-rule-based `P(rally)` (`rally/score.py`) and implements the duration-aware segmental
-Viterbi in `rally/segment.py::dp_decode` — the same objective above with the two
+rule-based `P(rally)` (`rally/fusion/score.py`) and implements the duration-aware segmental
+Viterbi in `rally/fusion/decode.py::dp_decode` — the same objective above with the two
 labels RALLY/GAP.
 
 ## (b) Evidence extracted from source papers
@@ -130,6 +130,19 @@ as an ordered event sequence.
 
 - **Phase 1 (this repo):** audio strikes + player-geometry + motion → rule score →
   duration-aware segment decode → ffmpeg cut. No training data.
-- **Phase 2:** ResNet50 court-keypoint homography + TrackNet ball tracking (precision).
+- **Phase 2 (implemented, ball-arbiter):** TrackNet ball tracking as the *arbiter*, not
+  just an end-trimmer. Coarse-to-fine on CPU: the Phase-1 channels propose candidate
+  windows, then per candidate the ball is tracked, the trajectory reconstructed
+  (`signals/trajectory.py`: constant-velocity Kalman + RTS smoother → gap-fill,
+  Mahalanobis outlier gating, per-sample confidence), bounces detected from the
+  vertical-velocity reversal in court metres, and a verdict (`fusion/ball_verify.py`)
+  keeps/rejects and bounds each window (serve start, point-end). Court homography via
+  automatic detection (`signals/court_detect.py`: white-line Hough → outer-corner
+  intersection → homography, scored by court-model reprojection overlap) or manual
+  `court_corners`. On by default (auto court detection too; `--no-ball-arbiter` /
+  `--no-court-auto` to disable), falling back to audio-primary if weights are absent;
+  weights via
+  `rally.tools.fetch_models`. A ResNet50 court-keypoint model can replace the classical
+  detector at the documented hook for perspective-heavy footage.
 - **Phase 3:** labelled data → learned TCN + segment-model classifier; scoreboard OCR
   + scoring automaton to reject warm-up and index points.

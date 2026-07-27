@@ -1,0 +1,43 @@
+import pytest
+
+from rally.tools.fetch_models import _drive_id_from_url, main
+
+FILE_ID = "1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl"
+
+
+@pytest.mark.parametrize("url,expected", [
+    (f"https://drive.google.com/file/d/{FILE_ID}/view?usp=sharing", FILE_ID),
+    (f"https://drive.google.com/uc?id={FILE_ID}", FILE_ID),
+    (f"https://drive.google.com/uc?export=download&id={FILE_ID}", FILE_ID),
+    ("https://example.com/tracknet.pt", None),        # not a drive URL
+    ("https://drive.google.com/drive/folders/abc", None),  # folder, no file id
+])
+def test_drive_id_from_url(url, expected):
+    assert _drive_id_from_url(url) == expected
+
+
+def test_main_no_args_returns_usage_code():
+    assert main([]) == 2      # nothing to do -> usage exit code
+
+
+def test_main_drive_download_routes_through_gdown(monkeypatch, tmp_path):
+    """--drive-id (and a drive URL) route to the gdown path, then verify."""
+    calls = {}
+
+    def fake_drive(file_id, dest):
+        calls["id"] = file_id
+        calls["dest"] = dest
+        open(dest, "wb").close()          # pretend a file arrived
+
+    monkeypatch.setattr("rally.tools.fetch_models._download_drive", fake_drive)
+    monkeypatch.setattr("rally.tools.fetch_models._verify", lambda p: calls.setdefault("verified", p))
+
+    dest = str(tmp_path / "tracknet.pt")
+    rc = main(["--drive-id", FILE_ID, "--dest", dest])
+    assert rc == 0
+    assert calls["id"] == FILE_ID and calls["dest"] == dest and calls["verified"] == dest
+
+    # a drive share URL is parsed to the same id
+    calls.clear()
+    assert main(["--url", f"https://drive.google.com/file/d/{FILE_ID}/view", "--dest", dest]) == 0
+    assert calls["id"] == FILE_ID

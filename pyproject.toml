@@ -16,13 +16,22 @@ dependencies = [
 
 [project.optional-dependencies]
 players = ["ultralytics>=8.0"]
-dev = ["pytest>=7.0"]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+]
+dev = ["pytest>=7.0", "httpx>=0.27"]
 
 [project.scripts]
 rally = "rally.cli:main"
+rally-web = "rally.web.app:main"
 
 [tool.setuptools.packages.find]
 include = ["rally*"]
+
+[tool.setuptools.package-data]
+"rally.web" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

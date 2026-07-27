@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 tests/_scratch/
+tests/_scratch_web/
+
+# web UI runtime data (uploads, outputs, job metadata)
+.rally_web/
 _demo/
 *.mp4
 !tests/fixtures/*.mp4
@@ -22,3 +26,6 @@ samples/slice_output/
 # internal AI review / audit notes (not part of the deliverable)
 feedback.claude
 feedback.muse
+
+# Local Claude Code session/agent state
+.claude/

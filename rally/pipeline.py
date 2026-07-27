@@ -4,7 +4,9 @@
 function below so the flow reads top-to-bottom:
 
     probe -> [audio | visual | ball | pose] channels -> co-decide (fuse)
-          -> derive points -> anchor serves -> trim ball ends
+          -> derive points -> anchor serves
+          -> ball arbiter: validate + bound each candidate   (default; ball_arbiter)
+             OR legacy trim-ball-ends                          (when ball_arbiter off)
           -> drop non-play -> write sidecar + cut
 """
 
@@ -229,6 +231,63 @@ def _anchor_serves(input_path, segments, ch, cfg, progress) -> List[Segment]:
     return segments
 
 
+def _resolve_court(input_path, cfg, progress):
+    """Court homography from (in priority order) manual corners, then auto-detection.
+
+    Returns a :class:`~rally.signals.court.Court` or ``None`` (the arbiter degrades to
+    in-play + bounce-count structure without a court)."""
+    # Explicit manual calibration wins — it's the user's stated intent and the most
+    # reliable; only auto-detect when no corners were given.
+    if cfg.court_corners is not None:
+        from .signals.court import Court
+        return Court.calibrate(*cfg.court_corners)
+    if cfg.court_auto:
+        try:
+            from .signals.court_detect import detect_court
+            court = detect_court(input_path, cfg, progress=progress)
+            if court is not None:
+                progress("  court auto-detected")
+                return court
+            progress("  court auto-detection found no court -> in-play + bounce only")
+        except Exception as exc:  # pragma: no cover
+            progress(f"  court auto-detection error: {exc}")
+    return None
+
+
+def _ball_arbiter(input_path, segments, ch, cfg, progress) -> List[Segment]:
+    """Ball-primary decision: track the ball inside each candidate window and keep only
+    the real rallies, bounded to their serve start / point-end (see fusion.ball_verify)."""
+    if not (cfg.ball_arbiter and segments):
+        return segments
+    from .signals.ball import discover_ball_weights
+    weights = cfg.ball_weights or discover_ball_weights()
+    if not weights:
+        progress("  ball arbiter: no TrackNet weights (set --ball-weights or drop one in "
+                 "models/) -> skipping validation")
+        return segments
+    try:
+        from .fusion.ball_verify import verify_segments
+        court = _resolve_court(input_path, cfg, progress)
+        if court is None:
+            progress("  ball arbiter: no court -> in-play + bounce structure only")
+        progress("ball arbiter: validating candidates by ball trajectory (slow on CPU)")
+        verdict_kwargs = dict(
+            min_speed_px_s=cfg.arbiter_min_speed_px_s, min_conf=cfg.arbiter_min_conf,
+            min_in_play_frac=cfg.arbiter_min_in_play_frac,
+            min_in_play_span_s=cfg.arbiter_min_in_play_span_s,
+            min_bounces=cfg.arbiter_min_bounces, min_rally_s=cfg.min_rally_s,
+            toss_preroll_s=cfg.toss_preroll_s, tail_s=cfg.ball_tail_s,
+        )
+        segments = verify_segments(
+            input_path, segments, court=court, weights_path=weights,
+            pre_pad_s=cfg.arbiter_pre_pad_s, post_pad_s=cfg.arbiter_post_pad_s,
+            max_extend_s=cfg.ball_max_extend_s, verdict_kwargs=verdict_kwargs,
+            progress=progress)
+    except Exception as exc:  # pragma: no cover
+        progress(f"  ball arbiter failed: {exc}")
+    return segments
+
+
 def _trim_ball_ends(input_path, segments, ch, cfg, progress) -> List[Segment]:
     """Opt-in (TrackNet + calibration): trim each rally end to the point-ending bounce."""
     if not (cfg.ball_weights and cfg.court_corners and ch.onsets.size and segments):
@@ -346,7 +405,12 @@ def trim(
     # ---- decide + refine ----------------------------------------------------
     segments = _derive_points(ch, duration, cfg, progress)
     segments = _anchor_serves(input_path, segments, ch, cfg, progress)
-    segments = _trim_ball_ends(input_path, segments, ch, cfg, progress)
+    if cfg.ball_arbiter:
+        # ball-primary: the trajectory validates each candidate and sets its bounds
+        segments = _ball_arbiter(input_path, segments, ch, cfg, progress)
+    else:
+        # audio-primary (legacy): only trim rally ends by the ball, if configured
+        segments = _trim_ball_ends(input_path, segments, ch, cfg, progress)
     segments = _filter_nonplay(segments, cfg, progress)
 
     kept = total_kept_seconds(segments)

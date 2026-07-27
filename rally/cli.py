@@ -60,13 +60,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ball-channel", action="store_true",
                    help="also use ball-in-play as a co-deciding rally channel over the whole "
                         "video (needs --ball-weights + calibration; very slow on CPU)")
+    p.add_argument("--no-ball-arbiter", action="store_true",
+                   help="disable ball-tracking validation (on by default: the ball trajectory "
+                        "validates each candidate as a real rally and sets its serve / point-end. "
+                        "Falls back to the faster audio-primary detector automatically when "
+                        "TrackNet weights / PyTorch aren't installed)")
+    p.add_argument("--no-court-auto", action="store_true",
+                   help="disable automatic court detection (on by default; --court-corners/"
+                        "--calibration override it; turn off if it locks onto the wrong lines)")
     p.add_argument("--player-pose", action="store_true",
                    help="add player pose-activity as a confidence-weighted rally vote "
                         "(YOLOv8-pose over the video; slow on CPU)")
     p.add_argument("--gap", type=float, default=None,
                    help="black delay (seconds) inserted between points (default 0.4)")
     p.add_argument("--serve-preroll", type=float, default=None,
-                   help="lead-in kept before the serve strike / toss (default 1.0)")
+                   help="lead-in kept before the serve strike / toss (sets toss_preroll_s, "
+                        "default 1.0, and serve_preroll_s used on the --no-split path)")
     p.add_argument("--tail", type=float, default=None,
                    help="tail kept after the last strike (ball lands / point ends, default 1.2)")
     p.add_argument("--hysteresis", action="store_true",
@@ -140,6 +149,10 @@ def _config_from_args(args) -> RallyConfig:
         if not args.ball_weights:
             print("[rally] warning: --ball-channel ignored without --ball-weights", file=sys.stderr)
         overrides["ball_channel"] = True
+    if args.no_ball_arbiter:
+        overrides["ball_arbiter"] = False
+    if args.no_court_auto:
+        overrides["court_auto"] = False
     if args.player_pose:
         overrides["player_pose"] = True
     return RallyConfig(**overrides)

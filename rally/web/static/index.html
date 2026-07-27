@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rally — tennis rally trimmer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">▚</span>
+        <div>
+          <h1>Rally</h1>
+          <p id="subtitle">trim a match down to the rallies</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="galleryButton" type="button" class="ghost">Gallery</button>
+        <span id="globalStatus" class="pill">Idle</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- ================= GALLERY ================= -->
+      <section id="galleryView" class="view">
+        <div class="gallery-grid">
+          <form id="uploadForm" class="card upload-card">
+            <h2>New match</h2>
+            <label id="dropzone" class="dropzone">
+              <input id="videoFile" name="file" type="file" accept="video/*" required hidden />
+              <span class="drop-icon">⬆</span>
+              <span id="fileName" class="drop-title">Choose or drop a video</span>
+              <span class="drop-sub">mp4 · mov · mkv · webm</span>
+            </label>
+
+            <!-- The defaults already give the best result (ball-arbiter + auto court).
+                 Everything here is optional and tucked away — a normal user never opens it. -->
+            <details class="advanced">
+              <summary>Advanced options</summary>
+              <p class="advanced-note">Defaults are tuned for best accuracy — you don't need to change anything here.</p>
+              <fieldset class="checks">
+                <label><input id="ballArbiter" type="checkbox" checked /> Ball tracking (accuracy)</label>
+                <label><input id="courtAuto" type="checkbox" checked /> Auto court</label>
+                <label><input id="detectPlayers" type="checkbox" checked /> YOLO players</label>
+                <label><input id="staticCamera" type="checkbox" checked /> Static camera</label>
+                <label><input id="fast" type="checkbox" /> Fast cut</label>
+                <label><input id="hysteresis" type="checkbox" /> Hysteresis</label>
+                <label><input id="noLabels" type="checkbox" /> No labels</label>
+              </fieldset>
+              <div class="number-grid">
+                <label>Analysis FPS<input id="analysisFps" type="number" min="0.5" step="0.5" placeholder="5" /></label>
+                <label>Min rally s<input id="minRally" type="number" min="0" step="0.5" placeholder="2" /></label>
+                <label>Skip intro s<input id="skipIntro" type="number" min="0" step="5" placeholder="0" /></label>
+                <label>Gap s<input id="gap" type="number" min="0" step="0.1" placeholder="0.4" /></label>
+                <label>Serve pre-roll s<input id="servePreroll" type="number" min="0" step="0.1" placeholder="1.8" /></label>
+                <label>Tail s<input id="tail" type="number" min="0" step="0.1" placeholder="1.2" /></label>
+              </div>
+            </details>
+
+            <button id="uploadButton" type="submit" class="primary">Upload &amp; trim</button>
+            <div id="uploadProgress" class="upload-bar hidden">
+              <div class="upload-head"><span id="uploadText">Uploading…</span><span id="uploadPct">0%</span></div>
+              <progress id="uploadBar" max="100" value="0"></progress>
+            </div>
+          </form>
+
+          <div class="gallery-main">
+            <div class="gallery-head">
+              <h2>Matches</h2>
+              <span id="gallerySummary" class="muted">No videos yet</span>
+            </div>
+            <div id="jobGrid" class="job-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= DETAIL ================= -->
+      <section id="detailView" class="view hidden">
+        <div class="detail-bar">
+          <button id="backButton" type="button" class="ghost">← Gallery</button>
+          <div class="detail-title">
+            <h2 id="detailName">Video</h2>
+            <p id="detailMeta" class="muted"></p>
+          </div>
+          <div class="detail-actions">
+            <button id="reprocessButton" type="button" class="ghost">Re-run</button>
+            <a id="dlOutput" class="ghost disabled" download>Output</a>
+            <a id="dlJson" class="ghost disabled" download>JSON</a>
+            <button id="deleteButton" type="button" class="danger-ghost">Delete</button>
+          </div>
+        </div>
+
+        <div class="detail-grid">
+          <aside class="side card">
+            <h3>Progress</h3>
+            <div class="proc-head"><span id="procStage">Waiting</span><span id="procPct">0%</span></div>
+            <progress id="procBar" max="100" value="0"></progress>
+            <p id="procDetail" class="muted small">No active job</p>
+            <div class="metrics">
+              <div><b id="mPoints">0</b><small>rallies</small></div>
+              <div><b id="mKept">0s</b><small>kept</small></div>
+              <div><b id="mRatio">0%</b><small>of match</small></div>
+            </div>
+          </aside>
+
+          <div class="workspace">
+            <div class="videos">
+              <div class="video-tool">
+                <div class="video-head"><h3>Original</h3><span id="origTime" class="mono muted">00:00</span></div>
+                <video id="originalVideo" controls playsinline preload="metadata"></video>
+              </div>
+              <div class="video-tool">
+                <div class="video-head"><h3>Rallies only</h3><span id="outTime" class="mono muted">00:00</span></div>
+                <div class="video-shell">
+                  <video id="outputVideo" controls playsinline preload="metadata"></video>
+                  <div id="outputState" class="video-empty">Output appears after processing</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h3>Timeline</h3>
+                <span class="legend"><i class="sw rally"></i>rally <i class="sw strike"></i>strike <i class="sw head"></i>playhead</span>
+              </div>
+              <canvas id="timeline" height="80"></canvas>
+              <p id="timelineMeta" class="mono muted small"></p>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h3>Rally segments <span id="segCount" class="muted">(0)</span></h3>
+                <div class="seg-actions">
+                  <button id="addSegment" type="button" class="ghost small">+ Add</button>
+                  <button id="revertSegments" type="button" class="ghost small">Revert</button>
+                  <button id="applySegments" type="button" class="primary small" disabled>Apply &amp; re-cut</button>
+                </div>
+              </div>
+              <div class="seg-table-wrap">
+                <table class="seg-table">
+                  <thead><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th></th></tr></thead>
+                  <tbody id="segBody"></tbody>
+                </table>
+              </div>
+              <p class="muted small">Click a row to jump both players there. Edit start/end (seconds) to correct the auto-detection, then <b>Apply &amp; re-cut</b>.</p>
+            </div>
+
+            <!-- ===== labeling ===== -->
+            <div class="card">
+              <div class="card-head">
+                <h3>Labeling</h3>
+                <div class="lab-controls">
+                  <label class="inline">Match
+                    <select id="labMatchType">
+                      <option value="auto">Auto</option>
+                      <option value="singles">Singles</option>
+                      <option value="doubles">Doubles</option>
+                    </select>
+                  </label>
+                  <label class="inline">Count <input id="labCount" type="number" min="2" max="40" value="10" /></label>
+                  <button id="labGenerate" type="button" class="primary small">Generate samples</button>
+                </div>
+              </div>
+              <p id="labStatus" class="muted small">Generate cropped player pictures and short serve clips from this video, then label them below.</p>
+
+              <div id="labWorkspace" class="hidden">
+                <div class="lab-tabs">
+                  <button type="button" class="lab-tab active" data-mode="player_identity">Player ID <span id="labPlayerCount" class="tab-count">0</span></button>
+                  <button type="button" class="lab-tab" data-mode="serve_motion">Serve motion <span id="labServeCount" class="tab-count">0</span></button>
+                  <div class="lab-tab-right">
+                    <span id="labProgress" class="muted small">0 labeled</span>
+                    <a id="labDownload" class="ghost small" download>Export labels</a>
+                  </div>
+                </div>
+
+                <!-- roster editor (players) -->
+                <div id="rosterBox" class="roster-box">
+                  <span class="roster-title">Players (rename as needed):</span>
+                  <div id="rosterList" class="roster-list"></div>
+                </div>
+
+                <div class="lab-body">
+                  <div class="lab-stage">
+                    <div id="labStageMedia" class="lab-media">Pick or generate a sample.</div>
+                    <div class="lab-nav">
+                      <button id="labPrev" type="button" class="ghost small">← Prev</button>
+                      <span id="labWhich" class="mono muted small">0 / 0</span>
+                      <button id="labNext" type="button" class="ghost small">Next →</button>
+                    </div>
+                    <div id="labThumbs" class="lab-thumbs"></div>
+                  </div>
+
+                  <div class="lab-form">
+                    <!-- player form -->
+                    <div id="formPlayer" class="lab-fields">
+                      <label class="fld">Which player? <span class="req">*</span></label>
+                      <div id="playerChoices" class="choice-row"></div>
+                      <label class="fld">Crop quality</label>
+                      <div class="choice-row" data-group="quality">
+                        <button type="button" class="choice" data-k="quality" data-v="clear">Clear</button>
+                        <button type="button" class="choice" data-k="quality" data-v="partial">Partial</button>
+                        <button type="button" class="choice" data-k="quality" data-v="occluded">Occluded</button>
+                        <button type="button" class="choice" data-k="quality" data-v="not_player">Not a player</button>
+                      </div>
+                    </div>
+
+                    <!-- serve form -->
+                    <div id="formServe" class="lab-fields hidden">
+                      <label class="fld">Is this a serve? <span class="req">*</span></label>
+                      <div class="choice-row" data-group="is_serve">
+                        <button type="button" class="choice" data-k="is_serve" data-v="yes">Yes</button>
+                        <button type="button" class="choice" data-k="is_serve" data-v="no">No</button>
+                        <button type="button" class="choice" data-k="is_serve" data-v="unsure">Unsure</button>
+                      </div>
+                      <label class="fld">Who is serving?</label>
+                      <div id="serverChoices" class="choice-row"></div>
+                      <label class="fld">Side</label>
+                      <div class="choice-row" data-group="side">
+                        <button type="button" class="choice" data-k="side" data-v="deuce">Deuce</button>
+                        <button type="button" class="choice" data-k="side" data-v="ad">Ad</button>
+                      </div>
+                      <label class="fld">End</label>
+                      <div class="choice-row" data-group="end">
+                        <button type="button" class="choice" data-k="end" data-v="near">Near</button>
+                        <button type="button" class="choice" data-k="end" data-v="far">Far</button>
+                      </div>
+                      <label class="fld">Serve type</label>
+                      <div class="choice-row" data-group="serve_type">
+                        <button type="button" class="choice" data-k="serve_type" data-v="flat">Flat</button>
+                        <button type="button" class="choice" data-k="serve_type" data-v="slice">Slice</button>
+                        <button type="button" class="choice" data-k="serve_type" data-v="kick">Kick</button>
+                      </div>
+                      <label class="fld">Outcome</label>
+                      <div class="choice-row" data-group="outcome">
+                        <button type="button" class="choice" data-k="outcome" data-v="in">In</button>
+                        <button type="button" class="choice" data-k="outcome" data-v="fault">Fault</button>
+                        <button type="button" class="choice" data-k="outcome" data-v="ace">Ace</button>
+                        <button type="button" class="choice" data-k="outcome" data-v="let">Let</button>
+                      </div>
+                      <label class="fld" for="serveNotes">Notes</label>
+                      <input id="serveNotes" type="text" placeholder="optional" />
+                    </div>
+
+                    <div class="lab-save">
+                      <button id="labSave" type="button" class="ghost small">Save</button>
+                      <button id="labSaveNext" type="button" class="primary small">Save &amp; next</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

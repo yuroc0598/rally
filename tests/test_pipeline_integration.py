@@ -94,7 +94,9 @@ def test_end_to_end(scratch_dir):
     _make_audio(audio)
     _make_video(audio, src)
 
-    cfg = RallyConfig(analysis_fps=5.0, pad_pre_s=0.5, pad_post_s=0.5)
+    # ball_arbiter is on by default but needs TrackNet weights and is CPU-slow; this test
+    # exercises the audio/motion segmentation path, so opt out for speed/determinism.
+    cfg = RallyConfig(analysis_fps=5.0, pad_pre_s=0.5, pad_post_s=0.5, ball_arbiter=False)
     result = trim(src, output_path=out, cfg=cfg, json_path=js, detect_players=False)
 
     # recovered roughly the right amount of play and compressed the video

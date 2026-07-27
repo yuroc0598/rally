@@ -118,6 +118,23 @@ def _decode_heatmap(feature_map_360x640: np.ndarray, prev=None,
     return cands[0]
 
 
+def discover_ball_weights(models_dir: str = "models") -> Optional[str]:
+    """Find a bundled TrackNet checkpoint so ball mode works with no explicit path.
+
+    Looks for ``models/tracknet*.pt`` first (the expected name), then any ``models/*.pt``
+    that isn't a YOLO file. Returns the path or ``None`` if none is present.
+    """
+    import glob
+    import os
+
+    for pat in ("tracknet*.pt", "*tracknet*.pt", "*.pt"):
+        for path in sorted(glob.glob(os.path.join(models_dir, pat))):
+            if "yolo" in os.path.basename(path).lower():
+                continue
+            return path
+    return None
+
+
 def load_ball_model(weights_path: str):
     """Load the 3-frame PyTorch TrackNet once (reuse across segments)."""
     import torch

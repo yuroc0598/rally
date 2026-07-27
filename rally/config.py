@@ -116,6 +116,31 @@ class RallyConfig:
     ball_tail_s: float = 0.8                 # kept after the point-ending bounce
     ball_max_extend_s: float = 3.0           # how far past the current end to look
 
+    # ---- ball-as-arbiter (SwingVision-style; needs TrackNet weights; court optional) --
+    # The cheap channels only *propose* candidate windows; the ball trajectory then decides
+    # which are real rallies and sets each one's serve start / point-end. On CPU we track
+    # only inside candidates (padded), so this stays affordable. Court homography (manual
+    # court_corners or court_auto) unlocks net-crossing / in-out geometry; without it the
+    # verdict leans on in-play span + bounce count alone.
+    # On by default — it's the most accurate path (the whole point of the ball-arbiter
+    # work). It degrades gracefully: if PyTorch or the TrackNet weights aren't present,
+    # the pipeline logs a note and falls back to the audio-primary detector automatically,
+    # so the user never has to think about it. Disable only to force the fast/audio path.
+    ball_arbiter: bool = True
+    # On by default: when the ball arbiter runs, auto-detecting the court is cheap next to
+    # ball tracking and only adds signal (net crossings / in-out); it falls back to
+    # no-court if it can't find one confidently. Manual court_corners, if given, take
+    # precedence. Disable only if the detector locks onto the wrong lines.
+    court_auto: bool = True                    # auto-detect the court homography
+    court_weights: Optional[str] = None       # reserved: future court-keypoint model (not yet implemented; classical is used)
+    arbiter_pre_pad_s: float = 2.0            # track this far before each candidate (catch the serve)
+    arbiter_post_pad_s: float = 2.0           # track this far after (catch the point end)
+    arbiter_min_speed_px_s: float = 25.0      # image speed above which the ball counts as "live"
+    arbiter_min_conf: float = 0.3             # trajectory confidence required to trust a sample
+    arbiter_min_in_play_frac: float = 0.35    # fraction of the window the ball must be live
+    arbiter_min_in_play_span_s: float = 1.5   # live-ball span required for a real rally
+    arbiter_min_bounces: int = 2              # bounces that stand in for a net crossing (no court)
+
     # ---- non-play exclusion -------------------------------------------------
     drop_isolated: bool = True         # drop points with no neighbouring point nearby
     isolation_gap_s: float = 120.0     # "nearby" window; a lone point beyond this is likely non-match

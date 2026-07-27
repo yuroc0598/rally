@@ -44,6 +44,20 @@ class Court:
         H = cv2.getPerspectiveTransform(img, court)
         return cls(H_img2court=H, H_court2img=np.linalg.inv(H), corners_img=img)
 
+    @classmethod
+    def from_image_corners(cls, near_left, near_right, far_right, far_left) -> "Court":
+        """Calibrate from all four DOUBLES court corners in the image (near & far visible).
+
+        Used by automatic court detection, which recovers the outer court quadrilateral
+        directly. Maps the four image corners to the court-model doubles corners
+        (0,0)-(W,0)-(W,L)-(0,L)."""
+        import cv2
+        img = np.array([near_left, near_right, far_right, far_left], dtype=np.float32)
+        court = np.array([[0, 0], [DOUBLES_W, 0], [DOUBLES_W, COURT_L], [0, COURT_L]],
+                         dtype=np.float32)
+        H = cv2.getPerspectiveTransform(img, court)
+        return cls(H_img2court=H, H_court2img=np.linalg.inv(H), corners_img=img)
+
     def to_court(self, pts_img: np.ndarray) -> np.ndarray:
         pts = np.asarray(pts_img, dtype=float).reshape(-1, 1, 2)
         import cv2
