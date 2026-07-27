@@ -1,25 +1,71 @@
-"""Thin wrappers over the system ffmpeg / ffprobe binaries.
+"""Thin wrappers over the ffmpeg / ffprobe binaries.
 
-Only the system binaries are required for the audio + cut path; numpy/OpenCV cover
-the rest. Everything shells out so there is no hard dependency on pyav/moviepy.
+Binary resolution (see :func:`_require`), in order:
+  1. an explicit override — ``$RALLY_FFMPEG`` / ``$RALLY_FFPROBE``;
+  2. the bundled ``static-ffmpeg`` binaries (a declared dependency) — reproducible and
+     requires no system install, so ``pip install -r requirements.txt`` just works;
+  3. a working system ``ffmpeg``/``ffprobe`` on PATH.
+
+Static is preferred over PATH deliberately: some environments ship an ffmpeg *wrapper*
+on PATH that answers ``-version`` but fails on real multi-path work, and the bundled
+binaries sidestep that. Set ``$RALLY_FFMPEG``/``$RALLY_FFPROBE`` to force your own build.
+Everything shells out, so there is no hard dependency on pyav/moviepy.
 """
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 
+def _runs(path: Optional[str]) -> bool:
+    """True if ``path -version`` actually executes (guards against broken PATH shims)."""
+    if not path:
+        return False
+    try:
+        subprocess.run([path, "-version"], capture_output=True, timeout=30, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _static_binary(binary: str) -> Optional[str]:
+    try:
+        from static_ffmpeg import run as _sf
+
+        ffmpeg_path, ffprobe_path = _sf.get_or_fetch_platform_executables_else_raise()
+        return {"ffmpeg": ffmpeg_path, "ffprobe": ffprobe_path}[binary]
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=None)
 def _require(binary: str) -> str:
+    """Resolve 'ffmpeg'/'ffprobe' to a working executable, cached for the process."""
+    override = os.environ.get(f"RALLY_{binary.upper()}")
+    if _runs(override):
+        return override  # type: ignore[return-value]
+
+    static = _static_binary(binary)
+    if _runs(static):
+        return static  # type: ignore[return-value]
+
     path = shutil.which(binary)
-    if path is None:
-        raise RuntimeError(f"'{binary}' not found on PATH — install ffmpeg")
-    return path
+    if _runs(path):
+        return path  # type: ignore[return-value]
+
+    raise RuntimeError(
+        f"'{binary}' is unavailable: no working binary from $RALLY_{binary.upper()}, "
+        f"static-ffmpeg, or PATH. Run `pip install static-ffmpeg` (or install ffmpeg), "
+        f"or set $RALLY_{binary.upper()} to a working binary."
+    )
 
 
 @dataclass

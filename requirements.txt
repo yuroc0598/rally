@@ -3,7 +3,11 @@ numpy>=1.24
 scipy>=1.10
 opencv-python-headless>=4.8
 
-# System dependency (not pip-installable): ffmpeg + ffprobe on PATH
+# ffmpeg + ffprobe. A system install is used if present; otherwise these bundled
+# static binaries are used automatically (see rally/io/ffmpeg.py). Either works.
+static-ffmpeg>=2.5
 
-# Optional — enables the YOLO player-geometry channel:
+# Optional — enables the YOLO player-geometry / pose channels:
 #   pip install ultralytics
+# Optional — enables the TrackNet ball-tracking channel:
+#   pip install torch
