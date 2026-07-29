@@ -8,7 +8,8 @@ the far lines aren't visible.
 
 Court model (metres), origin at the near-left DOUBLES corner, x across, y toward far end:
     near-left (0,0)  near-right (10.97,0)  far-right (10.97,23.77)  far-left (0,23.77)
-Singles sidelines are at x=1.37 and x=9.60; service line at y=5.03 and y=18.74; net y=11.885.
+Singles sidelines are at x=1.37 and x=9.60; service lines are at y=5.4864 and
+y=18.2836; net y=11.885.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import numpy as np
 DOUBLES_W = 10.97
 COURT_L = 23.77
 SINGLES_IN = 1.37          # singles sideline inset from doubles line
-SERVICE_Y = 5.03           # near service line (from near baseline)
+SERVICE_Y = 5.4864         # 18 ft: service line distance from each baseline
 NET_Y = COURT_L / 2.0
 
 

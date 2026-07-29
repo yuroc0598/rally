@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rally — tennis rally trimmer</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260728-ui6" />
   </head>
   <body>
     <header class="topbar">
@@ -28,19 +28,19 @@
           <form id="uploadForm" class="card upload-card">
             <h2>New match</h2>
             <label id="dropzone" class="dropzone">
-              <input id="videoFile" name="file" type="file" accept="video/*" required hidden />
+              <input id="videoFile" name="file" type="file" accept="video/*" multiple hidden />
               <span class="drop-icon">⬆</span>
-              <span id="fileName" class="drop-title">Choose or drop a video</span>
+              <span id="fileName" class="drop-title">Choose or drop videos</span>
               <span class="drop-sub">mp4 · mov · mkv · webm</span>
             </label>
 
-            <!-- The defaults already give the best result (ball-arbiter + auto court).
-                 Everything here is optional and tucked away — a normal user never opens it. -->
+            <!-- The defaults select the fullest available path (ball-arbiter + auto court).
+                 Everything here is optional and tucked away. -->
             <details class="advanced">
               <summary>Advanced options</summary>
-              <p class="advanced-note">Defaults are tuned for best accuracy — you don't need to change anything here.</p>
+              <p class="advanced-note">Defaults use the fullest available analysis path; verify results in the review screen.</p>
               <fieldset class="checks">
-                <label><input id="ballArbiter" type="checkbox" checked /> Ball tracking (accuracy)</label>
+                <label><input id="ballArbiter" type="checkbox" checked /> Ball tracking</label>
                 <label><input id="courtAuto" type="checkbox" checked /> Auto court</label>
                 <label><input id="detectPlayers" type="checkbox" checked /> YOLO players</label>
                 <label><input id="staticCamera" type="checkbox" checked /> Static camera</label>
@@ -49,12 +49,21 @@
                 <label><input id="noLabels" type="checkbox" /> No labels</label>
               </fieldset>
               <div class="number-grid">
+                <label>Play type
+                  <select id="playMode">
+                    <option value="auto" selected>Auto (match-aware)</option>
+                    <option value="match">Match</option>
+                    <option value="casual">Casual rally</option>
+                  </select>
+                </label>
                 <label>Analysis FPS<input id="analysisFps" type="number" min="0.5" step="0.5" placeholder="5" /></label>
                 <label>Min rally s<input id="minRally" type="number" min="0" step="0.5" placeholder="2" /></label>
                 <label>Skip intro s<input id="skipIntro" type="number" min="0" step="5" placeholder="0" /></label>
-                <label>Gap s<input id="gap" type="number" min="0" step="0.1" placeholder="0.4" /></label>
+                <label>Black gap s<input id="gap" type="number" min="0" step="0.1" placeholder="0 (off)" /></label>
+                <label>Output pre-roll s<input id="startBuffer" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
+                <label>Output post-roll s<input id="endBuffer" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
                 <label>Serve pre-roll s<input id="servePreroll" type="number" min="0" step="0.1" placeholder="1.8" /></label>
-                <label>Tail s<input id="tail" type="number" min="0" step="0.1" placeholder="1.2" /></label>
+                <label>Detection tail s<input id="tail" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
               </div>
             </details>
 
@@ -97,6 +106,7 @@
             <div class="proc-head"><span id="procStage">Waiting</span><span id="procPct">0%</span></div>
             <progress id="procBar" max="100" value="0"></progress>
             <p id="procDetail" class="muted small">No active job</p>
+            <button id="stopProcessingButton" type="button" class="danger-ghost stop-processing hidden">Stop processing</button>
             <div class="metrics">
               <div><b id="mPoints">0</b><small>rallies</small></div>
               <div><b id="mKept">0s</b><small>kept</small></div>
@@ -105,17 +115,41 @@
           </aside>
 
           <div class="workspace">
-            <div class="videos">
-              <div class="video-tool">
-                <div class="video-head"><h3>Original</h3><span id="origTime" class="mono muted">00:00</span></div>
-                <video id="originalVideo" controls playsinline preload="metadata"></video>
-              </div>
-              <div class="video-tool">
-                <div class="video-head"><h3>Rallies only</h3><span id="outTime" class="mono muted">00:00</span></div>
-                <div class="video-shell">
-                  <video id="outputVideo" controls playsinline preload="metadata"></video>
-                  <div id="outputState" class="video-empty">Output appears after processing</div>
+            <div class="video-tabs" role="tablist" aria-label="Video source">
+              <button id="processedTab" class="video-tab active" type="button" role="tab" aria-selected="true" aria-controls="processedPanel">Processed</button>
+              <button id="originalTab" class="video-tab" type="button" role="tab" aria-selected="false" aria-controls="originalPanel">Original</button>
+            </div>
+            <div id="processedPanel" class="video-panel" role="tabpanel" aria-labelledby="processedTab">
+              <div class="video-tool video-main">
+                <div class="video-head">
+                  <h3>Rallies only</h3>
+                  <span><span id="currentPoint" class="point-readout">Point —</span><span id="outTime" class="mono muted">00:00</span></span>
                 </div>
+                <div class="video-shell interactive-player">
+                  <video id="outputVideo" controls playsinline preload="metadata"></video>
+                  <div id="ballSpeed" class="ball-speed" title="Approximate court-plane peak speed for this point">Ball speed —</div>
+                  <div id="playerHitLayer" class="player-hit-layer" aria-label="Video gestures">
+                    <button id="previousPointZone" type="button" aria-label="Double-click for previous point" title="Double-click: previous point"></button>
+                    <button id="nextPointZone" type="button" aria-label="Double-click for next point" title="Double-click: next point"></button>
+                  </div>
+                  <div id="outputState" class="video-empty">
+                    <img id="processingPreview" class="processing-preview hidden" alt="Original video preview" />
+                    <div class="processing-scrim"></div>
+                    <div class="processing-overlay">
+                      <span id="processingStatus" class="processing-status">Preparing video</span>
+                      <strong id="processingPercent" class="processing-percent">0%</strong>
+                      <progress id="processingBar" class="processing-bar" max="100" value="0"></progress>
+                      <span id="processingElapsed" class="processing-elapsed">Elapsed 00:00</span>
+                    </div>
+                  </div>
+                </div>
+                <p class="player-hint">Double-click the left or right side for the previous or next point.</p>
+              </div>
+            </div>
+            <div id="originalPanel" class="video-panel hidden" role="tabpanel" aria-labelledby="originalTab">
+              <div class="video-tool">
+                <div class="video-head"><h3>Original recording</h3><span id="origTime" class="mono muted">00:00</span></div>
+                <video id="originalVideo" controls playsinline preload="metadata"></video>
               </div>
             </div>
 
@@ -163,6 +197,7 @@
                 </div>
               </div>
               <p id="labStatus" class="muted small">Generate cropped player pictures and short serve clips from this video, then label them below.</p>
+              <p class="muted small">Answers are saved automatically with this job and can be exported. They are training data; the current analyzer does not retrain itself automatically.</p>
 
               <div id="labWorkspace" class="hidden">
                 <div class="lab-tabs">
@@ -256,6 +291,6 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260728-ui6"></script>
   </body>
 </html>

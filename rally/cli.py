@@ -28,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--static-camera", action="store_true",
                    help="preset for fixed-tripod footage where motion is uninformative: "
                         "up-weight audio and widen the strike-rhythm window (improves recall)")
+    p.add_argument("--play-mode", choices=("auto", "match", "casual"), default="auto",
+                   help="tennis sequence rules: auto detects match-like runs, match enables "
+                        "them explicitly, casual disables serve-side validation")
     p.add_argument("--no-players", action="store_true", help="disable YOLO player-geometry channel")
 
     p.add_argument("--no-labels", action="store_true", help="do not draw 'Point N' labels")
@@ -59,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(trim rally ends at the double-bounce / out; needs calibration, slow on CPU)")
     p.add_argument("--ball-channel", action="store_true",
                    help="also use ball-in-play as a co-deciding rally channel over the whole "
-                        "video (needs --ball-weights + calibration; very slow on CPU)")
+                        "video (needs --ball-weights; very slow on CPU)")
     p.add_argument("--no-ball-arbiter", action="store_true",
                    help="disable ball-tracking validation (on by default: the ball trajectory "
                         "validates each candidate as a real rally and sets its serve / point-end. "
@@ -68,28 +71,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-court-auto", action="store_true",
                    help="disable automatic court detection (on by default; --court-corners/"
                         "--calibration override it; turn off if it locks onto the wrong lines)")
+    p.add_argument("--require-serve-evidence", action="store_true",
+                   help="precision mode: ball-validated candidates also need an audio strike near serve start")
     p.add_argument("--player-pose", action="store_true",
                    help="add player pose-activity as a confidence-weighted rally vote "
                         "(YOLOv8-pose over the video; slow on CPU)")
     p.add_argument("--gap", type=float, default=None,
-                   help="black delay (seconds) inserted between points (default 0.4)")
+                   help="optional black delay between points (default 0; normally leave off)")
+    p.add_argument("--start-buffer", type=float, default=None,
+                   help="real source footage before each detected point start (default 1.0; max 1.0)")
+    p.add_argument("--end-buffer", type=float, default=None,
+                   help="real source footage after each detected point end (default 1.0; max 1.0)")
     p.add_argument("--serve-preroll", type=float, default=None,
                    help="lead-in kept before the serve strike / toss (sets toss_preroll_s, "
                         "default 1.0, and serve_preroll_s used on the --no-split path)")
     p.add_argument("--tail", type=float, default=None,
-                   help="tail kept after the last strike (ball lands / point ends, default 1.2)")
+                   help="real-footage tail after the last strike / point-end cue (default 1.0)")
     p.add_argument("--hysteresis", action="store_true",
                    help="use the simple hysteresis decoder instead of the duration-aware one")
     p.add_argument("--fast", action="store_true",
-                   help="stream-copy cut (fast, keyframe-aligned) instead of frame-accurate re-encode")
+                   help="stream-copy cut (fast, keyframe-aligned; labels/gaps are omitted)")
+    p.add_argument("--allow-degraded", action="store_true",
+                   help="continue after an enabled analysis stage fails; the sidecar records failures")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
     return p
 
 
 def _config_from_args(args) -> RallyConfig:
-    overrides = {}
+    overrides = {"play_mode": args.play_mode}
     if args.static_camera:
-        overrides.update(w_audio=0.7, w_motion=0.1, rhythm_window_s=5.0)
+        # Far-court impacts are quieter in fixed baseline recordings. A slightly lower
+        # local SNR gate recovers short serve/return points without weakening the general
+        # preset used for noisier handheld footage.
+        overrides.update(
+            w_audio=0.7, w_motion=0.1, rhythm_window_s=5.0,
+            strike_snr_ratio=5.5,
+        )
     if args.analysis_fps is not None:
         overrides["analysis_fps"] = args.analysis_fps
     if args.min_rally is not None:
@@ -102,6 +119,8 @@ def _config_from_args(args) -> RallyConfig:
         overrides["use_dp_decoder"] = False
     if args.fast:
         overrides["reencode"] = False
+    if args.allow_degraded:
+        overrides["allow_degraded"] = True
     if args.no_labels:
         overrides["label_points"] = False
     if args.no_snap_serve:
@@ -114,6 +133,10 @@ def _config_from_args(args) -> RallyConfig:
         overrides["move_thresh"] = args.move_thresh
     if args.gap is not None:
         overrides["inter_point_gap_s"] = args.gap
+    if args.start_buffer is not None:
+        overrides["point_start_buffer_s"] = args.start_buffer
+    if args.end_buffer is not None:
+        overrides["point_end_buffer_s"] = args.end_buffer
     if args.serve_preroll is not None:
         overrides["serve_preroll_s"] = args.serve_preroll
         overrides["toss_preroll_s"] = args.serve_preroll
@@ -153,6 +176,8 @@ def _config_from_args(args) -> RallyConfig:
         overrides["ball_arbiter"] = False
     if args.no_court_auto:
         overrides["court_auto"] = False
+    if args.require_serve_evidence:
+        overrides["arbiter_require_serve_evidence"] = True
     if args.player_pose:
         overrides["player_pose"] = True
     return RallyConfig(**overrides)

@@ -21,7 +21,7 @@ models/*.h5
 .ffbin/
 
 # generated run outputs (JSON sidecars, logs, batch script; .mp4 already ignored)
-samples/slice_output/
+samples/
 
 # internal AI review / audit notes (not part of the deliverable)
 feedback.claude

@@ -1,7 +1,7 @@
 # rally
 
-Trim a long, unedited tennis match recording (2–3 h, fixed single camera) down to a
-short video containing **only the rallies** — dropping warm-up, changeovers, ball
+Aim to trim a long, unedited tennis match recording (2–3 h, fixed single camera) down to a
+short video containing the rallies while dropping warm-up, changeovers, ball
 retrieval, chatting, and other dead time. Same end result as SwingVision's
 rally-only export, built from open components.
 
@@ -32,13 +32,13 @@ so we fuse them:
 | **Geometry** | exactly two players, on court, opposed across the net | YOLO person detection + court-region filter (`signals/player.py`, optional) |
 
 Audio is first-class here: the racket impact train is cheap, camera-angle invariant,
-and highly discriminative — the pipeline produces sensible output from **audio +
-motion alone** when YOLO isn't installed.
+and highly discriminative. Without TrackNet, the fallback is intentionally conservative:
+supporting motion/geometry cues are never rescaled into certainty when audio is absent.
 
 ## Setup
 
-One command installs every dependency **and** fetches the ball-tracking weights, so
-ball-arbiter mode works out of the box:
+One command installs every headless-compatible runtime dependency **and** fetches the
+ball-tracking weights, so ball-arbiter mode works out of the box:
 
 ```bash
 ./setup.sh
@@ -51,8 +51,7 @@ Python. That's all a fresh clone needs — then launch `python -m rally.web.app`
 <summary>What setup.sh does / manual steps</summary>
 
 ```bash
-pip install -r requirements.txt        # core: numpy, scipy, opencv, bundled ffmpeg, web
-pip install torch gdown ultralytics    # ball-arbiter (torch), weight fetch (gdown), players
+pip install -r requirements.txt        # core + ball-arbiter + web, using headless OpenCV
 python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl
 ```
 
@@ -77,12 +76,17 @@ python -m rally.cli match.mp4 -o rallies.mp4 --json rallies.json
 python -m rally.cli match.mp4 --json rallies.json
 
 # faster, keyframe-aligned cut instead of frame-accurate re-encode
+# (burned labels and inter-point gaps are omitted because they require re-encoding)
 python -m rally.cli match.mp4 -o rallies.mp4 --fast
 
 # tuning
 python -m rally.cli match.mp4 -o out.mp4 \
     --analysis-fps 5 --min-rally 2.5 --pad-pre 1 --pad-post 1.5 \
     --no-players --hysteresis
+
+# match rules are auto-detected by default; disable serve-side/setup validation for
+# unconstrained practice hitting
+python -m rally.cli practice.mp4 -o rallies.mp4 --play-mode casual
 
 # ball-primary (SwingVision-style) is the DEFAULT: the ball trajectory validates each
 # candidate as a real rally and sets its serve start / point-end. Just install weights once:
@@ -102,13 +106,22 @@ then the **ball trajectory decides**. If TrackNet weights / PyTorch aren't insta
 falls back automatically to the audio-primary path, so nothing to configure. Inside each
 candidate the ball is tracked (TrackNet), the track is reconstructed
 with a Kalman+RTS smoother (`signals/trajectory.py` — gap-fill, outlier-reject, per-sample
-confidence), bounces are found from the vertical-velocity reversal in court coordinates, and
-a verdict (`fusion/ball_verify.py`) keeps only windows with a genuine live ball + rally
-structure (net crossing / bounces), snapping each to its serve start and point-ending
-bounce. This rejects warm-up and audio false positives that the audio-primary path keeps.
+confidence), bounce candidates require a measured 2-D velocity-vector turn, and a verdict
+(`fusion/ball_verify.py`) evaluates one continuous live component with gap-aware net
+crossings/bounces. Candidate padding is used only for boundary recovery, not as negative
+classification evidence. The verdict is tri-state: reliable structure accepts, reliable
+contradiction rejects, and fragmented/low-coverage tracking is indeterminate. Only
+cadence-coherent audio points survive an indeterminate or workload-omitted candidate; weak
+one-off proposals do not. Per-candidate coverage, components, reason codes, and decisions are
+stored in the sidecar. This rejects many audio/blob false positives, but ball motion alone
+cannot prove match play: cooperative warm-up can still look identical. Use
+`--require-serve-evidence` for a higher-precision audio+ball gate (with a recall tradeoff).
 
-On **CPU** the ball is tracked only inside candidate windows (not the whole video), which is
-the only tractable option — full-video tracking is ~0.3 s/frame. A court homography (auto
+Audio is decoded in bounded chunks rather than buffered for the entire match. On **CPU** the
+ball is tracked only inside candidate windows (not the whole video), which is
+the only tractable option — full-video tracking is ~0.3 s/frame. Candidate work is ranked by
+audio coherence/strike support with temporal diversity and capped by the padded union actually
+tracked; coherent omitted intervals use the same conservative fallback. A court homography (auto
 classical detection, **on by default**; or manual `--court-corners`, which takes precedence)
 unlocks net-crossing and in/out geometry; without one the verdict falls back to in-play span
 + bounce count. Disable auto-detection with `--no-court-auto` if it misfires.
@@ -128,24 +141,26 @@ print(result.segments, result.compression_ratio)
 
 A browser front-end for the same pipeline lives in `rally/web` (a thin FastAPI
 layer — the core `rally` package is used unchanged). Upload a match, watch it
-process live, review the trimmed cut next to the original, correct the detected
-rallies by hand, and re-export.
+process live, review the trimmed cut in the main player, open the original from
+its secondary tab, correct the detected rallies by hand, and re-export.
 
 ```bash
-python3 -m pip install -r requirements.txt     # fastapi, uvicorn, python-multipart
+python3 -m pip install -r requirements.txt     # core + ball + web dependencies
 python3 -m rally.web                            # or: rally-web  -> http://127.0.0.1:8000
 python3 -m rally.web --port 9000 --data-dir /tmp/rally_jobs   # options
 ```
 
 What it does:
 
-- **Upload & go** — drag-drop a video; the accurate defaults (ball tracking + auto
-  court) need no configuration. An **Advanced** section exposes a subset of the CLI knobs
+- **Upload & go** — drag-drop a video; the default trajectory path (ball tracking + auto
+  court) needs no configuration when its external weights are available. An **Advanced** section exposes a subset of the CLI knobs
   (ball-arbiter/auto-court/YOLO on-off, static-camera preset, fast cut, hysteresis,
   min-rally, …). Processing runs in a background worker with **live progress**.
-- **Review** — the original and the rallies-only cut play side by side, with a
-  **timeline** showing every detected rally band and ball-strike, and a
-  click-to-seek playhead.
+- **Review** — the processed cut is the primary player and the original is lazy-loaded in
+  a secondary tab. Double-click the left/right sides to move between points. A top-right
+  overlay shows approximate calibrated ball speed when
+  reliable court/trajectory evidence exists (otherwise it says unavailable). The
+  **timeline** shows every detected rally band and ball-strike with a click-to-seek playhead.
 - **Correct & re-export** — an editable segment table lets you nudge start/end
   times, add, or drop rallies, then **re-cut** the output from your edits.
 - **Download** the trimmed `rallies.mp4` and the `rallies.json` sidecar; manage a
@@ -168,17 +183,19 @@ server produces two kinds of raw data (in a background worker):
 
 Labels autosave to the server (`←/→` to move, `Enter` to save & advance) and
 **Export labels** downloads a self-describing JSON bundle (roster + tasks +
-labels). YOLO is only needed for the player crops; the first run downloads
-`yolov8n.pt` (or point `RALLY_WEB_YOLO` at an existing weight).
+labels). The server setup retains Ultralytics while pinning `cv2` to the headless OpenCV
+wheel, so player geometry, serve-setup validation, and crops work without GUI libraries.
+`RALLY_WEB_YOLO` may point at an existing weight file.
 
 Each job is a self-contained directory under the data dir (default `.rally_web/`,
-override with `--data-dir` or `RALLY_WEB_DATA`); set `RALLY_WEB_WORKERS` to run
-more than one trim concurrently. Video export needs `ffmpeg` on `PATH`; if a
+override with `--data-dir` or `RALLY_WEB_DATA`). The server automatically runs up to four
+trims concurrently, sized from CPU capacity and currently free CUDA memory; set
+`RALLY_WEB_WORKERS` to override that choice. Video export needs `ffmpeg` on `PATH`; if a
 label/`drawtext` render isn't available it falls back to a plain cut, and the
 JSON analysis is always produced regardless.
 
-Run the web tests (unit + one end-to-end upload→process→edit cycle) with
-`pytest tests/test_web.py`.
+The web regression checks can be run with `pytest tests/test_web.py`; they are not an
+accuracy benchmark.
 
 ## The decoder (part (a) of the design)
 
@@ -196,17 +213,27 @@ Run the web tests (unit + one end-to-end upload→process→edit cycle) with
 Tuning bias: prefer **recall** (a couple of extra seconds of dead time is far more
 forgivable than a missing point). The defaults reflect that.
 
+Audio-only attachment of an isolated pre-cluster sound as a serve is disabled by default:
+without court/trajectory confirmation it can mistake a bounce, speech consonant, or prior-point
+sound for a serve and retain walking/reset footage. The rendered cut instead keeps a bounded
+one-second real-footage pre-roll around every detected point.
+
 ## Configuration
 
 All thresholds live in `rally/config.py` (`RallyConfig`). Notable knobs: analysis and
 player frame rates, audio strike band / sensitivity / SNR gate, channel weights,
 hysteresis thresholds, duration priors, padding, and re-encode vs stream-copy.
 
-## Tests
+## Regression checks and independent evaluation
 
 ```bash
 pytest -q
 ```
+
+These author-written synthetic checks only guard implementation invariants; they do not
+validate real-world detection accuracy. Follow [`EVALUATION.md`](EVALUATION.md) and use
+`rally-evaluate predicted.json independently_labeled_gold.json` for a sealed real-video
+holdout. No accuracy claim should be inferred from the repository test result.
 
 - `test_decode.py`, `test_score.py`, `test_audio.py`, `test_players.py` — pure-logic
   unit tests (no video needed).
@@ -220,9 +247,9 @@ pytest -q
 - **Court region is heuristic** in the default channels (percentiles of where feet
   cluster); the ball-arbiter path replaces this with a real homography (auto-detected by
   default, or manual `--court-corners`).
-- **Warm-up looks like a rally** to the audio-primary path; the ball-arbiter rejects
-  most of it (no serve / no point-end structure), but without a scoreboard reader some
-  cooperative warm-up hitting can still slip through.
+- **Warm-up can look like a rally** to both the audio and trajectory paths. Optional serve
+  evidence improves precision, but reliable separation still needs independently validated
+  serve/match-state or scoreboard information.
 - **Ball tracking** is the default *arbiter* (Phase-2; `--no-ball-arbiter` to disable) but
   remains the least reliable single cue (motion blur / occlusion) — the Kalman+RTS
   reconstruction in `signals/trajectory.py` mitigates this, and on CPU it runs only

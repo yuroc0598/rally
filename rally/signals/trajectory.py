@@ -15,10 +15,9 @@ This module fixes the track *before* the rules see it:
   jumps are gated out as outliers, and every output sample carries a **confidence** in
   ``[0, 1]`` derived from the posterior covariance — high where the ball was tracked
   cleanly, low across long dropouts. Downstream rules weight by this confidence.
-* :func:`bounces_from_velocity` detects ground contacts from the sign flip of the ball's
-  **vertical image velocity** (moving down the screen -> moving up) on the *smoothed*
-  track — the "velocity angle change" cue (cf. the Hawk-Eye stack in DESIGN.md), which is
-  far steadier than raw image-y local maxima.
+* :func:`bounces_from_velocity` detects ground-contact candidates from a confident,
+  measured **2-D velocity-vector turn** with descending and rebounding components.  A
+  vertical image-y reversal alone is not treated as physical bounce evidence.
 
 Pure NumPy, no weights, independent of how the track was produced — unit-testable on
 synthetic trajectories.
@@ -213,28 +212,37 @@ def bounces_from_velocity(
     track: SmoothTrack,
     *,
     min_descent_px_s: float = 40.0,
+    min_rebound_px_s: float | None = None,
+    min_turn_angle_deg: float = 20.0,
+    max_speed_ratio: float = 8.0,
+    evidence_window_s: float = 0.12,
     min_sep_s: float = 0.3,
     min_conf: float = 0.3,
 ) -> list[int]:
-    """Ground-contact sample indices from the vertical-velocity sign flip.
+    """Ground-contact candidates from a confident 2-D velocity-vector turn.
 
-    On the *smoothed* track a bounce is where the ball stops moving down the screen and
-    starts moving up: ``vy`` crosses from positive (descending, image-y increasing) to
-    negative (ascending). Requiring a minimum descent speed just before the flip
-    (``min_descent_px_s``) rejects the trajectory apex and slow wobble; ``min_sep_s`` is
-    the refractory spacing; low-confidence samples (long dropouts) are skipped.
+    A candidate must descend before the contact and rebound afterward, but that image-y
+    sign change is only the first gate.  Velocity vectors measured on the two sides must
+    also have meaningful magnitudes, turn through ``min_turn_angle_deg``, have a plausible
+    magnitude ratio, and contain real detector measurements on both sides.  This rejects
+    slow image jitter, trajectory apexes, and turns invented entirely inside a filled gap.
 
-    This is steadier than image-y ``find_peaks`` because it keys on the *dynamics*
-    (velocity reversal) rather than the exact peak height, which perspective distorts.
+    The result remains a single-view image-space event, not a calibrated 3-D ground
+    contact.  Court mapping is still required for any in/out decision.
     """
+    vx = np.asarray(track.vx, float)
     vy = np.asarray(track.vy, float)
     t = np.asarray(track.t, float)
     conf = np.asarray(track.confidence, float)
+    measured = np.asarray(track.measured, bool)
     n = vy.size
     if n < 3:
         return []
     dt_med = float(np.median(np.diff(t))) if n > 1 else 1.0 / 30.0
     refractory = max(1, int(round(min_sep_s / max(dt_med, 1e-6))))
+    evidence_n = max(1, int(round(evidence_window_s / max(dt_med, 1e-6))))
+    min_rebound = (0.5 * min_descent_px_s if min_rebound_px_s is None
+                   else float(min_rebound_px_s))
 
     out: list[int] = []
     for i in range(1, n):
@@ -243,12 +251,37 @@ def bounces_from_velocity(
         # on one side so a crossing that lands on vy==0 is still caught.)
         if not (vy[i - 1] > 0.0 and vy[i] <= 0.0):
             continue
-        # require a genuinely fast descent just before (rejects apex / slow wobble)
-        w0 = max(0, i - refractory)
-        if vy[w0:i].max(initial=0.0) < min_descent_px_s:
+        pre = slice(max(0, i - evidence_n), i)
+        post = slice(i, min(n, i + evidence_n))
+        if i - pre.start < 1 or post.stop - i < 1:
             continue
-        if conf[i] < min_conf and conf[i - 1] < min_conf:
-            continue                                  # inside a long dropout
+        good_pre = conf[pre] >= min_conf
+        good_post = conf[post] >= min_conf
+        if not good_pre.any() or not good_post.any():
+            continue
+        # A smoother can extrapolate a convincing turn through a gap.  Require actual
+        # observations on both sides before accepting it as evidence.
+        if not np.any(measured[pre] & good_pre) or not np.any(measured[post] & good_post):
+            continue
+
+        pre_vec = np.array([np.median(vx[pre][good_pre]),
+                            np.median(vy[pre][good_pre])])
+        post_vec = np.array([np.median(vx[post][good_post]),
+                             np.median(vy[post][good_post])])
+        if pre_vec[1] < min_descent_px_s or post_vec[1] > -min_rebound:
+            continue
+        pre_speed = float(np.linalg.norm(pre_vec))
+        post_speed = float(np.linalg.norm(post_vec))
+        if pre_speed <= 0.0 or post_speed <= 0.0:
+            continue
+        ratio = max(pre_speed, post_speed) / min(pre_speed, post_speed)
+        if ratio > max_speed_ratio:
+            continue
+        cos_turn = float(np.clip(np.dot(pre_vec, post_vec)
+                                 / (pre_speed * post_speed), -1.0, 1.0))
+        turn_deg = float(np.degrees(np.arccos(cos_turn)))
+        if turn_deg < min_turn_angle_deg:
+            continue
         if out and i - out[-1] < refractory:
             continue                                  # refractory spacing
         out.append(i)

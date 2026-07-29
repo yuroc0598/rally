@@ -139,6 +139,27 @@ def test_dp_handles_clip_shorter_than_min_constraints():
     assert isinstance(segs, list)
 
 
+@pytest.mark.parametrize("duration_s", [91, 600, 10_800])
+def test_dp_long_all_low_stream_never_fabricates_rallies(duration_s):
+    # max_segment_s is only a computational cap; crossing it must not force a
+    # GAP/RALLY alternation.  These durations straddle and far exceed the default cap.
+    fps = 2.0
+    cfg = RallyConfig(use_dp_decoder=True, pad_pre_s=0.0, pad_post_s=0.0)
+    prob = np.full(int(duration_s * fps), 0.01)
+    assert dp_decode(prob, fps, cfg, total_s=duration_s) == []
+
+
+def test_dp_finds_real_rally_between_gaps_longer_than_segment_cap():
+    fps = 2.0
+    cfg = RallyConfig(use_dp_decoder=True, pad_pre_s=0.0, pad_post_s=0.0,
+                      max_segment_s=30.0)
+    prob = _prob_with_rallies(fps, [("g", 75), ("r", 8), ("g", 75)])
+    segs = dp_decode(prob, fps, cfg, total_s=len(prob) / fps)
+    assert len(segs) == 1
+    assert segs[0][0] == pytest.approx(75.0, abs=1.0)
+    assert segs[0][1] == pytest.approx(83.0, abs=1.0)
+
+
 def test_empty_input():
     cfg = RallyConfig()
     assert segments_from_prob(np.zeros(0), 5.0, cfg, total_s=0.0) == []

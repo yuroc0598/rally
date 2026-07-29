@@ -1,4 +1,4 @@
-"""Train + honestly evaluate a serve classifier on labelled candidates.
+"""Train and cross-validate a serve classifier on labelled candidates.
 
 Reads candidates/labels.csv (from rally.tools.serve_dataset, with is_serve filled in),
 extracts audio + visual features for each candidate, and runs leave-one-out
@@ -17,9 +17,9 @@ import csv
 
 import numpy as np
 
-from ..signals.audio import detect_strikes
+from ..signals.audio import detect_strikes_stream
 from ..config import RallyConfig
-from ..io.ffmpeg import load_audio_mono
+from ..io.ffmpeg import iter_audio_mono
 
 
 def _clusters(onsets, gap_s=2.5):
@@ -29,33 +29,30 @@ def _clusters(onsets, gap_s=2.5):
     return cl
 
 
-def _audio_env(pcm, sr, cfg):
-    from scipy.signal import butter, sosfiltfilt
-    lo, hi = cfg.strike_band_hz
-    hi = min(hi, sr / 2 - 1)
-    env = np.abs(sosfiltfilt(butter(4, [lo, hi], btype="band", fs=sr, output="sos"), pcm))
-    w = max(1, int(0.01 * sr))
-    return np.convolve(env, np.ones(w) / w, mode="same")
-
-
 def extract_features(video: str, labels_csv: str):
     import cv2
     from ultralytics import YOLO
+    from ..signals.player import discover_yolo_weights
 
     cfg = RallyConfig()
     rows = list(csv.DictReader(open(labels_csv)))
     rows = [r for r in rows if r["is_serve"] in ("0", "1")]
+    if not rows:
+        raise ValueError("labels CSV contains no rows labeled is_serve=0/1")
 
-    pcm = load_audio_mono(video, cfg.audio_sr)
-    env = _audio_env(pcm, cfg.audio_sr, cfg)
-    med = float(np.median(env))
-    onsets = detect_strikes(pcm, cfg.audio_sr, cfg)
+    onsets = detect_strikes_stream(
+        iter_audio_mono(video, cfg.audio_sr, chunk_s=60.0), cfg.audio_sr, cfg)
+    if onsets.size == 0:
+        raise ValueError("no audio strike candidates were detected")
     cl = _clusters(onsets)
     firsts = np.array([c[0] for c in cl])
 
-    det = YOLO("yolov8n.pt")
+    det = YOLO(discover_yolo_weights("yolov8n.pt"))
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if not cap.isOpened() or not np.isfinite(fps) or fps <= 0:
+        cap.release()
+        raise ValueError(f"could not decode video or determine frame rate: {video}")
 
     def feet(t):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
@@ -67,17 +64,22 @@ def extract_features(video: str, labels_csv: str):
         return [((b[0] + b[2]) / 2 / w, b[3] / h) for b in r.boxes.xyxy.cpu().numpy()]
 
     # global baseline estimate from feet at all candidate times
-    X, y, names = [], [], ["gap_before", "n_strikes", "first_loud", "near_disp", "backmost_y", "frontmost_y"]
+    X, y, names = [], [], ["gap_before", "n_strikes", "near_disp", "backmost_y", "frontmost_y"]
     per = []
+    used_clusters: set[int] = set()
     for r in rows:
         ps = float(r["point_start_s"])
         fs = ps + cfg.toss_preroll_s
         ci = int(np.argmin(np.abs(firsts - fs)))
+        if abs(float(firsts[ci]) - fs) > 1.0:
+            raise ValueError(
+                f"label {r['index']} has no audio cluster within 1s of its expected strike")
+        if ci in used_clusters:
+            raise ValueError(f"multiple labels map to audio cluster {ci}; fix candidate alignment")
+        used_clusters.add(ci)
         c = cl[ci]
         gap_before = c[0] - cl[ci - 1][-1] if ci > 0 else 30.0
         n_strikes = len(c)
-        i0 = int(c[0] * cfg.audio_sr)
-        first_loud = float(env[max(0, i0 - 200):i0 + 200].max() / (med + 1e-9))
         # visual around the serve
         near0 = None
         disp = 0.0
@@ -95,9 +97,12 @@ def extract_features(video: str, labels_csv: str):
                         near0 = p
                     disp = max(disp, np.hypot(p[0] - near0[0], p[1] - near0[1]))
             t += 0.3
+        if len(backs) < 2:
+            raise ValueError(
+                f"insufficient player detections around label {r['index']} ({len(backs)} frames)")
         backmost = max(backs) if backs else 0.0
         frontmost = min(fronts) if fronts else 1.0
-        X.append([gap_before, n_strikes, first_loud, disp, backmost, frontmost])
+        X.append([gap_before, n_strikes, disp, backmost, frontmost])
         y.append(int(r["is_serve"]))
         per.append((r["index"], ps, int(r["is_serve"])))
     cap.release()
@@ -106,11 +111,13 @@ def extract_features(video: str, labels_csv: str):
 
 def evaluate(X, y, names, per, model_out=None):
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import StratifiedKFold
     from sklearn.preprocessing import StandardScaler
 
     n = len(y)
+    classes, counts = np.unique(y, return_counts=True)
+    if n < 4 or classes.size != 2 or counts.min() < 2:
+        raise ValueError("serve evaluation needs both classes with at least two samples each")
     maj = 1 if y.sum() >= n / 2 else 0
     base_acc = max(y.sum(), n - y.sum()) / n
 
@@ -135,7 +142,7 @@ def evaluate(X, y, names, per, model_out=None):
         for i in range(n):
             tr = [j for j in range(n) if j != i]
             sc = StandardScaler().fit(X[tr])
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+            clf = make_clf()
             clf.fit(sc.transform(X[tr]), y[tr])
             preds[i] = clf.predict(sc.transform(X[i:i + 1]))[0]
     print(f"\nvalidation scheme: {scheme}")
@@ -148,7 +155,7 @@ def evaluate(X, y, names, per, model_out=None):
 
     print(f"\nsamples: {n}  ({int(y.sum())} serve, {int(n - y.sum())} non-serve)")
     print(f"majority-class baseline accuracy: {base_acc:.0%} (predict '{['non-serve','serve'][maj]}')")
-    print(f"\nleave-one-out LogisticRegression:")
+    print(f"\ncross-validated RandomForest:")
     print(f"  accuracy = {acc:.0%}   precision = {prec:.0%}   recall = {rec:.0%}")
     print(f"  confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
     print(f"\nper-candidate (idx, start, true, pred):")

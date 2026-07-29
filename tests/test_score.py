@@ -23,12 +23,12 @@ def test_motion_score_damped_by_camera_motion():
     assert s[1] == pytest.approx(0.3)  # damped while camera moves
 
 
-def test_rally_probability_renormalises_over_available_channels():
+def test_rally_probability_preserves_absolute_audio_strength():
     cfg = RallyConfig()
-    # audio-only: should equal the audio score regardless of other weights
+    # Missing channels abstain; they do not rescale the configured audio strength.
     p = rally_probability(cfg, n=1, audio_rate=np.array([1.0]),
                           audio_regularity=np.array([1.0]))
-    assert p[0] == pytest.approx(1.0)
+    assert p[0] == pytest.approx(cfg.w_audio)
 
 
 def test_rally_probability_ball_channel_codecides():
@@ -51,7 +51,7 @@ def test_confidence_weighting_drops_out_unsure_source():
     p = rally_probability(cfg, n=1, audio_rate=np.array([1.0]),
                           audio_regularity=np.array([1.0]),
                           pose=np.array([0.0]), pose_conf=np.array([0.0]))
-    assert p[0] == pytest.approx(1.0)  # pose dropped out; audio-only stands
+    assert p[0] == pytest.approx(0.5)  # pose dropped out; audio retains its own strength
 
 
 def test_confidence_weighting_lets_sure_source_vote():
@@ -67,6 +67,53 @@ def test_rally_probability_zero_without_channels():
     cfg = RallyConfig()
     p = rally_probability(cfg, n=3)
     assert np.all(p == 0.0)
+
+
+def test_supporting_channels_cannot_become_certain_when_alone():
+    cfg = RallyConfig(motion_full_score=1.0)
+    motion_only = rally_probability(cfg, n=1, motion=np.array([1.0]))
+    geometry_only = rally_probability(cfg, n=1, geometry=np.array([1.0]))
+    supporting = rally_probability(
+        cfg, n=1, geometry=np.array([1.0]), motion=np.array([1.0])
+    )
+    assert motion_only[0] == pytest.approx(cfg.w_motion)
+    assert geometry_only[0] == pytest.approx(cfg.w_geometry)
+    assert supporting[0] == pytest.approx(cfg.w_motion + cfg.w_geometry)
+    assert supporting[0] < cfg.enter_threshold
+
+
+def test_unavailable_and_zero_confidence_are_equivalent():
+    cfg = RallyConfig()
+    absent = rally_probability(cfg, n=1, motion=np.array([cfg.motion_full_score]))
+    zero_conf = rally_probability(
+        cfg, n=1,
+        geometry=np.array([1.0]), geometry_conf=np.array([0.0]),
+        motion=np.array([cfg.motion_full_score]),
+    )
+    assert zero_conf == pytest.approx(absent)
+
+
+def test_rally_probability_clips_combined_support_to_unit_interval():
+    cfg = RallyConfig(w_audio=0.8, w_ball=0.8)
+    p = rally_probability(
+        cfg, n=2,
+        audio_rate=np.array([1.0, -1.0]), audio_regularity=np.array([1.0, 1.0]),
+        ball=np.array([1.0, -1.0]),
+    )
+    assert np.array_equal(p, np.array([1.0, 0.0]))
+
+
+def test_nonfinite_samples_abstain_and_output_stays_bounded():
+    cfg = RallyConfig(motion_full_score=1.0)
+    p = rally_probability(
+        cfg, n=3,
+        geometry=np.array([1.0, 1.0, 1.0]),
+        geometry_conf=np.array([np.nan, np.inf, -np.inf]),
+        motion=np.array([np.nan, np.inf, -np.inf]),
+    )
+    assert np.all(np.isfinite(p))
+    assert np.all((0.0 <= p) & (p <= 1.0))
+    assert p[0] == 0.0
 
 
 def test_rally_probability_length_mismatch_raises():

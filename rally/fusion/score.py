@@ -1,8 +1,8 @@
 """Fuse per-frame channel features into a single rally probability in [0, 1].
 
-Rule-based (Phase-1). Only the channels that are actually available contribute; the
-weights are renormalised over present channels, so the pipeline still produces a
-sensible score from audio + motion alone when person detection is unavailable.
+Rule-based (Phase-1). Configured weights are absolute evidence strengths rather than
+shares of whichever sources happen to be present.  Missing or zero-confidence sources
+contribute no evidence; they do not promote weak supporting cues to certainty.
 
 Kept pure (arrays in, array out) for unit testing.
 """
@@ -22,7 +22,9 @@ def _as_array(x: Optional[np.ndarray], n: int) -> Optional[np.ndarray]:
     a = np.asarray(x, dtype=float)
     if a.shape[0] != n:
         raise ValueError(f"channel length {a.shape[0]} != timeline length {n}")
-    return a
+    # Sanitize before channel-specific clipping/scoring; otherwise +inf is clipped to one
+    # and becomes maximum evidence instead of an unavailable sample.
+    return np.where(np.isfinite(a), a, 0.0)
 
 
 def audio_score(rate: np.ndarray, regularity: np.ndarray) -> np.ndarray:
@@ -60,14 +62,16 @@ def rally_probability(
     """Confidence-weighted co-decision -> per-frame rally probability (length n).
 
     Each source (audio strikes, player geometry, player pose, ball-in-play, motion) votes
-    with a score in [0,1] AND a per-frame confidence in [0,1]. The fused probability is::
+    with a score in [0,1] AND a per-frame confidence in [0,1]. The fused support is::
 
-        P = Σ (weight · confidence · score) / Σ (weight · confidence)
+        P = clip(Σ (weight · confidence · score), 0, 1)
 
-    so a source only influences the decision in proportion to how sure it is *right now*.
-    A near-side pose that's clear votes strongly; a far/blurred pose (confidence ~0) drops
-    out instead of dragging the result. No single channel gates. Sources without an
-    explicit confidence default to fully confident.
+    A source influences the decision in proportion to how sure it is *right now*.
+    A near-side pose that's clear votes strongly; a far/blurred pose (confidence ~0) is
+    equivalent to an unavailable source.  Crucially, a lone supporting source retains its
+    configured strength (default motion=0.1, geometry=0.15) rather than being divided by
+    its own weight and becoming 1.0.  Sources without explicit confidence default to fully
+    confident.
     """
     audio_rate = _as_array(audio_rate, n)
     audio_regularity = _as_array(audio_regularity, n)
@@ -101,9 +105,14 @@ def rally_probability(
         return np.zeros(n, dtype=float)
 
     num = np.zeros(n, dtype=float)
-    den = np.zeros(n, dtype=float)
     for w, s, c in channels:
-        wc = w * np.clip(c, 0.0, 1.0)
-        num += wc * s
-        den += wc
-    return np.where(den > 0, num / np.maximum(den, 1e-9), 0.0)
+        # A non-finite sample is unusable evidence, so handle it like an
+        # unavailable/zero-confidence sample instead of leaking NaN to the output.
+        confidence = np.clip(
+            np.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0
+        )
+        score = np.clip(
+            np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0
+        )
+        num += w * confidence * score
+    return np.clip(num, 0.0, 1.0)

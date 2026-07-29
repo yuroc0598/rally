@@ -26,8 +26,8 @@ Key decisions:
   frames — tractable on one machine. The final cut references the original file so
   quality is untouched.
 - **Fuse at the frame level, decide at the interval level.**
-- **Redundancy over any single cue.** Ball tracking is the strongest positive signal
-  but the least reliable; audio + player-geometry provide the backbone.
+- **Redundancy over any single cue.** Ball tracking and audio are the strongest positive
+  signals; motion and optional player geometry remain supporting evidence.
 
 ## (a) The rally classifier: a segment model
 
@@ -134,9 +134,11 @@ as an ordered event sequence.
   just an end-trimmer. Coarse-to-fine on CPU: the Phase-1 channels propose candidate
   windows, then per candidate the ball is tracked, the trajectory reconstructed
   (`signals/trajectory.py`: constant-velocity Kalman + RTS smoother → gap-fill,
-  Mahalanobis outlier gating, per-sample confidence), bounces detected from the
-  vertical-velocity reversal in court metres, and a verdict (`fusion/ball_verify.py`)
-  keeps/rejects and bounds each window (serve start, point-end). Court homography via
+  Mahalanobis outlier gating, per-sample confidence), bounce candidates requiring a
+  measured 2-D velocity-vector turn, and a gap-aware verdict (`fusion/ball_verify.py`)
+  accepts/rejects/abstains and bounds each window (serve start, point-end). Fragmented or
+  low-coverage ball tracks abstain instead of deleting coherent audio points; explicit reliable
+  contradictions still reject. Court homography via
   automatic detection (`signals/court_detect.py`: white-line Hough → outer-corner
   intersection → homography, scored by court-model reprojection overlap) or manual
   `court_corners`. On by default (auto court detection too; `--no-ball-arbiter` /

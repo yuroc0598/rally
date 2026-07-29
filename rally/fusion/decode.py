@@ -118,6 +118,8 @@ def _runs_to_padded_segments(
 def hysteresis_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
                       total_s: float | None = None) -> List[Segment]:
     prob = np.asarray(prob, dtype=float)
+    if not np.all(np.isfinite(prob)):
+        raise ValueError("rally probability must contain only finite values")
     total_s = total_s if total_s is not None else prob.size / fps
     smooth_win = int(round(cfg.smooth_window_s * fps))
     sm = moving_average(prob, smooth_win)
@@ -138,7 +140,7 @@ _INFEASIBLE = -1e17   # scores at/below this mean "no valid segmentation reached
 
 def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
               total_s: float | None = None) -> List[Segment]:
-    """Duration-aware segmental Viterbi over two alternating labels (RALLY / GAP).
+    """Duration-aware segmental Viterbi over two labels (RALLY / GAP).
 
     Jointly chooses segment boundaries and labels to maximise
     ``Σ frame-log-emissions + duration_prior(len|label) − transition_penalty``.
@@ -149,9 +151,15 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
     post-hoc merge/min-length cleanup that would undo the optimality (cf. hysteresis_decode).
 
     Prefix sums give O(1) segment scoring and the length window is vectorised over numpy, so
-    the cost is O(T · Lmax) arithmetic but only O(T) Python iterations.
+    the cost is O(T · Lmax) arithmetic but only O(T) Python iterations.  ``Lmax`` is a
+    computational/duration-prior cap, not a semantic one: once a segment reaches it, a
+    saturated state can keep the same label for arbitrarily long.  Thus long dead periods
+    do not need fake RALLY segments merely to tile the timeline.
     """
-    prob = np.clip(np.asarray(prob, dtype=float), _EPS, 1.0 - _EPS)
+    prob = np.asarray(prob, dtype=float)
+    if not np.all(np.isfinite(prob)):
+        raise ValueError("rally probability must contain only finite values")
+    prob = np.clip(prob, _EPS, 1.0 - _EPS)
     T = prob.size
     total_s = total_s if total_s is not None else T / fps
     if T == 0:
@@ -161,8 +169,10 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
     sm = np.clip(moving_average(prob, smooth_win), _EPS, 1.0 - _EPS)
 
     # prefix[k] = Σ frame-log-emissions over [0, k)  ->  segment [i, j) emission = pref[j]-pref[i]
-    pref_r = np.concatenate([[0.0], np.cumsum(np.log(sm))])          # if RALLY
-    pref_g = np.concatenate([[0.0], np.cumsum(np.log(1.0 - sm))])    # if GAP
+    log_r = np.log(sm)
+    log_g = np.log(1.0 - sm)
+    pref_r = np.concatenate([[0.0], np.cumsum(log_r)])          # if RALLY
+    pref_g = np.concatenate([[0.0], np.cumsum(log_g)])          # if GAP
 
     Lmax = max(1, int(round(cfg.max_segment_s * fps)))
     wdur = cfg.duration_prior_weight
@@ -174,7 +184,11 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
 
     NEG = -1e18
     best_r = np.empty(T + 1); best_g = np.empty(T + 1)
+    short_r = np.empty(T + 1); short_g = np.empty(T + 1)
+    long_r = np.empty(T + 1); long_g = np.empty(T + 1)
     back_r = np.empty(T + 1, np.int64); back_g = np.empty(T + 1, np.int64)
+    long_start_r = np.empty(T + 1, np.int64)
+    long_start_g = np.empty(T + 1, np.int64)
     # A_lbl[i] = (best score of a segmentation ending at i with the OPPOSITE label) - pref_lbl[i].
     # A RALLY must follow a GAP, so A_r uses best_g; a GAP must follow a RALLY, so A_g uses best_r.
     # i == 0 is the "no predecessor" start state (score 0), enabling a first segment of either label.
@@ -182,7 +196,10 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
 
     def _solve(min_rally: int, min_gap: int) -> float:
         best_r.fill(NEG); best_g.fill(NEG)
+        short_r.fill(NEG); short_g.fill(NEG)
+        long_r.fill(NEG); long_g.fill(NEG)
         back_r.fill(-1); back_g.fill(-1)
+        long_start_r.fill(-1); long_start_g.fill(-1)
         A_r.fill(NEG); A_g.fill(NEG)
         A_r[0] = -pref_r[0]
         A_g[0] = -pref_g[0]
@@ -192,22 +209,47 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
             hi = j - min_rally
             if hi >= lo:
                 ii = np.arange(lo, hi + 1)
-                cand = A_r[ii] + dur_r[j - ii]
+                # i == 0 starts the sequence; it is not a label transition.
+                cand = A_r[ii] + dur_r[j - ii] - pen * (ii > 0)
                 m = int(np.argmax(cand))
-                val = cand[m] + pref_r[j] - pen
-                if val > best_r[j]:
-                    best_r[j] = val
-                    back_r[j] = ii[m]
+                short_r[j] = cand[m] + pref_r[j]
+                back_r[j] = ii[m]
             # GAP [i, j): length in [min_gap, Lmax]
             hi = j - min_gap
             if hi >= lo:
                 ii = np.arange(lo, hi + 1)
-                cand = A_g[ii] + dur_g[j - ii]
+                cand = A_g[ii] + dur_g[j - ii] - pen * (ii > 0)
                 m = int(np.argmax(cand))
-                val = cand[m] + pref_g[j] - pen
-                if val > best_g[j]:
-                    best_g[j] = val
-                    back_g[j] = ii[m]
+                short_g[j] = cand[m] + pref_g[j]
+                back_g[j] = ii[m]
+
+            # A segment at the cap may continue in the same label without another
+            # duration prior or transition penalty.  Keep this separate from the
+            # bounded segment state so shorter durations still receive their proper
+            # duration prior.
+            i = j - Lmax
+            if i >= 0 and Lmax >= min_rally and A_r[i] > _INFEASIBLE:
+                exact = A_r[i] + dur_r[Lmax] + pref_r[j] - pen * (i > 0)
+                long_r[j] = exact
+                long_start_r[j] = i
+            if long_r[j - 1] > _INFEASIBLE:
+                extended = long_r[j - 1] + log_r[j - 1]
+                if extended > long_r[j]:
+                    long_r[j] = extended
+                    long_start_r[j] = long_start_r[j - 1]
+
+            if i >= 0 and Lmax >= min_gap and A_g[i] > _INFEASIBLE:
+                exact = A_g[i] + dur_g[Lmax] + pref_g[j] - pen * (i > 0)
+                long_g[j] = exact
+                long_start_g[j] = i
+            if long_g[j - 1] > _INFEASIBLE:
+                extended = long_g[j - 1] + log_g[j - 1]
+                if extended > long_g[j]:
+                    long_g[j] = extended
+                    long_start_g[j] = long_start_g[j - 1]
+
+            best_r[j] = max(short_r[j], long_r[j])
+            best_g[j] = max(short_g[j], long_g[j])
             # publish j as a predecessor state for later segments
             if best_g[j] > _INFEASIBLE:
                 A_r[j] = best_g[j] - pref_r[j]
@@ -219,12 +261,16 @@ def dp_decode(prob: np.ndarray, fps: float, cfg: RallyConfig,
     if _solve(min_r, min_g) <= _INFEASIBLE:
         _solve(1, 1)
 
-    # backtrack: labels alternate, so flip on each hop; i == 0 is the start (stop).
+    # Backtrack semantic segments.  A saturated segment jumps directly to its true
+    # start, so the computational cap never appears as an output boundary.
     mask = np.zeros(T, dtype=bool)
     label_rally = best_r[T] >= best_g[T]
     j = T
     while j > 0:
-        i = int(back_r[j] if label_rally else back_g[j])
+        if label_rally:
+            i = int(long_start_r[j] if long_r[j] > short_r[j] else back_r[j])
+        else:
+            i = int(long_start_g[j] if long_g[j] > short_g[j] else back_g[j])
         if i < 0:
             break
         if label_rally:

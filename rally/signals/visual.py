@@ -8,7 +8,7 @@ Requires OpenCV; callers should guard with ``opencv_available()``.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -48,6 +48,7 @@ def analyze_visual(
     timeline_s: np.ndarray,
     detector: Optional[PlayerDetector] = None,
     progress=lambda _m: None,
+    cancel_check: Callable[[], None] = lambda: None,
 ) -> Dict[str, Optional[np.ndarray]]:
     """Return dict with 'motion', 'camera_moving', 'geometry' arrays (length == timeline).
 
@@ -65,10 +66,14 @@ def analyze_visual(
     use_players = detector is not None and detector.available
     player_stride = max(1, int(round(cfg.analysis_fps / max(cfg.player_fps, 1e-6))))
     persons_per_index: List[List[Tuple[float, float, float]]] = [[] for _ in range(T)]
+    # Preserve the actual detector samples for point-level serve-position validation.
+    # Reusing them avoids decoding the full video and running person detection twice.
+    player_samples: List[Tuple[float, List[Tuple[float, float, float]]]] = []
     all_feet: List[Tuple[float, float]] = []
     # near-player foot track (largest bottom-half player), for the movement gate
     near_px = np.full(T, np.nan, dtype=float)
     near_py = np.full(T, np.nan, dtype=float)
+    last_near: Optional[Tuple[float, float]] = None
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -82,6 +87,7 @@ def analyze_visual(
     last_persons: List[Tuple[float, float, float]] = []
     try:
         while ti < T:
+            cancel_check()
             target = int(target_frames[ti])
             # advance to the target frame using cheap grabs
             while current <= target:
@@ -108,12 +114,31 @@ def analyze_visual(
             if use_players:
                 if ti % player_stride == 0:
                     last_persons = detector.detect_persons(frame)
+                    player_samples.append((
+                        float(timeline_s[ti]),
+                        [(float(x), float(y), float(area))
+                         for x, y, area in last_persons],
+                    ))
                     for (fx, fy, _a) in last_persons:
                         all_feet.append((fx, fy))
-                    # near player = largest box whose foot is in the lower half of the frame
+                    # Keep one near-player identity over time. Picking the largest box on
+                    # every sample independently switches to spectators/partners whenever
+                    # their apparent size changes and corrupts the movement-reset signal.
                     near = [p for p in last_persons if p[1] > 0.5]
                     if near:
-                        fx, fy, _a = max(near, key=lambda p: p[2])
+                        if last_near is not None:
+                            ranked = sorted(
+                                near, key=lambda p: np.hypot(p[0] - last_near[0],
+                                                             p[1] - last_near[1]))
+                            closest = ranked[0]
+                            if np.hypot(closest[0] - last_near[0],
+                                        closest[1] - last_near[1]) <= 0.25:
+                                fx, fy, _a = closest
+                            else:
+                                fx, fy, _a = max(near, key=lambda p: p[2])
+                        else:
+                            fx, fy, _a = max(near, key=lambda p: p[2])
+                        last_near = (fx, fy)
                         near_px[ti], near_py[ti] = fx, fy
                 persons_per_index[ti] = last_persons
             ti += 1
@@ -135,4 +160,5 @@ def analyze_visual(
         near_track = (near_px, near_py)
 
     return {"motion": motion, "camera_moving": camera_moving,
-            "geometry": geometry, "near_track": near_track}
+            "geometry": geometry, "near_track": near_track,
+            "player_samples": player_samples}

@@ -6,10 +6,26 @@ from rally.signals.court_detect import (
     classify_lines,
     corners_from_lines,
     line_intersection,
+    normalize_hough_lines,
     score_court,
+    valid_court_quad,
 )
 
 cv2 = pytest.importorskip("cv2")
+
+
+def test_normalize_hough_lines_accepts_both_opencv_shapes():
+    flat = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], np.int32)
+    nested = flat[:, None, :]
+    assert normalize_hough_lines(flat) == normalize_hough_lines(nested)
+    assert normalize_hough_lines(flat) == [(1.0, 2.0, 3.0, 4.0),
+                                            (5.0, 6.0, 7.0, 8.0)]
+
+
+def test_valid_quad_rejects_collapsed_far_baseline():
+    shape = (1080, 1920, 3)
+    assert valid_court_quad([(20, 840), (1900, 825), (1220, 510), (840, 510)], shape)
+    assert not valid_court_quad([(20, 840), (1900, 825), (1220, 510), (1160, 510)], shape)
 
 
 def test_line_intersection():

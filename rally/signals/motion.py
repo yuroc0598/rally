@@ -18,14 +18,29 @@ def frame_diff_energy(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     return float(np.mean(np.abs(gray - prev_gray)) / 255.0)
 
 
-def camera_shift_px(prev_gray: np.ndarray, gray: np.ndarray) -> float:
-    """Magnitude (pixels) of global translation. Requires OpenCV; returns 0.0 if
-    unavailable so the pipeline still runs without the camera-motion channel."""
+def camera_shift_px(prev_gray: np.ndarray, gray: np.ndarray, *,
+                    min_texture_std: float = 5.0,
+                    min_response: float = 0.10) -> float:
+    """Magnitude (pixels) of a *reliable* global translation estimate.
+
+    Phase correlation is undefined on flat/near-flat images and can return a large,
+    arbitrary shift with a weak correlation peak.  Such estimates are rejected as
+    unavailable (``0.0``), as is the historical no-OpenCV fallback.  This keeps the
+    public scalar API while preventing low-texture frames from looking like camera pans.
+    """
     try:
         import cv2
     except Exception:  # pragma: no cover - environment without cv2
         return 0.0
     a = np.asarray(prev_gray, dtype=np.float32)
     b = np.asarray(gray, dtype=np.float32)
-    (dx, dy), _response = cv2.phaseCorrelate(a, b)
+    if a.shape != b.shape or a.ndim != 2 or a.size == 0:
+        return 0.0
+    if (not np.isfinite(a).all() or not np.isfinite(b).all()
+            or np.std(a) < min_texture_std or np.std(b) < min_texture_std):
+        return 0.0
+    (dx, dy), response = cv2.phaseCorrelate(a, b)
+    if (not np.isfinite(dx) or not np.isfinite(dy)
+            or not np.isfinite(response) or response < min_response):
+        return 0.0
     return float(np.hypot(dx, dy))

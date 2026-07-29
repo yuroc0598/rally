@@ -28,7 +28,9 @@ def refine_ends_with_ball(
     bounce_prominence_px: float = 6.0,
     double_bounce_window_s: float = 2.5,
     margin_m: float = 0.35,
+    inference_batch_size: Optional[int] = None,
     progress: Callable[[str], None] = lambda _m: None,
+    cancel_check: Callable[[], None] = lambda: None,
 ) -> List[Segment]:
     """For each rally, track the ball over the segment, detect bounces, and move the end
     to the first point-ending event. Non-overlapping; keeps original end if none found."""
@@ -36,7 +38,10 @@ def refine_ends_with_ball(
     out: List[Segment] = []
     n_trimmed = 0
     for s, e in segments:
-        bt = track_tracknet(video, model=model, start_s=s, end_s=e + max_extend_s)
+        cancel_check()
+        bt = track_tracknet(
+            video, model=model, start_s=s, end_s=e + max_extend_s,
+            batch_size=inference_batch_size, cancel_check=cancel_check)
         bounces = bounces_in_court(bt.t, bt.x, bt.y, court, prominence_px=bounce_prominence_px)
         events = point_end_events(bounces, double_bounce_window_s=double_bounce_window_s,
                                   margin_m=margin_m)

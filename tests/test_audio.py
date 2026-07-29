@@ -1,7 +1,11 @@
 import numpy as np
 import pytest
 
-from rally.signals.audio import detect_strikes, strike_rhythm_features
+from rally.signals.audio import (
+    _plausible_impact_shape,
+    detect_strikes,
+    strike_rhythm_features,
+)
 from rally.config import RallyConfig
 
 
@@ -38,6 +42,27 @@ def test_detect_strikes_empty_on_silence():
     x = 0.0005 * np.random.default_rng(1).standard_normal(sr * 3)
     found = detect_strikes(x, sr, cfg)
     assert len(found) <= 1  # essentially nothing
+
+
+def test_impact_shape_rejects_voiced_score_call_but_keeps_racket_contact():
+    sr = 22050
+    cfg = RallyConfig(audio_sr=sr)
+    n = int(0.2 * sr)
+    center = n // 2
+    t = np.arange(n) / sr
+
+    # A voiced score call: sustained harmonic energy with no sharp broadband attack.
+    voiced = sum(np.sin(2 * np.pi * 220 * harmonic * t) / harmonic
+                 for harmonic in range(1, 18)).astype(np.float32)
+    assert not _plausible_impact_shape(voiced, voiced, center, sr, cfg)
+
+    # A short, decaying noise burst has the impulsive/broadband shape of contact.
+    impact = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(7)
+    burst = rng.standard_normal(int(0.012 * sr)).astype(np.float32)
+    burst *= np.exp(-np.arange(burst.size) / (0.002 * sr))
+    impact[center:center + burst.size] = burst
+    assert _plausible_impact_shape(impact, impact, center, sr, cfg)
 
 
 def test_rhythm_features_high_during_regular_strikes():

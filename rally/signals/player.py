@@ -11,19 +11,117 @@ Signals this module provides to the pipeline:
 * **near-player court track + speed** — for the movement gate (point splitting) and the
   serve set-up (point-start anchor).
 
-Pose is intentionally not used: it was validated as unreliable on wide/night footage.
+Pose is used narrowly for a high-resolution near-player overhead check around early
+impacts. It is never used as general rally evidence; wide/far-side serves are confirmed
+by the dedicated TrackNet ball-motion check instead.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 Person = Tuple[float, float, float]          # (foot_x_norm, foot_y_norm, box_area_norm)
 Region = Tuple[float, float, float, float]   # (x0, y0, x1, y1) normalized
 Segment = Tuple[float, float]
+
+
+def resolve_yolo_device() -> str:
+    """Use the same explicit CUDA-first policy as TrackNet, with safe CPU fallback."""
+    from .ball import resolve_device
+
+    return str(resolve_device())
+
+
+@dataclass(frozen=True)
+class ServeSetupObservation:
+    """Visible pre-strike state used by the match-sequence validator.
+
+    ``side`` is deliberately screen-left/screen-right, not deuce/ad. Without a reliable
+    court orientation and server identity, assigning tennis names would manufacture
+    certainty; alternation only needs the two stable screen-side states.
+    """
+
+    point: Segment
+    first_strike: float
+    side: Optional[str]
+    side_confidence: float
+    near_x: Optional[float]
+    near_x_std: Optional[float]
+    sampled_frames: int
+    pose_frames: int
+    ready_frames: int
+    serve_motion: bool
+    setup_evidence: bool
+    observable: bool
+    overhead_frames: int = 0
+    overhead_max_ratio: float = 0.0
+    overhead_strikes: tuple[float, ...] = ()
+    position_checked: bool = False
+    position_setup_evidence: bool = False
+    position_best_strike: Optional[float] = None
+    position_setup_strikes: tuple[float, ...] = ()
+    position_score: float = 0.0
+    position_server_end: Optional[str] = None
+    position_server_span: Optional[float] = None
+    position_player_tracks: int = 0
+    position_stable_tracks: int = 0
+    position_stable_fraction: float = 0.0
+    ball_checked: bool = False
+    ball_serve_evidence: bool = False
+    ball_best_strike: Optional[float] = None
+    ball_coverage: float = 0.0
+    ball_vertical_span: float = 0.0
+    ball_outgoing_span: float = 0.0
+    ball_ordered_evidence: bool = False
+    ball_measured_samples: int = 0
+
+    @property
+    def confirmed_serve(self) -> bool:
+        # A raised wrist alone is vulnerable to pose hallucination and ordinary
+        # overhead actions. It confirms a serve only in a stationary baseline setup.
+        # TrackNet's sustained toss/serve flight remains independently sufficient.
+        aligned_pose_setup = any(
+            abs(pose_strike - position_strike) <= 1e-6
+            for pose_strike in self.overhead_strikes
+            for position_strike in self.position_setup_strikes
+        )
+        return bool(self.ball_serve_evidence or aligned_pose_setup)
+
+
+@dataclass(frozen=True)
+class PositionSetupObservation:
+    """Player-formation evidence immediately before an early impact."""
+
+    point: Segment
+    best_strike: Optional[float]
+    setup_strikes: tuple[float, ...]
+    checked: bool
+    setup_evidence: bool
+    score: float
+    server_end: Optional[str]
+    server_span: Optional[float]
+    player_tracks: int
+    stable_tracks: int
+    stable_fraction: float
+    sampled_frames: int
+
+
+def discover_yolo_weights(name: str = "yolov8n.pt", models_dir: Optional[str] = None) -> str:
+    """Resolve a YOLO weight name to ``models/<name>`` when it lives there (we keep all
+    weights — TrackNet + YOLO — in models/), else return the bare name so ultralytics can
+    use its own cache or download it. Mirrors ``ball.discover_ball_weights``."""
+    import os
+    from pathlib import Path
+
+    if models_dir is None:
+        models_dir = os.environ.get("RALLY_MODELS_DIR")
+        if not models_dir:
+            models_dir = str(Path(__file__).resolve().parents[2] / "models")
+    local = Path(models_dir) / name
+    return str(local) if local.is_file() else name
 
 
 # ---------------------------------------------------------------------------
@@ -35,10 +133,13 @@ class PlayerDetector:
     def __init__(self, model: str = "yolov8n.pt", conf: float = 0.3):
         self.conf = conf
         self.model = None
+        self.device = "cpu"
         try:  # pragma: no cover - optional heavy dependency
             from ultralytics import YOLO
 
-            self.model = YOLO(model)
+            self.device = resolve_yolo_device()
+            self.model = YOLO(discover_yolo_weights(model))
+            self.model.to(self.device)
         except Exception:
             self.model = None
 
@@ -51,7 +152,9 @@ class PlayerDetector:
         if self.model is None:
             return []
         h, w = frame_bgr.shape[:2]
-        res = self.model.predict(frame_bgr, conf=self.conf, classes=[0], verbose=False)
+        res = self.model.predict(
+            frame_bgr, conf=self.conf, classes=[0], verbose=False,
+            device=self.device)
         persons: List[Person] = []
         for r in res:
             for box in r.boxes.xyxy.cpu().numpy():
@@ -112,7 +215,9 @@ def track_near_player(video: str, court, fps_a: float = 5.0, model=None):
 
     if model is None:
         from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
+        model = YOLO(discover_yolo_weights("yolov8n.pt"))
+    device = resolve_yolo_device()
+    model.to(device)
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS) or fps_a
     stride = max(1, int(round(fps / fps_a)))
@@ -127,7 +232,8 @@ def track_near_player(video: str, court, fps_a: float = 5.0, model=None):
                 if not ok:
                     break
                 h = fr.shape[0]
-                r = model.predict(fr, conf=0.3, classes=[0], verbose=False)[0]
+                r = model.predict(
+                    fr, conf=0.3, classes=[0], verbose=False, device=device)[0]
                 boxes = [b for b in r.boxes.xyxy.cpu().numpy() if b[3] / h > 0.60]
                 ts.append(fi / fps)
                 if boxes:
@@ -237,7 +343,10 @@ def refine_starts_with_serve(points: List[Segment], onsets: np.ndarray, times: n
 # ---------------------------------------------------------------------------
 # pose-activity channel (near player) — a confidence-weighted vote
 # ---------------------------------------------------------------------------
-def pose_activity_track(video: str, timeline: np.ndarray, fps_a: float = 2.0):
+def pose_activity_track(
+    video: str, timeline: np.ndarray, fps_a: float = 2.0,
+    cancel_check: Callable[[], None] = lambda: None,
+):
     """Per-analysis-frame pose-activity score + confidence for the near player.
 
     Uses YOLOv8-pose. "Activity" = how far the racket arm is raised above the hips
@@ -253,7 +362,9 @@ def pose_activity_track(video: str, timeline: np.ndarray, fps_a: float = 2.0):
     score = np.zeros(timeline.size, float)
     conf = np.zeros(timeline.size, float)
     try:
-        model = YOLO("yolov8n-pose.pt")
+        model = YOLO(discover_yolo_weights("yolov8n-pose.pt"))
+        device = resolve_yolo_device()
+        model.to(device)
     except Exception:
         return score, conf
 
@@ -264,6 +375,7 @@ def pose_activity_track(video: str, timeline: np.ndarray, fps_a: float = 2.0):
     fi = 0
     try:
         while True:
+            cancel_check()
             if not cap.grab():
                 break
             if fi % stride == 0:
@@ -271,7 +383,8 @@ def pose_activity_track(video: str, timeline: np.ndarray, fps_a: float = 2.0):
                 if not ok:
                     break
                 h, w = fr.shape[:2]
-                r = model.predict(fr, conf=0.3, classes=[0], verbose=False)[0]
+                r = model.predict(
+                    fr, conf=0.3, classes=[0], verbose=False, device=device)[0]
                 s_val, c_val = 0.0, 0.0
                 if r.keypoints is not None and len(r.boxes) > 0:
                     boxes = r.boxes.xyxy.cpu().numpy()
@@ -317,6 +430,394 @@ def pose_activity_track(video: str, timeline: np.ndarray, fps_a: float = 2.0):
         left = pos - 1
         idx = np.where((timeline - samp_t[left]) <= (samp_t[pos] - timeline), left, pos)
     return ss[idx], sc[idx]
+
+
+# ---------------------------------------------------------------------------
+# point-level serve / receiver setup observation
+# ---------------------------------------------------------------------------
+def _position_frame_coordinates(persons, court=None, frame_size=None) -> np.ndarray:
+    """Return filtered player foot positions in normalized court/view coordinates."""
+    raw = np.asarray([[person[0], person[1]] for person in persons], dtype=float)
+    if raw.size == 0:
+        return np.empty((0, 2), dtype=float)
+    calibrated = court is not None and frame_size is not None
+    if calibrated:
+        width, height = frame_size
+        pixels = raw * np.array([float(width), float(height)])
+        from .court import COURT_L, DOUBLES_W
+
+        raw = court.to_court(pixels) / np.array([DOUBLES_W, COURT_L])
+        keep = (
+            np.isfinite(raw).all(axis=1)
+            & (raw[:, 0] >= -0.15) & (raw[:, 0] <= 1.15)
+            & (raw[:, 1] >= -0.15) & (raw[:, 1] <= 1.15)
+        )
+    else:
+        # Conservative central-court envelope. It excludes most spectators and people
+        # behind the fence while retaining a server just behind either baseline.
+        keep = (
+            np.isfinite(raw).all(axis=1)
+            & (raw[:, 0] >= 0.04) & (raw[:, 0] <= 0.96)
+            & (raw[:, 1] >= 0.30) & (raw[:, 1] <= 0.995)
+        )
+    return raw[keep]
+
+
+def classify_position_setup(
+    point: Segment,
+    first_strike: float,
+    player_samples,
+    cfg,
+    *,
+    court=None,
+    frame_size=None,
+) -> PositionSetupObservation:
+    """Measure a stationary baseline formation before a candidate's first impact.
+
+    Person detections are associated by nearest foot position. A setup is present when
+    at least one stable track occupies a baseline band and the configured fraction of
+    all reliably observed players stays stable. This is supporting evidence only; a
+    dynamic pose or ball-flight event is still required to confirm a serve.
+    """
+    point = (float(point[0]), float(point[1]))
+    first_strike = float(first_strike)
+    start = max(0.0, first_strike - float(cfg.match_setup_lookback_s))
+    end = min(float(point[1]), first_strike + cfg.match_position_post_strike_s)
+    frames = [
+        (float(sample_time), _position_frame_coordinates(
+            persons, court=court, frame_size=frame_size))
+        for sample_time, persons in player_samples
+        if start - 1e-9 <= float(sample_time) <= end + 1e-9
+    ]
+    if not frames:
+        return PositionSetupObservation(
+            point=point, best_strike=first_strike, setup_strikes=(), checked=False,
+            setup_evidence=False, score=0.0, server_end=None, server_span=None,
+            player_tracks=0, stable_tracks=0, stable_fraction=0.0,
+            sampled_frames=0)
+
+    # Greedy nearest-neighbour association is sufficient over this short, fixed-camera
+    # window. A deliberately generous step keeps walking players in one track so their
+    # displacement is measured rather than hidden as several short tracks.
+    tracks: list[dict] = []
+    max_gap_s = max(0.75, 2.5 / max(float(cfg.player_fps), 1e-6))
+    for sample_time, positions in frames:
+        active = [
+            index for index, track in enumerate(tracks)
+            if sample_time - track["last_time"] <= max_gap_s
+        ]
+        pairs = sorted(
+            (
+                (float(np.linalg.norm(position - tracks[index]["last"])), index, pi)
+                for index in active
+                for pi, position in enumerate(positions)
+            ),
+            key=lambda item: item[0],
+        )
+        used_tracks: set[int] = set()
+        used_positions: set[int] = set()
+        for distance, index, pi in pairs:
+            if distance > cfg.match_position_track_step:
+                break
+            if index in used_tracks or pi in used_positions:
+                continue
+            position = positions[pi]
+            tracks[index]["points"].append(position)
+            tracks[index]["last"] = position
+            tracks[index]["last_time"] = sample_time
+            used_tracks.add(index)
+            used_positions.add(pi)
+        for pi, position in enumerate(positions):
+            if pi not in used_positions:
+                tracks.append({
+                    "points": [position], "last": position, "last_time": sample_time,
+                })
+
+    reliable = [
+        np.asarray(track["points"], dtype=float) for track in tracks
+        if len(track["points"]) >= int(cfg.match_position_min_frames)
+    ]
+    if len(reliable) < int(cfg.match_position_min_players):
+        return PositionSetupObservation(
+            point=point, best_strike=first_strike, setup_strikes=(), checked=True,
+            setup_evidence=False, score=0.0, server_end=None, server_span=None,
+            player_tracks=len(reliable), stable_tracks=0, stable_fraction=0.0,
+            sampled_frames=len(frames))
+
+    spans = [float(max(np.ptp(track[:, 0]), np.ptp(track[:, 1]))) for track in reliable]
+    stable = [span <= cfg.match_position_max_span for span in spans]
+    stable_count = int(sum(stable))
+    stable_fraction = float(stable_count / len(reliable))
+    calibrated = court is not None and frame_size is not None
+    candidates: list[tuple[float, str]] = []
+    for track, span, is_stable in zip(reliable, spans, stable):
+        if not is_stable:
+            continue
+        median_y = float(np.median(track[:, 1]))
+        if calibrated:
+            depth = cfg.match_position_court_baseline_depth
+            server_end = "near" if median_y <= depth else (
+                "far" if median_y >= 1.0 - depth else None)
+        else:
+            far0, far1 = cfg.match_position_far_baseline_y
+            near0, near1 = cfg.match_position_near_baseline_y
+            server_end = "far" if far0 <= median_y <= far1 else (
+                "near" if near0 <= median_y <= near1 else None)
+        if server_end is not None:
+            candidates.append((span, server_end))
+
+    if candidates:
+        server_span, server_end = min(candidates, key=lambda item: item[0])
+        stability_score = float(np.clip(
+            1.0 - server_span / max(cfg.match_position_max_span, 1e-9), 0.0, 1.0))
+    else:
+        server_span, server_end, stability_score = None, None, 0.0
+    score = float(stability_score * stable_fraction)
+    setup = bool(
+        candidates
+        and stable_fraction >= cfg.match_position_min_stable_fraction
+        and score >= cfg.match_position_min_score
+    )
+    return PositionSetupObservation(
+        point=point, best_strike=first_strike,
+        setup_strikes=(first_strike,) if setup else (), checked=True,
+        setup_evidence=setup, score=score, server_end=server_end,
+        server_span=server_span, player_tracks=len(reliable),
+        stable_tracks=stable_count, stable_fraction=stable_fraction,
+        sampled_frames=len(frames))
+
+
+def observe_position_setups(
+    points: Sequence[Segment],
+    onsets: np.ndarray,
+    player_samples,
+    cfg,
+    *,
+    court=None,
+    frame_size=None,
+) -> List[PositionSetupObservation]:
+    """Classify position setup for each point from the shared visual-pass detections."""
+    ordered = np.sort(np.asarray(onsets, dtype=float))
+    observations: List[PositionSetupObservation] = []
+    for point in points:
+        strikes = ordered[(ordered >= point[0] - 1e-9) & (ordered <= point[1] + 1e-9)]
+        considered = strikes[: int(cfg.match_serve_strikes_to_check)]
+        if not considered.size:
+            considered = np.array([float(point[0])])
+        per_strike = [
+            classify_position_setup(
+                point, float(strike), player_samples, cfg,
+                court=court, frame_size=frame_size)
+            for strike in considered
+        ]
+        best = max(
+            per_strike,
+            key=lambda item: (
+                int(item.setup_evidence), item.score,
+                item.stable_fraction, item.player_tracks),
+        )
+        setup_strikes = tuple(
+            float(item.best_strike) for item in per_strike
+            if item.setup_evidence and item.best_strike is not None
+        )
+        observations.append(replace(
+            best,
+            checked=any(item.checked for item in per_strike),
+            setup_evidence=bool(setup_strikes),
+            setup_strikes=setup_strikes,
+        ))
+    return observations
+
+
+def _joint_angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Angle ABC in degrees, guarded against collapsed pose keypoints."""
+    ba = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+    bc = np.asarray(c, dtype=float) - np.asarray(b, dtype=float)
+    denom = float(np.linalg.norm(ba) * np.linalg.norm(bc))
+    if denom <= 1e-9:
+        return float("nan")
+    cosine = float(np.clip(np.dot(ba, bc) / denom, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def observe_serve_setups(
+    video: str,
+    points: Sequence[Segment],
+    onsets: np.ndarray,
+    cfg,
+    cancel_check: Callable[[], None] = lambda: None,
+) -> List[ServeSetupObservation]:  # pragma: no cover - exercised with optional YOLO
+    """Observe the visible player setup immediately before each candidate's first hit.
+
+    A far-side serve is usually too small for dependable arm keypoints, so receiver posture
+    remains useful only as sequence context. Raw pose evidence requires the large near-side
+    player's wrist to rise substantially over the shoulder near an early impact; match
+    validation then pairs it with the separately measured stationary baseline formation.
+    TrackNet independently handles far-side and underarm serves.
+    """
+    import cv2
+    from ultralytics import YOLO
+
+    model = YOLO(discover_yolo_weights("yolov8n-pose.pt"))
+    device = resolve_yolo_device()
+    model.to(device)
+    ordered_onsets = np.sort(np.asarray(onsets, dtype=float))
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video}")
+
+    observations: List[ServeSetupObservation] = []
+    step = 1.0 / float(cfg.match_setup_fps)
+    try:
+        for point in points:
+            cancel_check()
+            start, end = point
+            strikes = ordered_onsets[
+                (ordered_onsets >= start - 1e-9) & (ordered_onsets <= end + 1e-9)
+            ]
+            serve_strikes = strikes[: int(cfg.match_serve_strikes_to_check)]
+            first = float(strikes[0]) if strikes.size else float(start)
+            sample_start = max(0.0, first - float(cfg.match_setup_lookback_s))
+            sample_end = max(sample_start, first - float(cfg.match_setup_end_before_strike_s))
+            side_times = np.arange(sample_start, sample_end + step * 0.25, step)
+            # The first accepted transient can be a bounce/feed. Sample around each of the
+            # first few impacts rather than scanning the full point; this catches a later
+            # serve without letting an ordinary mid-rally overhead become serve evidence.
+            pose_event_times = np.array([
+                float(strike) + offset
+                for strike in serve_strikes
+                for offset in np.arange(
+                    -cfg.match_overhead_window_s,
+                    cfg.match_overhead_window_s + step * 0.25,
+                    step,
+                )
+                if start <= float(strike) + offset <= end
+            ], dtype=float)
+            sample_times = np.unique(np.round(
+                np.concatenate((side_times, pose_event_times)), 6))
+
+            xs: List[float] = []
+            ready_frames = 0
+            overhead_frames = 0
+            overhead_max_ratio = 0.0
+            overhead_strikes: set[float] = set()
+            pose_frames = 0
+            sampled_frames = 0
+            for sample_time in sample_times:
+                cancel_check()
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(sample_time) * 1000.0)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                sampled_frames += 1
+                height, width = frame.shape[:2]
+                result = model.predict(
+                    frame, conf=0.15, classes=[0], verbose=False,
+                    imgsz=int(cfg.match_pose_imgsz),
+                    device=device,
+                )[0]
+                if result.keypoints is None or len(result.boxes) == 0:
+                    continue
+                boxes = result.boxes.xyxy.cpu().numpy()
+                keypoints = result.keypoints.xy.cpu().numpy()
+                confidence = (result.keypoints.conf.cpu().numpy()
+                              if result.keypoints.conf is not None else None)
+                candidates = [
+                    i for i, box in enumerate(boxes)
+                    if box[3] / height > 0.55
+                    and 0.06 < (box[0] + box[2]) / (2.0 * width) < 0.94
+                ]
+                if not candidates:
+                    continue
+                # The near player is much larger than the far player. Selecting by area
+                # per point also permits the players to swap ends between games; a global
+                # nearest-neighbour identity would incorrectly stick to the far player.
+                selected = max(
+                    candidates,
+                    key=lambda i: ((boxes[i][2] - boxes[i][0])
+                                   * (boxes[i][3] - boxes[i][1])),
+                )
+                box = boxes[selected]
+                pose = keypoints[selected]
+                conf = (confidence[selected] if confidence is not None
+                        else np.ones(pose.shape[0], dtype=float))
+                body_joints = (5, 6, 11, 12, 13, 14, 15, 16)
+                body_quality = float(np.mean(conf[list(body_joints)]))
+                if body_quality < 0.45:
+                    continue
+                pose_frames += 1
+                if sample_start - 1e-6 <= sample_time <= sample_end + 1e-6:
+                    xs.append(float((box[0] + box[2]) / (2.0 * width)))
+
+                knee_angles = []
+                for hip, knee, ankle in ((11, 13, 15), (12, 14, 16)):
+                    if min(float(conf[hip]), float(conf[knee]), float(conf[ankle])) > 0.2:
+                        angle = _joint_angle_deg(pose[hip], pose[knee], pose[ankle])
+                        if np.isfinite(angle):
+                            knee_angles.append(angle)
+                shoulder_mid = (pose[5] + pose[6]) / 2.0
+                hip_mid = (pose[11] + pose[12]) / 2.0
+                torso = float(np.linalg.norm(hip_mid - shoulder_mid))
+                stance = float("nan")
+                if torso > 1e-6 and min(float(conf[15]), float(conf[16])) > 0.2:
+                    stance = float(np.linalg.norm(pose[15] - pose[16]) / torso)
+                ready = ((knee_angles and min(knee_angles) <= cfg.match_ready_knee_deg)
+                         or (np.isfinite(stance)
+                             and stance >= cfg.match_ready_stance_ratio))
+                ready_frames += int(bool(ready))
+
+                if torso > 1e-6:
+                    shoulder_y = float((pose[5][1] + pose[6][1]) / 2.0)
+                    wrist_ratios = []
+                    for wrist in (9, 10):
+                        if (float(conf[wrist]) > 0.2
+                                and (pose[wrist][0] > 0 or pose[wrist][1] > 0)):
+                            wrist_ratios.append(
+                                (shoulder_y - float(pose[wrist][1])) / torso)
+                    ratio = max(wrist_ratios, default=-1.0)
+                    near_early_impact = any(
+                        abs(float(sample_time) - float(strike))
+                        <= cfg.match_overhead_window_s + 1e-9
+                        for strike in serve_strikes
+                    )
+                    if near_early_impact:
+                        overhead_max_ratio = max(overhead_max_ratio, float(ratio))
+                        if ratio >= cfg.match_overhead_wrist_ratio:
+                            overhead_frames += 1
+                            nearest_strike = min(
+                                serve_strikes,
+                                key=lambda strike: abs(
+                                    float(sample_time) - float(strike)),
+                            )
+                            overhead_strikes.add(float(nearest_strike))
+
+            near_x = float(np.median(xs)) if xs else None
+            x_std = float(np.std(xs)) if xs else None
+            side = None
+            side_confidence = 0.0
+            if (len(xs) >= 3 and x_std is not None
+                    and x_std <= cfg.match_side_max_std and near_x is not None):
+                distance = abs(near_x - 0.5)
+                if distance >= cfg.match_side_center_margin:
+                    side = "left" if near_x < 0.5 else "right"
+                    side_confidence = float(np.clip(
+                        (distance - cfg.match_side_center_margin) / 0.20, 0.0, 1.0))
+            serve_motion = overhead_frames > 0
+            setup = ready_frames >= cfg.match_min_ready_frames or serve_motion
+            observations.append(ServeSetupObservation(
+                point=(float(start), float(end)), first_strike=first,
+                side=side, side_confidence=side_confidence,
+                near_x=near_x, near_x_std=x_std, pose_frames=pose_frames,
+                sampled_frames=sampled_frames,
+                ready_frames=ready_frames, serve_motion=serve_motion,
+                setup_evidence=bool(setup), observable=sampled_frames >= 3,
+                overhead_frames=overhead_frames,
+                overhead_max_ratio=overhead_max_ratio,
+                overhead_strikes=tuple(sorted(overhead_strikes)),
+            ))
+    finally:
+        cap.release()
+    return observations
 
 
 # ---------------------------------------------------------------------------

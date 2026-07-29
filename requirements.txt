@@ -1,22 +1,3 @@
-# Core runtime (Phase-1 pipeline)
-numpy>=1.24
-scipy>=1.10
-opencv-python-headless>=4.8
-
-# ffmpeg + ffprobe. A system install is used if present; otherwise these bundled
-# static binaries are used automatically (see rally/io/ffmpeg.py). Either works.
-static-ffmpeg>=2.5
-
-# Web UI (rally.web) — FastAPI backend + static frontend
-fastapi>=0.110
-uvicorn[standard]>=0.27
-python-multipart>=0.0.9
-httpx>=0.27           # required by fastapi's TestClient (web tests)
-
-# Optional — enables the YOLO player-geometry / pose channels:
-#   pip install ultralytics
-# Optional — enables the TrackNet ball-tracking / ball-arbiter mode:
-#   pip install torch
-# Optional — only for fetching TrackNet weights from Google Drive
-# (handles the large-file confirm-token): pip install gdown
-#   then: python -m rally.tools.fetch_models --drive-id <ID>
+# Compatibility entry point for users following the README. pyproject.toml is the single
+# dependency source of truth; this installs every headless-compatible runtime feature.
+-e .[server]

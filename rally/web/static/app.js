@@ -54,18 +54,45 @@ const state = {
   jobs: [],
   current: null,        // full public job object
   pollTimer: null,
+  processingClockTimer: null,
   waveform: null,       // {duration, strikes[], segments[]}
   editSegments: null,   // [[start,end], ...] working copy while editing
   dirty: false,
+  detailJobId: null,    // requested detail, even while its GET is in flight
+  detailGeneration: 0, // invalidates stale job/waveform responses after navigation/mutation
+  videoTab: null,
+  hadOutput: false,
+  outputLayout: [],
+  activeUploads: new Map(),
+  uploadSequence: 0,
 };
+
+function beginDetailGeneration(id) {
+  state.detailGeneration += 1;
+  state.detailJobId = id;
+  return state.detailGeneration;
+}
+
+function detailRequestIsCurrent(id, generation) {
+  return state.detailJobId === id && state.detailGeneration === generation;
+}
 
 // --------------------------------------------------------------------------- //
 // gallery                                                                     //
 // --------------------------------------------------------------------------- //
 async function refreshGallery() {
   try {
-    const data = await api("/api/jobs");
-    state.jobs = data.jobs || [];
+    const jobs = [];
+    let offset = 0, total = 0;
+    do {
+      const data = await api(`/api/jobs?limit=100&offset=${offset}`);
+      const page = data.jobs || [];
+      jobs.push(...page);
+      total = data.total ?? jobs.length;
+      offset += page.length;
+      if (!page.length) break;
+    } while (offset < total);
+    state.jobs = jobs;
   } catch (e) {
     toast(`Could not load videos: ${e.message}`, "error");
     return;
@@ -109,8 +136,8 @@ function statusClass(job) {
   const s = job.processing?.stage || job.status;
   if (["complete", "ready"].includes(s)) return "ok";
   if (["failed", "error"].includes(s)) return "err";
-  if (["no_output"].includes(s)) return "warn";
-  if (["running", "queued", "starting", "audio", "visual", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
+  if (["no_output", "cancelled"].includes(s)) return "warn";
+  if (["running", "queued", "cancelling", "starting", "audio", "visual", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
   return "";
 }
 
@@ -126,22 +153,35 @@ function setupUpload() {
   const dz = $("#dropzone");
 
   input.addEventListener("change", () => {
-    $("#fileName").textContent = input.files[0]?.name || "Choose or drop a video";
+    const files = Array.from(input.files || []);
+    $("#fileName").textContent = files.length > 1
+      ? `${files.length} videos selected`
+      : (files[0]?.name || "Choose or drop videos");
   });
   ["dragover", "dragenter"].forEach((ev) =>
     dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((ev) =>
     dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
   dz.addEventListener("drop", (e) => {
-    const f = e.dataTransfer.files[0];
-    if (f) { input.files = e.dataTransfer.files; $("#fileName").textContent = f.name; }
+    const files = e.dataTransfer.files;
+    if (files.length) {
+      input.files = files;
+      $("#fileName").textContent = files.length > 1
+        ? `${files.length} videos selected` : files[0].name;
+    }
   });
 
   form.addEventListener("submit", (e) => {
     e.preventDefault();
-    const file = input.files[0];
-    if (!file) { toast("Pick a video first", "error"); return; }
-    uploadJob(file);
+    const files = Array.from(input.files || []);
+    if (!files.length) {
+      alert("Please select at least one local video before uploading.");
+      toast("Select a video first", "error");
+      return;
+    }
+    for (const file of files) uploadJob(file, files.length === 1);
+    input.value = "";
+    $("#fileName").textContent = "Choose or drop videos";
   });
 }
 
@@ -150,9 +190,31 @@ function numOrEmpty(id) {
   return v === "" ? null : v;
 }
 
-function uploadJob(file) {
+function paintUploadProgress() {
+  const uploads = Array.from(state.activeUploads.values());
+  const bar = $("#uploadProgress");
+  if (!uploads.length) {
+    bar.classList.add("hidden");
+    $("#uploadBar").value = 0;
+    $("#uploadPct").textContent = "0%";
+    return;
+  }
+  const pct = Math.round(uploads.reduce((sum, upload) => sum + upload.percent, 0) / uploads.length);
+  bar.classList.remove("hidden");
+  $("#uploadBar").value = pct;
+  $("#uploadPct").textContent = `${pct}%`;
+  $("#uploadText").textContent = uploads.length === 1
+    ? `Uploading ${uploads[0].name}…`
+    : `Uploading ${uploads.length} videos concurrently…`;
+}
+
+function uploadJob(file, openWhenBatchFinishes = false) {
+  const uploadId = ++state.uploadSequence;
+  state.activeUploads.set(uploadId, { name: file.name, percent: 0 });
+  paintUploadProgress();
   const fd = new FormData();
   fd.append("file", file);
+  fd.append("play_mode", $("#playMode").value);
   fd.append("detect_players", $("#detectPlayers").checked);
   fd.append("static_camera", $("#staticCamera").checked);
   fd.append("fast", $("#fast").checked);
@@ -163,7 +225,8 @@ function uploadJob(file) {
   fd.append("run_now", "true");
   const opt = {
     analysis_fps: "#analysisFps", min_rally: "#minRally", skip_intro: "#skipIntro",
-    gap: "#gap", serve_preroll: "#servePreroll", tail: "#tail",
+    gap: "#gap", start_buffer: "#startBuffer", end_buffer: "#endBuffer",
+    serve_preroll: "#servePreroll", tail: "#tail",
   };
   for (const [k, id] of Object.entries(opt)) {
     const v = numOrEmpty(id);
@@ -172,27 +235,21 @@ function uploadJob(file) {
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
-  const bar = $("#uploadProgress");
-  bar.classList.remove("hidden");
-  $("#uploadButton").disabled = true;
   xhr.upload.addEventListener("progress", (e) => {
     if (!e.lengthComputable) return;
     const pct = Math.round((e.loaded / e.total) * 100);
-    $("#uploadBar").value = pct;
-    $("#uploadPct").textContent = `${pct}%`;
-    $("#uploadText").textContent = pct < 100 ? "Uploading…" : "Processing on server…";
+    const upload = state.activeUploads.get(uploadId);
+    if (upload) upload.percent = pct;
+    paintUploadProgress();
   });
   xhr.addEventListener("load", () => {
-    $("#uploadButton").disabled = false;
-    bar.classList.add("hidden");
-    $("#uploadBar").value = 0;
+    state.activeUploads.delete(uploadId);
+    paintUploadProgress();
     if (xhr.status >= 200 && xhr.status < 300) {
       const job = JSON.parse(xhr.responseText);
-      $("#uploadForm").reset();
-      $("#fileName").textContent = "Choose or drop a video";
-      toast("Uploaded — processing started");
+      toast(`${file.name} uploaded — processing started`);
       refreshGallery();
-      openDetail(job.id);
+      if (openWhenBatchFinishes && state.activeUploads.size === 0) openDetail(job.id);
     } else {
       let msg = "upload failed";
       try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (_) {}
@@ -200,9 +257,13 @@ function uploadJob(file) {
     }
   });
   xhr.addEventListener("error", () => {
-    $("#uploadButton").disabled = false;
-    bar.classList.add("hidden");
-    toast("Upload failed (network)", "error");
+    state.activeUploads.delete(uploadId);
+    paintUploadProgress();
+    toast(`${file.name}: upload failed (network)`, "error");
+  });
+  xhr.addEventListener("abort", () => {
+    state.activeUploads.delete(uploadId);
+    paintUploadProgress();
   });
   xhr.send(fd);
 }
@@ -217,40 +278,81 @@ function showView(which) {
 
 async function openDetail(id) {
   stopPolling();
+  stopProcessingClock();
+  const generation = beginDetailGeneration(id);
   state.current = null;
   state.waveform = null;
   state.editSegments = null;
   state.dirty = false;
+  state.videoTab = null;
+  state.hadOutput = false;
+  state.outputLayout = [];
+  for (const video of [$("#originalVideo"), $("#outputVideo")]) {
+    video.pause();
+    video.removeAttribute("src");
+    video.dataset.src = "";
+    video.load();
+  }
   resetLabelingState();
   showView("detail");
   window.scrollTo(0, 0);
   try {
-    await loadJob(id);
+    const job = await loadJob(id, generation);
+    if (!job) return;
   } catch (e) {
+    if (!detailRequestIsCurrent(id, generation)) return;
     toast(`Could not open video: ${e.message}`, "error");
     backToGallery();
     return;
   }
-  startPolling(id);
+  startPolling(id, generation);
 }
 
 function backToGallery() {
   stopPolling();
+  stopProcessingClock();
+  beginDetailGeneration(null);
   showView("gallery");
   state.current = null;
+  $("#originalVideo").pause();
+  $("#outputVideo").pause();
   refreshGallery();
 }
 
-async function loadJob(id) {
+function selectVideoTab(tab) {
+  state.videoTab = tab === "original" ? "original" : "processed";
+  const original = state.videoTab === "original";
+  $("#processedPanel").classList.toggle("hidden", original);
+  $("#originalPanel").classList.toggle("hidden", !original);
+  $("#processedTab").classList.toggle("active", !original);
+  $("#originalTab").classList.toggle("active", original);
+  $("#processedTab").setAttribute("aria-selected", String(!original));
+  $("#originalTab").setAttribute("aria-selected", String(original));
+  if (original) {
+    $("#outputVideo").pause();
+    const video = $("#originalVideo");
+    const pending = video.dataset.pendingSrc || "";
+    if (pending && video.dataset.src !== pending) {
+      video.src = pending;
+      video.dataset.src = pending;
+      video.load();
+    }
+  } else {
+    $("#originalVideo").pause();
+  }
+}
+
+async function loadJob(id, generation = state.detailGeneration) {
   const job = await api(`/api/jobs/${id}`);
+  if (!detailRequestIsCurrent(id, generation)) return null;
   const first = !state.current || state.current.id !== id;
   state.current = job;
   renderDetail(job, first);
   const running = ["queued", "running"].includes(job.status);
   if (!running && (job.result || job.status === "complete" || job.status === "no_output")) {
-    await loadWaveform(id);
+    await loadWaveform(id, generation);
   }
-  return job;
+  return detailRequestIsCurrent(id, generation) ? job : null;
 }
 
 function renderDetail(job, first) {
@@ -271,6 +373,12 @@ function renderDetail(job, first) {
   $("#procBar").value = p.percent || 0;
   $("#procBar").className = job.status === "failed" ? "err" : "";
   $("#procDetail").textContent = job.error || p.detail || "";
+  const processing = ["queued", "running"].includes(job.status);
+  const stopButton = $("#stopProcessingButton");
+  stopButton.classList.toggle("hidden", !processing);
+  stopButton.disabled = Boolean(job.cancel_requested || p.stage === "cancelling");
+  stopButton.textContent = stopButton.disabled ? "Stopping…" : "Stop processing";
+  $("#reprocessButton").disabled = processing;
 
   // metrics
   $("#mPoints").textContent = r.n_rallies ?? 0;
@@ -279,23 +387,60 @@ function renderDetail(job, first) {
 
   // media
   const m = job.media || {};
-  if (first) {
-    const ov = $("#originalVideo");
-    ov.src = m.original || "";
+  const ov = $("#originalVideo");
+  const originalUrl = m.original || "";
+  if (ov.dataset.pendingSrc !== originalUrl) {
+    ov.dataset.pendingSrc = originalUrl;
+    if (state.videoTab !== "original") {
+      ov.pause();
+      ov.removeAttribute("src");
+      ov.dataset.src = "";
+      ov.load();
+    }
   }
   const outState = $("#outputState");
   const out = $("#outputVideo");
+  const gainedOutput = !state.hadOutput && Boolean(m.output);
+  state.hadOutput = Boolean(m.output);
+  state.outputLayout = Array.isArray(r.output_layout) ? r.output_layout : [];
   if (m.output) {
     if (out.dataset.src !== m.output) { out.src = m.output; out.dataset.src = m.output; }
     outState.classList.add("hidden");
+    $("#playerHitLayer").classList.remove("hidden");
+    $("#ballSpeed").classList.remove("hidden");
   } else {
     out.removeAttribute("src");
     out.dataset.src = "";
     outState.classList.remove("hidden");
-    outState.textContent = job.status === "failed"
+    const preview = $("#processingPreview");
+    if (m.thumbnail) {
+      if (preview.dataset.src !== m.thumbnail) {
+        preview.src = m.thumbnail;
+        preview.dataset.src = m.thumbnail;
+      }
+      preview.classList.remove("hidden");
+    } else {
+      preview.removeAttribute("src");
+      preview.dataset.src = "";
+      preview.classList.add("hidden");
+    }
+    const terminalState = p.stage || job.status;
+    const isProcessing = ["queued", "running"].includes(job.status);
+    $("#processingStatus").textContent = terminalState === "failed"
       ? "Processing failed — see log"
-      : (job.status === "no_output" ? (p.detail || "No rally video") : "Output appears after processing");
+      : (terminalState === "cancelled" ? "Processing stopped"
+        : (terminalState === "no_output" ? (p.detail || "No rally video")
+          : (isProcessing ? (p.label || "Processing video") : "Output appears after processing")));
+    const pct = Math.max(0, Math.min(100, Number(p.percent) || 0));
+    $("#processingPercent").textContent = `${Math.round(pct)}%`;
+    $("#processingBar").value = pct;
+    $("#playerHitLayer").classList.add("hidden");
+    $("#ballSpeed").classList.add("hidden");
   }
+  updateProcessingClock(job);
+  if (state.videoTab === null || gainedOutput) selectVideoTab("processed");
+  else selectVideoTab(state.videoTab);
+  updateOutputOverlay();
 
   // downloads
   setLink($("#dlOutput"), m.output_download);
@@ -303,6 +448,93 @@ function renderDetail(job, first) {
 
   // labeling section reflects the job's labeling status
   renderLabelingSection(job);
+}
+
+function processingStartMs(job) {
+  const progress = Array.isArray(job?.progress) ? job.progress : [];
+  // Start at submission so the clock includes queue time and never jumps backwards when
+  // the worker changes the state from queued to running.
+  for (let i = progress.length - 1; i >= 0; i -= 1) {
+    if (progress[i]?.message === "queued for processing") {
+      const value = Date.parse(progress[i].at);
+      if (Number.isFinite(value)) return value;
+    }
+  }
+  for (let i = progress.length - 1; i >= 0; i -= 1) {
+    if (progress[i]?.message === "processing started") {
+      const value = Date.parse(progress[i].at);
+      if (Number.isFinite(value)) return value;
+    }
+  }
+  return null;
+}
+
+function paintProcessingClock(job = state.current) {
+  const running = ["queued", "running"].includes(job?.status);
+  const started = processingStartMs(job);
+  const elapsed = running && started != null ? Math.max(0, (Date.now() - started) / 1000) : 0;
+  $("#processingElapsed").textContent = running ? `Elapsed ${fmtTime(elapsed)}` : "Processing stopped";
+}
+
+function updateProcessingClock(job) {
+  paintProcessingClock(job);
+  const running = ["queued", "running"].includes(job?.status);
+  if (running && !state.processingClockTimer) {
+    state.processingClockTimer = setInterval(() => paintProcessingClock(), 1000);
+  } else if (!running) {
+    stopProcessingClock();
+  }
+}
+
+function stopProcessingClock() {
+  if (state.processingClockTimer) {
+    clearInterval(state.processingClockTimer);
+    state.processingClockTimer = null;
+  }
+}
+
+function currentOutputPoint(time = $("#outputVideo").currentTime) {
+  const layout = state.outputLayout || [];
+  if (!layout.length || !isFinite(time)) return null;
+  for (let i = 0; i < layout.length; i += 1) {
+    const point = layout[i];
+    const nextStart = layout[i + 1]?.output_start ?? Infinity;
+    if (time >= point.output_start && time < nextStart) return { point, index: i };
+  }
+  if (time < layout[0].output_start) return { point: layout[0], index: 0 };
+  return { point: layout[layout.length - 1], index: layout.length - 1 };
+}
+
+function updateOutputOverlay() {
+  const current = currentOutputPoint();
+  $("#currentPoint").textContent = current ? `Point ${current.index + 1}` : "Point —";
+  const speed = current?.point?.peak_ball_speed_kmh;
+  $("#ballSpeed").textContent = Number.isFinite(speed)
+    ? `Ball ~${Math.round(speed)} km/h`
+    : "Ball speed unavailable";
+}
+
+function seekOutputPoint(delta) {
+  const layout = state.outputLayout || [];
+  if (!layout.length) return;
+  const current = currentOutputPoint();
+  const from = current ? current.index : 0;
+  const target = Math.max(0, Math.min(layout.length - 1, from + delta));
+  const video = $("#outputVideo");
+  video.currentTime = Math.max(0, Number(layout[target].output_start) || 0);
+  video.play().catch(() => {});
+  updateOutputOverlay();
+}
+
+function seekOriginal(time) {
+  selectVideoTab("original");
+  const video = $("#originalVideo");
+  const apply = () => {
+    video.currentTime = Math.max(0, time);
+    video.play().catch(() => {});
+  };
+  if (video.readyState >= 1) apply();
+  else video.addEventListener("loadedmetadata", apply, { once: true });
 }
 
 function setLink(el, href) {
@@ -313,12 +545,15 @@ function setLink(el, href) {
 // --------------------------------------------------------------------------- //
 // polling                                                                     //
 // --------------------------------------------------------------------------- //
-function startPolling(id) {
+function startPolling(id, generation = state.detailGeneration) {
   stopPolling();
   state.pollTimer = setInterval(async () => {
-    if (!state.current || state.current.id !== id) return stopPolling();
+    if (!detailRequestIsCurrent(id, generation) || !state.current || state.current.id !== id) {
+      return stopPolling();
+    }
     try {
-      const job = await loadJob(id);
+      const job = await loadJob(id, generation);
+      if (!job) return;
       if (!["queued", "running"].includes(job.status)) stopPolling();
     } catch (_) { stopPolling(); }
   }, 1500);
@@ -330,17 +565,21 @@ function stopPolling() {
 // --------------------------------------------------------------------------- //
 // waveform + timeline                                                         //
 // --------------------------------------------------------------------------- //
-async function loadWaveform(id) {
+async function loadWaveform(id, generation = state.detailGeneration) {
+  let waveform;
   try {
-    state.waveform = await api(`/api/jobs/${id}/waveform`);
+    waveform = await api(`/api/jobs/${id}/waveform`);
   } catch (_) {
-    state.waveform = { duration: (state.current.result || {}).total_seconds || 0, strikes: [], segments: [] };
+    waveform = { duration: (state.current?.result || {}).total_seconds || 0, strikes: [], segments: [] };
   }
+  if (!detailRequestIsCurrent(id, generation)) return false;
+  state.waveform = waveform;
   if (state.editSegments === null) {
     state.editSegments = (state.waveform.segments || []).map((s) => [s.start, s.end]);
   }
   renderSegments();
   drawTimeline();
+  return true;
 }
 
 function drawTimeline() {
@@ -396,9 +635,7 @@ function setupTimelineInteractions() {
     if (!dur) return;
     const rect = cv.getBoundingClientRect();
     const t = ((e.clientX - rect.left) / rect.width) * dur;
-    const ov = $("#originalVideo");
-    ov.currentTime = t;
-    ov.play().catch(() => {});
+    seekOriginal(t);
   });
   $("#originalVideo").addEventListener("timeupdate", () => {
     $("#origTime").textContent = fmtTime($("#originalVideo").currentTime);
@@ -406,8 +643,30 @@ function setupTimelineInteractions() {
   });
   $("#outputVideo").addEventListener("timeupdate", () => {
     $("#outTime").textContent = fmtTime($("#outputVideo").currentTime);
+    updateOutputOverlay();
   });
   window.addEventListener("resize", () => { if (state.waveform) drawTimeline(); });
+}
+
+function setupVideoPlayer() {
+  $("#processedTab").addEventListener("click", () => selectVideoTab("processed"));
+  $("#originalTab").addEventListener("click", () => selectVideoTab("original"));
+
+  const previous = $("#previousPointZone");
+  const next = $("#nextPointZone");
+  previous.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    seekOutputPoint(-1);
+  });
+  next.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    seekOutputPoint(1);
+  });
+  // Keyboard activation remains accessible even though pointer navigation deliberately
+  // requires a double-click to avoid accidental point jumps.
+  previous.addEventListener("click", (e) => { if (e.detail === 0) seekOutputPoint(-1); });
+  next.addEventListener("click", (e) => { if (e.detail === 0) seekOutputPoint(1); });
+
 }
 
 // --------------------------------------------------------------------------- //
@@ -428,9 +687,7 @@ function renderSegments() {
       <td><button class="row-del" data-i="${i}" title="Delete">✕</button></td>`;
     tr.addEventListener("click", (ev) => {
       if (ev.target.matches("input, button")) return;
-      const ov = $("#originalVideo");
-      ov.currentTime = s;
-      ov.play().catch(() => {});
+      seekOriginal(s);
     });
     body.appendChild(tr);
   });
@@ -476,6 +733,7 @@ function setupSegmentEditor() {
 async function applySegments() {
   if (!state.current) return;
   const id = state.current.id;
+  const generation = beginDetailGeneration(id);
   const segs = (state.editSegments || [])
     .map(([s, e]) => [Math.max(0, s), e])
     .filter(([s, e]) => e - s > 0.05)
@@ -488,16 +746,18 @@ async function applySegments() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ segments: segs }),
     });
+    if (!detailRequestIsCurrent(id, generation)) return;
     state.current = job;
     state.dirty = false;
     state.editSegments = null;
     renderDetail(job, false);
-    await loadWaveform(id);
+    await loadWaveform(id, generation);
     // force reload of output video (cache-busted URL from server)
     const out = $("#outputVideo");
     if (job.media?.output) { out.src = job.media.output; out.dataset.src = job.media.output; out.load(); }
     toast("Output re-cut from your edits");
   } catch (e) {
+    if (!detailRequestIsCurrent(id, generation)) return;
     toast(`Re-cut failed: ${e.message}`, "error");
     $("#applySegments").disabled = false;
   }
@@ -511,13 +771,42 @@ function setupDetailActions() {
   $("#galleryButton").addEventListener("click", backToGallery);
   $("#reprocessButton").addEventListener("click", async () => {
     if (!state.current) return;
+    const id = state.current.id;
+    const generation = beginDetailGeneration(id);
     try {
-      await api(`/api/jobs/${state.current.id}/process`, { method: "POST" });
+      const job = await api(`/api/jobs/${id}/process`, { method: "POST" });
+      if (!detailRequestIsCurrent(id, generation)) return;
+      state.current = job;
       state.editSegments = null;
+      state.waveform = null;
+      renderDetail(job, false);
       toast("Re-processing…");
-      startPolling(state.current.id);
-      loadJob(state.current.id);
-    } catch (e) { toast(e.message, "error"); }
+      startPolling(id, generation);
+      loadJob(id, generation);
+    } catch (e) {
+      if (detailRequestIsCurrent(id, generation)) toast(e.message, "error");
+    }
+  });
+  $("#stopProcessingButton").addEventListener("click", async () => {
+    if (!state.current || !["queued", "running"].includes(state.current.status)) return;
+    if (!confirm(`Stop processing "${state.current.filename}"?`)) return;
+    const id = state.current.id;
+    const generation = beginDetailGeneration(id);
+    $("#stopProcessingButton").disabled = true;
+    try {
+      const job = await api(`/api/jobs/${id}/cancel`, { method: "POST" });
+      if (!detailRequestIsCurrent(id, generation)) return;
+      state.current = job;
+      renderDetail(job, false);
+      toast(job.status === "cancelled" ? "Processing stopped" : "Stopping processing…");
+      if (["queued", "running"].includes(job.status)) startPolling(id, generation);
+      else stopPolling();
+    } catch (e) {
+      if (detailRequestIsCurrent(id, generation)) {
+        $("#stopProcessingButton").disabled = false;
+        toast(e.message, "error");
+      }
+    }
   });
   $("#deleteButton").addEventListener("click", async () => {
     if (!state.current) return;
@@ -850,6 +1139,17 @@ async function loadCapabilities() {
         }
       }
     }
+    const players = caps.players || {};
+    const playerBox = $("#detectPlayers");
+    if (playerBox && !players.available) {
+      playerBox.checked = false;
+      playerBox.disabled = true;
+      const playerLabel = playerBox.closest("label");
+      if (playerLabel) {
+        playerLabel.classList.add("disabled");
+        playerLabel.title = players.hint || "Player detector unavailable";
+      }
+    }
   } catch (_) { /* capabilities are best-effort; leave the toggle as-is */ }
 }
 
@@ -858,6 +1158,7 @@ function init() {
   setupDetailActions();
   setupSegmentEditor();
   setupTimelineInteractions();
+  setupVideoPlayer();
   setupLabeling();
   loadCapabilities();
   refreshGallery();

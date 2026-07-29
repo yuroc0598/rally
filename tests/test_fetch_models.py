@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from rally.tools.fetch_models import _drive_id_from_url, main
@@ -31,11 +33,17 @@ def test_main_drive_download_routes_through_gdown(monkeypatch, tmp_path):
 
     monkeypatch.setattr("rally.tools.fetch_models._download_drive", fake_drive)
     monkeypatch.setattr("rally.tools.fetch_models._verify", lambda p: calls.setdefault("verified", p))
+    monkeypatch.setattr("rally.tools.fetch_models._check_digest",
+                        lambda p, expected: calls.setdefault("digest_checked", p) or "0" * 64)
 
     dest = str(tmp_path / "tracknet.pt")
     rc = main(["--drive-id", FILE_ID, "--dest", dest])
     assert rc == 0
-    assert calls["id"] == FILE_ID and calls["dest"] == dest and calls["verified"] == dest
+    assert calls["id"] == FILE_ID
+    assert calls["dest"] == calls["verified"]
+    assert Path(calls["dest"]).parent == tmp_path
+    assert calls["dest"] != dest
+    assert Path(dest).exists()
 
     # a drive share URL is parsed to the same id
     calls.clear()

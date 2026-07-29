@@ -17,7 +17,11 @@ import pytest
 pytest.importorskip("cv2")
 pytest.importorskip("scipy")
 
-if shutil.which("ffmpeg") is None:
+from rally.io.ffmpeg import _require, _video_encoder  # noqa: E402
+
+try:  # resolve a *working* ffmpeg (skips broken PATH shims); skip cleanly if none
+    FFMPEG = _require("ffmpeg")
+except Exception:
     pytest.skip("ffmpeg not available", allow_module_level=True)
 
 from scipy.io import wavfile  # noqa: E402
@@ -41,7 +45,7 @@ def scratch_dir():
     os.makedirs(local, exist_ok=True)
     probe = os.path.join(local, "_probe.wav")
     wavfile.write(probe, SR, np.zeros(SR // 10, dtype=np.int16))
-    rc = _sp.run(["ffmpeg", "-v", "error", "-i", os.path.abspath(probe),
+    rc = _sp.run([FFMPEG, "-v", "error", "-i", os.path.abspath(probe),
                   "-f", "null", "-"], capture_output=True).returncode
     if rc != 0:
         _sh.rmtree(local, ignore_errors=True)
@@ -76,11 +80,12 @@ def _make_audio(path):
 
 
 def _make_video(audio_path, out_path):
+    vcodec, vargs = _video_encoder()
     subprocess.run(
-        ["ffmpeg", "-v", "error", "-y",
+        [FFMPEG, "-v", "error", "-y",
          "-f", "lavfi", "-i", f"color=c=black:s=320x240:r=25:d={DURATION}",
          "-i", audio_path,
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+         "-c:v", vcodec, *vargs, "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
          out_path],
         check=True,
     )

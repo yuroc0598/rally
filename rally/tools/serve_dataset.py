@@ -29,12 +29,15 @@ def candidates_from_audio(video: str, min_strikes: int = 2):
     cluster (>= min_strikes), minus the toss pre-roll. Fast — no video decode."""
     import numpy as np
 
-    from ..signals.audio import detect_strikes
+    from ..signals.audio import detect_strikes_stream
     from ..config import RallyConfig
-    from ..io.ffmpeg import load_audio_mono
+    from ..io.ffmpeg import iter_audio_mono
 
     cfg = RallyConfig()
-    on = detect_strikes(load_audio_mono(video, cfg.audio_sr), cfg.audio_sr, cfg)
+    on = detect_strikes_stream(
+        iter_audio_mono(video, cfg.audio_sr, chunk_s=60.0), cfg.audio_sr, cfg)
+    if on.size == 0:
+        return []
     clusters = [[float(on[0])]]
     for t in on[1:]:
         (clusters[-1].append(float(t)) if t - clusters[-1][-1] <= cfg.point_gap_s

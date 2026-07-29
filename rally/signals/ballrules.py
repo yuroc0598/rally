@@ -4,8 +4,9 @@ These are pure functions over a ball track (+ optional court homography), indepe
 how the track was produced (TrackNet or motion). They implement the common tennis rules
 the user asked for:
 
-* a **bounce** shows up as a local maximum of the ball's image-y (the ball reaches its
-  lowest point on screen — ground contact — then rebounds);
+* a **bounce candidate** needs a measured 2-D velocity turn, including a sufficiently
+  fast descent and rebound; an image-y maximum alone is retained only as a legacy signal
+  helper and is not used for in/out decisions;
 * mapping a bounce through the court homography gives its court-metre landing position
   (valid at ground contact), so we can decide **in/out** and **which side**;
 * a **point ends** when the ball bounces twice on the same side (second bounce) or lands
@@ -28,7 +29,7 @@ Event = Tuple[float, str]             # (time_s, reason)
 
 def detect_bounces(t: np.ndarray, y: np.ndarray, prominence_px: float = 8.0,
                    min_sep_s: float = 0.3, max_gap_s: float = 0.5) -> List[int]:
-    """Bounce sample-indices = local maxima of image-y (screen-lowest points).
+    """Legacy image-y peak candidates (not sufficient physical bounce evidence).
 
     NaN gaps are interpolated first. ``prominence_px`` filters shallow wobble; ``min_sep_s``
     is the refractory spacing between bounces. Peaks that fall inside a long interpolated
@@ -62,10 +63,30 @@ def detect_bounces(t: np.ndarray, y: np.ndarray, prominence_px: float = 8.0,
     return out
 
 
+def detect_bounces_2d(t: np.ndarray, x: np.ndarray, y: np.ndarray, *,
+                      max_gap_s: float = 0.5, **kw) -> List[int]:
+    """Bounce candidates backed by measured 2-D velocity before and after the turn.
+
+    This is the rule-facing bounce detector.  It reconstructs the short-gapped track and
+    delegates to :func:`trajectory.bounces_from_velocity`, which requires a meaningful
+    vector angle/magnitude change and real measurements on both sides of the event.
+    """
+    from .ball import BallTrack
+    from .trajectory import bounces_from_velocity, smooth_track
+
+    # ``bounces_in_court`` historically forwarded this image-y peak option.  Keep calls
+    # source-compatible, but do not let a one-dimensional prominence substitute for the
+    # vector evidence required here.
+    kw.pop("prominence_px", None)
+    track = BallTrack(np.asarray(t, float), np.asarray(x, float), np.asarray(y, float))
+    smooth = smooth_track(track, max_gap_s=max_gap_s)
+    return bounces_from_velocity(smooth, **kw)
+
+
 def bounces_in_court(t: np.ndarray, x: np.ndarray, y: np.ndarray, court,
                      **kw) -> List[Bounce]:
-    """Detected bounces as (time, court_x, court_y) via the homography."""
-    idxs = detect_bounces(t, y, **kw)
+    """2-D-velocity-backed bounces mapped into court coordinates."""
+    idxs = detect_bounces_2d(t, x, y, **kw)
     out: List[Bounce] = []
     for i in idxs:
         if np.isfinite(x[i]) and np.isfinite(y[i]):
