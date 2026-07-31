@@ -8,6 +8,8 @@ tests/_scratch_web/
 
 # web UI runtime data (uploads, outputs, job metadata)
 .rally_web/
+.rally_golden/
+.rally_golden*/
 _demo/
 *.mp4
 !tests/fixtures/*.mp4
@@ -15,17 +17,22 @@ _demo/
 candidates/
 train_candidates/
 *.h5
-models/*.h5
+
+# local model binaries; retain only the directory documentation
+models/*
+!models/README.md
 
 # environment-specific ffmpeg shim symlinks (point into .venv)
 .ffbin/
 
-# generated run outputs (JSON sidecars, logs, batch script; .mp4 already ignored)
-samples/
+# local golden inputs, annotations, and generated evaluation outputs
+samples/*
+!samples/README.md
 
 # internal AI review / audit notes (not part of the deliverable)
 feedback.claude
 feedback.muse
+feedback.performance
 
 # Local Claude Code session/agent state
 .claude/

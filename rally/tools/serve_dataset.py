@@ -8,6 +8,8 @@ then train a light serve classifier that generalises across the match.
 
 Usage:
     python -m rally.tools.serve_dataset match.mp4 rallies.json candidates/ [--pre 1.5 --post 3.0]
+    python -m rally.tools.serve_dataset from-web --job MATCH_ID VIDEO LABELS_JSON \
+        --job MATCH_ID_2 VIDEO_2 LABELS_JSON_2 --out serve-training.json
 
 Produces candidates/cand_00.mp4 ... and candidates/labels.csv (pre-filled, index+time),
 which you edit to set is_serve (1/0) and end (near/far).
@@ -20,6 +22,8 @@ import csv
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 from ..io.ffmpeg import _rel, _require
 
@@ -89,7 +93,49 @@ def export_serve_candidates(
     return len(rows)
 
 
+def export_web_training_dataset(job_args, out_path: str) -> dict:
+    """Adapt one or more web label exports/raw revisions into an offline dataset."""
+    from .serve_learning import WebJobSpec, build_training_dataset
+
+    specs = [WebJobSpec(match_id, video, labels)
+             for match_id, video, labels in job_args]
+    dataset = build_training_dataset(specs)
+    destination = Path(out_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        with temporary.open("w") as handle:
+            json.dump(dataset, handle, indent=2)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return dataset
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "from-web":
+        p = argparse.ArgumentParser(
+            prog="rally.tools.serve_dataset from-web",
+            description=("Build a grouped offline serve-training dataset from web "
+                         "labels_export.json (or sibling labels.json/tasks.json) files."),
+        )
+        p.add_argument(
+            "--job", nargs=3, action="append", required=True,
+            metavar=("MATCH_ID", "VIDEO", "LABELS_JSON"),
+            help="repeat once per independent match; MATCH_ID is the validation group",
+        )
+        p.add_argument("--out", required=True, help="versioned dataset JSON to write")
+        args = p.parse_args(argv[1:])
+        dataset = export_web_training_dataset(args.job, args.out)
+        positives = sum(sample["label"] for sample in dataset["samples"])
+        print(
+            f"wrote {len(dataset['samples'])} labeled candidates from "
+            f"{len(dataset['matches'])} matches to {args.out} "
+            f"({positives} serve, {len(dataset['samples']) - positives} non-serve)"
+        )
+        return 0
+
     p = argparse.ArgumentParser(prog="rally.tools.serve_dataset",
                                 description="Export serve-candidate clips for labelling.")
     p.add_argument("video")

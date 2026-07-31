@@ -10,12 +10,15 @@ from rally.pipeline import (
     _bounded_arbiter_regions,
     _ball_arbiter,
     _apply_ball_end_hints,
+    _aligned_receiver_reaction_hint,
     _coherent_audio_fallback,
+    _clamp_player_recovered_starts,
     _derive_points,
     _indeterminate_audio_fallback,
     _merge_point_sources,
     _player_activity_proposal,
     _recover_player_hint_points,
+    _recover_fragmented_match_ends,
     trim,
 )
 
@@ -37,12 +40,84 @@ def test_stable_receiver_transition_opens_serve_hint():
     assert ch.player_serve_hints.size == 1
     assert 2.0 <= ch.player_serve_hints[0] <= 3.0
 
+    audio_supported = _Channels(
+        near_track=(px.copy(), py.copy()), onsets=np.array([2.7]))
+    assert not np.any(_player_activity_proposal(audio_supported, cfg))
+    assert audio_supported.player_serve_hints.size == 1
+    assert audio_supported.player_proposal_hints.size == 0
+    assert (audio_supported.stages["player_activity_proposal"]
+            ["audio_supported_hints_suppressed"] == 1)
+
     # Sustained motion without a preceding stable formation is ordinary movement, not a
     # reason to spend TrackNet work or manufacture a serve hint.
     px[sample_indices] = np.linspace(0.30, 0.70, sample_indices.size)
     moving_only = _Channels(near_track=(px, py))
     assert not np.any(_player_activity_proposal(moving_only, cfg))
     assert moving_only.player_serve_hints.size == 0
+
+
+def test_receiver_reaction_hint_aligns_only_to_early_candidate_events():
+    cfg = RallyConfig(
+        match_serve_strikes_to_check=2,
+        match_player_hint_audio_guard_s=0.25,
+    )
+    observation = SimpleNamespace(point=(10.0, 20.0), first_strike=11.0)
+
+    assert _aligned_receiver_reaction_hint(
+        observation, np.array([11.0, 12.0, 18.0]), np.array([11.2]), cfg,
+    ) == 11.2
+    assert _aligned_receiver_reaction_hint(
+        observation, np.array([11.0, 12.0, 18.0]), np.array([18.0]), cfg,
+    ) is None
+
+
+def test_receiver_reaction_recovers_serve_just_before_late_candidate_start():
+    cfg = RallyConfig(
+        match_point_start_preroll_s=4.0,
+        match_serve_strikes_to_check=2,
+        match_player_hint_audio_guard_s=0.25,
+    )
+    observation = SimpleNamespace(point=(10.0, 20.0), first_strike=11.0)
+
+    assert _aligned_receiver_reaction_hint(
+        observation, np.array([7.0, 11.0, 12.0]), np.array([7.1]), cfg,
+    ) == 7.1
+
+
+def test_prior_fragment_contacts_do_not_consume_candidate_reaction_budget():
+    cfg = RallyConfig(
+        match_point_start_preroll_s=4.0,
+        match_serve_strikes_to_check=3,
+        match_player_hint_audio_guard_s=1.0,
+    )
+    observation = SimpleNamespace(point=(10.0, 20.0), first_strike=11.0)
+
+    # The two lookback contacts belong to a preceding proposal. The reaction still aligns
+    # to one of the first three impacts owned by this candidate.
+    assert _aligned_receiver_reaction_hint(
+        observation,
+        np.array([7.0, 8.0, 11.0, 11.4, 12.2, 18.0]),
+        np.array([12.1]),
+        cfg,
+    ) == 12.1
+    assert _aligned_receiver_reaction_hint(
+        observation,
+        np.array([7.0, 8.0, 11.0, 11.4, 12.2, 18.0]),
+        np.array([18.0]),
+        cfg,
+    ) is None
+
+
+def test_reaction_just_before_candidate_can_align_to_first_candidate_impact():
+    cfg = RallyConfig(
+        match_serve_strikes_to_check=3,
+        match_player_hint_audio_guard_s=1.5,
+    )
+    observation = SimpleNamespace(point=(10.0, 20.0), first_strike=11.0)
+
+    assert _aligned_receiver_reaction_hint(
+        observation, np.array([11.0, 12.0]), np.array([9.7]), cfg,
+    ) == 9.7
 
 
 def test_fragmented_ball_structure_recovers_only_with_player_serve_hint():
@@ -54,11 +129,15 @@ def test_fragmented_ball_structure_recovers_only_with_player_serve_hint():
     )
     report = SimpleNamespace(candidates=[SimpleNamespace(
         candidate=(2.0, 8.0), verdict=verdict)])
-    ch = _Channels(player_serve_hints=np.array([3.0]))
+    ch = _Channels(
+        player_serve_hints=np.array([3.0]),
+        player_proposal_hints=np.array([3.0]),
+    )
 
     assert _recover_player_hint_points(report, ch, cfg) == [(2.0, 8.0)]
 
     ch.player_serve_hints = np.zeros(0)
+    ch.player_proposal_hints = np.zeros(0)
     assert _recover_player_hint_points(report, ch, cfg) == []
 
     # A short fragmented tail with one measured bounce may reach match validation, where
@@ -66,7 +145,32 @@ def test_fragmented_ball_structure_recovers_only_with_player_serve_hint():
     verdict.in_play_span_s = 1.05
     verdict.n_bounces = 1
     ch.player_serve_hints = np.array([3.0])
+    ch.player_proposal_hints = np.array([3.0])
     assert _recover_player_hint_points(report, ch, cfg) == [(2.0, 8.0)]
+
+
+def test_short_aligned_ball_component_can_recall_audio_missed_point():
+    verdict = SimpleNamespace(
+        state="indeterminate", reason_code="component_too_short",
+        selected_component=(99.16, 100.10), in_play_span_s=0.934,
+        measured_coverage=1.0, strike_aligned=True,
+        n_bounces=0, n_net_crossings=0,
+    )
+    report = SimpleNamespace(candidates=[SimpleNamespace(
+        candidate=(97.2, 101.9), verdict=verdict)])
+    ch = _Channels(
+        player_serve_hints=np.array([98.7]),
+        player_proposal_hints=np.array([98.7]),
+    )
+
+    assert _recover_player_hint_points(report, ch, RallyConfig()) == [(97.7, 104.9)]
+    assert ch.player_recovered_points == [(97.7, 104.9)]
+    assert _clamp_player_recovered_starts([(94.7, 104.9)], ch) == [(97.2, 104.9)]
+
+    # A late recovery fragment may overlap a point that already has an independently
+    # established start. It must not delete most of that point.
+    ch.player_recovered_points = [(96.5, 102.5)]
+    assert _clamp_player_recovered_starts([(74.1, 97.3)], ch) == [(74.1, 97.3)]
 
 
 def test_short_video_keeps_complete_proposal_set():
@@ -228,6 +332,54 @@ def test_selected_audio_fallback_uses_abstentions_but_not_explicit_rejects():
     assert superseded == 1       # accepted ball bounds replace its audio bounds
 
 
+def test_fragmented_multi_hit_match_point_recovers_bounded_visual_tail():
+    point = (241.6, 249.2)
+    ch = _Channels(
+        onsets=np.array([245.0, 246.0, 247.2, 248.2]),
+        arbiter_fragmented_regions=[(244.0, 252.7)],
+    )
+
+    recovered = _recover_fragmented_match_ends(
+        [point], ch, RallyConfig(arbiter_fragmented_end_recovery_s=2.0),
+    )
+
+    assert recovered == [(241.6, 251.2)]
+    assert ch.stages["match_state"]["fragmented_end_recoveries"]
+
+    one_hit = _Channels(
+        onsets=np.array([245.0]),
+        arbiter_fragmented_regions=[(244.0, 252.7)],
+    )
+    assert _recover_fragmented_match_ends([point], one_hit, RallyConfig()) == [point]
+
+
+def test_fragmented_visual_tail_stops_before_next_acoustic_candidate():
+    point = (10.0, 16.0)
+    ch = _Channels(
+        onsets=np.array([11.0, 12.0, 13.0, 15.0, 17.2]),
+        arbiter_fragmented_regions=[(9.0, 20.0)],
+    )
+
+    recovered = _recover_fragmented_match_ends(
+        [point], ch, RallyConfig(arbiter_fragmented_end_recovery_s=2.0),
+    )
+
+    assert recovered[0][0] == 10.0
+    assert np.isclose(recovered[0][1], 17.1)
+
+
+def test_validated_terminal_point_can_reach_source_boundary():
+    point = (276.9, 286.1)
+    ch = _Channels(
+        onsets=np.array([279.8, 280.9, 284.6, 285.7]),
+        arbiter_indeterminate_regions=[(282.7, 290.3)],
+    )
+
+    assert _recover_fragmented_match_ends(
+        [point], ch, RallyConfig(), duration=290.3,
+    ) == [(276.9, 290.3)]
+
+
 def test_partial_accept_cannot_truncate_a_boundary_split_whole_point():
     point = (43.0, 51.2)
     ch = _Channels(
@@ -255,7 +407,7 @@ def test_ball_arbiter_consumes_tri_state_verification_report(monkeypatch, tmp_pa
     candidates = [(10.0, 14.0), (30.0, 34.0), (50.0, 54.0)]
     entries = [
         SimpleNamespace(candidate=candidates[0], verdict=SimpleNamespace(
-            state="accept", evidence_core=None, selected_component=None)),
+            state="accept", evidence_core=(10.5, 13.5), selected_component=None)),
         SimpleNamespace(candidate=candidates[1], verdict=SimpleNamespace(
             state="indeterminate", evidence_core=None, selected_component=None)),
         SimpleNamespace(candidate=candidates[2], verdict=SimpleNamespace(
@@ -272,14 +424,16 @@ def test_ball_arbiter_consumes_tri_state_verification_report(monkeypatch, tmp_pa
 
     ch = _Channels(onsets=np.zeros(0))
     got = _ball_arbiter(
-        "unused.mp4", candidates, ch, RallyConfig(), lambda _m: None,
+        "unused.mp4", candidates, ch, RallyConfig(play_mode="casual"), lambda _m: None,
         weights=str(weights),
     )
     assert got == [(10.5, 13.5)]
-    assert ch.arbiter_accepted_regions == [(10.0, 14.0)]
+    assert ch.arbiter_accepted_regions == [(10.5, 13.5)]
     assert ch.arbiter_indeterminate_regions == [(30.0, 34.0)]
     assert ch.arbiter_rejected_regions == [(51.0, 53.0)]
     assert ch.stages["ball_arbiter"]["verification"]["counts"]["reject"] == 1
+    assert ch.stages["ball_arbiter"]["weights_provenance"] == "unknown_local_checkpoint"
+    assert ch.stages["ball_arbiter"]["weights_license"] == "unknown"
 
 
 def test_degraded_arbiter_failure_never_publishes_broad_proposals(monkeypatch, tmp_path):
@@ -303,7 +457,8 @@ def test_degraded_arbiter_failure_never_publishes_broad_proposals(monkeypatch, t
     )
 
     primary = _ball_arbiter(
-        "unused.mp4", candidates, ch, RallyConfig(allow_degraded=True),
+        "unused.mp4", candidates, ch,
+        RallyConfig(play_mode="casual", allow_degraded=True),
         lambda _m: None, weights=str(weights),
     )
     assert primary == []

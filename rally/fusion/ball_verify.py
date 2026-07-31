@@ -26,17 +26,59 @@ model, or weights. :func:`verify_segments` is the orchestrator that does the tra
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, List, Literal, Optional, Tuple
 
 import numpy as np
 
-from ..signals.ballrules import ball_speed_kmh, point_end_events, refine_end_from_events
-from ..signals.court import COURT_L, NET_Y
+from ..signals.ballrules import ball_speed_kmh, is_in, point_end_events, refine_end_from_events
+from ..signals.court import COURT_L, DOUBLES_W, NET_Y
 from ..signals.trajectory import SmoothTrack, bounces_from_velocity, smooth_track
+from .intervals import trim_previous_on_overlap
 
 Segment = Tuple[float, float]
 VerdictState = Literal["accept", "reject", "indeterminate"]
+
+BALL_SPEED_LIMITATIONS = (
+    "single-camera homography measures court-plane displacement, not full 3-D velocity",
+    "ball height is not recovered, so airborne speed is generally underestimated",
+    "court calibration and ball-tracking error can inflate or suppress the estimate",
+)
+
+
+def _ground_plane_speed_estimate(
+    values: np.ndarray, measured_fraction: float,
+) -> Optional[dict[str, Any]]:
+    """Summarise a robust peak with an honest heuristic error scale.
+
+    This is deliberately not labelled a confidence interval: the dominant missing-height
+    error is systematic and cannot be inferred from a single camera. The 30% geometry
+    floor is inflated for sparse trajectory coverage and small samples.
+    """
+    values = np.asarray(values, float)
+    values = values[np.isfinite(values)]
+    if values.size < 3:
+        return None
+    value = float(np.percentile(values, 95))
+    coverage = float(np.clip(measured_fraction, 0.0, 1.0))
+    relative_error = (
+        0.30
+        + 0.20 * (1.0 - coverage)
+        + 0.15 * min(1.0, 8.0 / float(values.size))
+    )
+    return {
+        "value_kmh": round(value, 1),
+        "uncertainty_kmh": round(value * relative_error, 1),
+        "uncertain": True,
+        "method": "single_camera_ground_plane_p95",
+        "sample_count": int(values.size),
+        "measured_fraction": round(coverage, 4),
+        "uncertainty_basis": (
+            "heuristic error scale from a 30% single-camera geometry floor, "
+            "inflated for sparse trajectory evidence; not a confidence interval"
+        ),
+        "limitations": list(BALL_SPEED_LIMITATIONS),
+    }
 
 
 @dataclass
@@ -103,6 +145,7 @@ class CandidateVerification:
     verdict: RallyVerdict
     output: Optional[Segment] = None
     peak_ball_speed_kmh: Optional[float] = None
+    ball_speed_estimate: Optional[dict[str, Any]] = None
 
     def as_dict(self) -> dict[str, Any]:
         data = self.verdict.as_dict()
@@ -113,6 +156,7 @@ class CandidateVerification:
                        if self.output is not None else None),
             "peak_ball_speed_kmh": (round(float(self.peak_ball_speed_kmh), 1)
                                     if self.peak_ball_speed_kmh is not None else None),
+            "ball_speed_estimate": self.ball_speed_estimate,
         })
         return data
 
@@ -121,6 +165,10 @@ class CandidateVerification:
 class VerificationReport:
     segments: List[Segment]
     candidates: List[CandidateVerification]
+    # Ephemeral raw tracks are intentionally excluded from ``as_dict``. They are reused by
+    # serve validation in the same pipeline run, avoiding a second TrackNet decode.
+    track_cache: List[Tuple[Segment, Any]] = field(default_factory=list, repr=False)
+    inference_batch_size: Optional[int] = None
 
     def as_dict(self) -> dict[str, Any]:
         counts = {state: sum(c.verdict.state == state for c in self.candidates)
@@ -129,8 +177,27 @@ class VerificationReport:
             "segments": [[round(float(s), 3), round(float(e), 3)]
                          for s, e in self.segments],
             "counts": counts,
+            "inference_batch_size": self.inference_batch_size,
             "candidates": [candidate.as_dict() for candidate in self.candidates],
         }
+
+
+def _group_tracking_windows(
+    segments: List[Segment], pre_pad_s: float, post_pad_s: float,
+    max_extend_s: float, max_group_s: float,
+) -> List[Tuple[float, float, List[Segment]]]:
+    """Merge padding overlap without allowing one transitive near-full-video group."""
+    grouped: List[Tuple[float, float, List[Segment]]] = []
+    tail = max(post_pad_s, max_extend_s)
+    for s, e in sorted(segments):
+        ts, te = max(0.0, s - pre_pad_s), e + tail
+        if (grouped and ts <= grouped[-1][1]
+                and max(grouped[-1][1], te) - grouped[-1][0] <= max_group_s):
+            gs, ge, members = grouped[-1]
+            grouped[-1] = (gs, max(ge, te), [*members, (s, e)])
+        else:
+            grouped.append((ts, te, [(s, e)]))
+    return grouped
 
 
 def _verdict(state: VerdictState, start: float, end: float, *,
@@ -262,7 +329,8 @@ def _audio_aligned_trajectory_end(
 
 def _net_crossings(track: SmoothTrack, court, in_play: np.ndarray,
                    dead_band_m: float = 0.5,
-                   max_gap_s: float = 0.35) -> int:
+                   max_gap_s: float = 0.35,
+                   court_margin_m: float = 0.35) -> int:
     """Count times the ball crosses the net, in court metres.
 
     The ball's court-y is compared to the net line with a dead-band so jitter around the
@@ -275,13 +343,20 @@ def _net_crossings(track: SmoothTrack, court, in_play: np.ndarray,
     if idx.size < 2:
         return 0
     pts = np.stack([track.x[idx], track.y[idx]], axis=1)
-    cy = court.to_court(pts)[:, 1]
+    court_pts = court.to_court(pts)
     side = 0            # -1 near, +1 far, 0 unknown (inside dead-band)
     side_time = None
     crossings = 0
-    for sample_i, v in zip(idx, cy):
+    for sample_i, (court_x, court_y) in zip(idx, court_pts):
         sample_t = float(track.t[sample_i])
-        s = -1 if v < NET_Y - dead_band_m else (1 if v > NET_Y + dead_band_m else 0)
+        # A neighboring-court trajectory can cross target net-y after homography
+        # projection. It is rally structure only while inside the target doubles court.
+        if not is_in(float(court_x), float(court_y), court_margin_m, singles=False):
+            side = 0
+            side_time = None
+            continue
+        s = (-1 if court_y < NET_Y - dead_band_m
+             else (1 if court_y > NET_Y + dead_band_m else 0))
         if s == 0:
             continue
         if side_time is not None and sample_t - side_time > max_gap_s:
@@ -312,6 +387,73 @@ def _strike_local_cores(serve_times: Optional[np.ndarray], win_start: float,
         if end > start:
             cores.append((start, end))
     return cores
+
+
+def _off_target_audio_contradiction(
+    track: SmoothTrack, court, live: np.ndarray, core: np.ndarray,
+    strikes: Optional[np.ndarray], *, court_margin_m: float,
+    target_serve_times: Optional[np.ndarray] = None,
+    target_motion_times: Optional[np.ndarray] = None,
+    min_live_fraction: float = 0.20, min_aligned_strikes: int = 2,
+    max_strike_distance_s: float = 0.80,
+) -> bool:
+    """Whether coherent measured activity belongs clearly to another court.
+
+    Merely missing the target ball is never negative evidence. This stronger condition
+    requires substantial moving-ball coverage, at least two audio impacts aligned to that
+    motion, and at least 90% of the motion to be several metres outside the target court.
+    It identifies the common multi-court failure where TrackNet and audio both follow the
+    neighboring point, rather than treating an ordinary out ball as a contradiction.
+    """
+    if court is None or strikes is None:
+        return False
+    core_times = np.asarray(track.t, float)[np.asarray(core, bool)]
+    if not core_times.size:
+        return False
+    core_start, core_end = float(core_times[0]), float(core_times[-1])
+
+    # TrackNet emits one trajectory, not one trajectory per court. In multi-court footage
+    # it can lock onto a well-lit neighboring ball while missing the target ball. That is
+    # a contradiction only when the calibrated target court is independently quiet.
+    # Player-derived serve/reaction hints are sparse events; target-masked frame motion is
+    # continuous support and therefore needs at least two samples before it can veto.
+    if target_serve_times is not None:
+        target_serves = np.asarray(target_serve_times, float)
+        target_serves = target_serves[np.isfinite(target_serves)]
+        if np.any((target_serves >= core_start - max_strike_distance_s)
+                  & (target_serves <= core_end + max_strike_distance_s)):
+            return False
+    if target_motion_times is not None:
+        target_motion = np.asarray(target_motion_times, float)
+        target_motion = target_motion[np.isfinite(target_motion)]
+        supported = ((target_motion >= core_start)
+                     & (target_motion <= core_end))
+        if int(np.sum(supported)) >= 2:
+            return False
+    live_idx = np.flatnonzero(np.asarray(live, bool) & np.asarray(core, bool))
+    core_count = int(np.sum(core))
+    if live_idx.size < 2 or live_idx.size / max(core_count, 1) < min_live_fraction:
+        return False
+    court_pts = court.to_court(np.stack([
+        np.asarray(track.x)[live_idx], np.asarray(track.y)[live_idx],
+    ], axis=1))
+    # Two metres is deliberately much wider than line-call tolerance: a normal out ball
+    # must not turn an uncertain target-court track into an explicit rejection.
+    clear_margin = max(2.0, float(court_margin_m))
+    clearly_outside = np.array([
+        not is_in(float(x), float(y), clear_margin, singles=False)
+        for x, y in court_pts
+    ], dtype=bool)
+    if float(np.mean(clearly_outside)) < 0.90:
+        return False
+    outside_times = np.asarray(track.t, float)[live_idx[clearly_outside]]
+    candidate_strikes = np.asarray(strikes, float)
+    candidate_strikes = candidate_strikes[np.isfinite(candidate_strikes)]
+    aligned = sum(
+        bool(np.any(np.abs(outside_times - strike) <= max_strike_distance_s))
+        for strike in candidate_strikes
+    )
+    return aligned >= min_aligned_strikes
 
 
 def _component_verdict(
@@ -351,8 +493,17 @@ def _component_verdict(
     bounce_idx = bounces_from_velocity(track, min_descent_px_s=bounce_min_descent_px_s,
                                        min_conf=min_conf)
     bounce_idx = [i for i in bounce_idx if in_play[i]]
-    n_bounces = len(bounce_idx)
-    n_cross = _net_crossings(track, court, in_play)
+    structure_bounce_idx = bounce_idx
+    if court is not None and bounce_idx:
+        bounce_court = court.to_court(np.stack([
+            np.asarray(track.x)[bounce_idx], np.asarray(track.y)[bounce_idx],
+        ], axis=1))
+        structure_bounce_idx = [
+            i for i, (court_x, court_y) in zip(bounce_idx, bounce_court)
+            if is_in(float(court_x), float(court_y), margin_m, singles=False)
+        ]
+    n_bounces = len(structure_bounce_idx)
+    n_cross = _net_crossings(track, court, in_play, court_margin_m=margin_m)
 
     strikes = None if serve_times is None else np.asarray(serve_times, float)
     serve_time = None
@@ -366,10 +517,12 @@ def _component_verdict(
 
     baseline_start = False
     if court is not None:
-        _cx, start_y = court.to_court(
+        start_x, start_y = court.to_court(
             [[float(track.x[live_idx[0]]), float(track.y[live_idx[0]])]])[0]
-        baseline_start = bool(start_y <= serve_baseline_margin_m
-                              or start_y >= COURT_L - serve_baseline_margin_m)
+        baseline_start = bool(
+            -margin_m <= start_x <= DOUBLES_W + margin_m
+            and (start_y <= serve_baseline_margin_m
+                 or start_y >= COURT_L - serve_baseline_margin_m))
 
     short_serve = (serve_time is not None and baseline_start and n_cross >= 1
                    and span >= min(0.5, min_in_play_span_s)
@@ -459,7 +612,12 @@ def rally_verdict(
     double_bounce_window_s: float = 2.5,
     margin_m: float = 0.35,
     serve_times: Optional[np.ndarray] = None,
+    audio_strike_times: Optional[np.ndarray] = None,
+    target_serve_times: Optional[np.ndarray] = None,
+    target_motion_times: Optional[np.ndarray] = None,
     require_serve_evidence: bool = False,
+    require_court: bool = False,
+    strike_cluster_gap_s: float = 2.5,
     serve_lag_s: float = 1.5,
     serve_baseline_margin_m: float = 3.0,
 ) -> RallyVerdict:
@@ -472,6 +630,13 @@ def rally_verdict(
     """
     t = np.asarray(track.t, float)
     court_available = court is not None
+    if require_court and not court_available:
+        return _verdict(
+            "indeterminate", win_start, win_end,
+            reason_code="target_court_geometry_required",
+            reason="target-court geometry is required for match/auto verification",
+            court_available=False,
+        )
     if t.size < 3:
         return _verdict("indeterminate", win_start, win_end,
                         reason_code="track_too_short",
@@ -509,6 +674,29 @@ def rally_verdict(
                     "TrackNet coverage is too low to decide whether a ball was live"),
             candidate_coverage=candidate_coverage, court_available=court_available)
 
+    contradiction_strikes = (
+        serve_times if audio_strike_times is None else audio_strike_times)
+    if _off_target_audio_contradiction(
+            track, court, all_live, core, contradiction_strikes,
+            court_margin_m=margin_m,
+            target_serve_times=target_serve_times,
+            target_motion_times=target_motion_times):
+        live_idx = np.flatnonzero(all_live & core)
+        measured_coverage = float(np.mean(np.asarray(track.measured, bool)[live_idx]))
+        span = float(t[live_idx[-1]] - t[live_idx[0]])
+        return _verdict(
+            "reject", win_start, win_end,
+            reason_code="audio_aligned_activity_outside_target_court",
+            reason=("measured moving-ball activity aligned to multiple impacts belongs "
+                    "clearly outside the calibrated target court"),
+            in_play_frac=float(live_idx.size / core_count), in_play_span_s=span,
+            measured_coverage=measured_coverage,
+            candidate_coverage=candidate_coverage,
+            n_live_components=len(raw_components),
+            selected_component=(float(t[live_idx[0]]), float(t[live_idx[-1]])),
+            evidence_core=(win_start, win_end), strike_aligned=True,
+            court_available=True)
+
     trajectory_end_hint = _audio_aligned_trajectory_end(
         raw_components, t, serve_times, win_start, win_end, tail_s=tail_s)
 
@@ -517,7 +705,7 @@ def rally_verdict(
 
     strike_cores = _strike_local_cores(
         serve_times, win_start, win_end, pre_s=toss_preroll_s,
-        post_s=max(tail_s, 0.5))
+        post_s=max(tail_s, 0.5), cluster_gap_s=strike_cluster_gap_s)
     evaluated: List[RallyVerdict] = []
     for component in components:
         a, b = component
@@ -568,19 +756,7 @@ def rally_verdict(
 
 def _dedupe_non_overlapping(segments: List[Segment]) -> List[Segment]:
     """Sort and remove overlaps, preserving each segment's (serve) start where possible."""
-    out: List[Segment] = []
-    for s, e in sorted(segments):
-        if e <= s:
-            continue
-        if out:
-            ps, pe = out[-1]
-            if s < pe:                       # overlap: trim previous end back to this start
-                if s > ps:
-                    out[-1] = (ps, s)
-                else:
-                    out.pop()
-        out.append((s, e))
-    return out
+    return trim_previous_on_overlap(segments)
 
 
 def verify_segments_detailed(
@@ -593,10 +769,16 @@ def verify_segments_detailed(
     pre_pad_s: float = 2.0,
     post_pad_s: float = 2.0,
     max_extend_s: float = 3.0,
+    max_tracking_group_s: float = 60.0,
     smooth_max_gap_s: float = 0.5,
     inference_batch_size: Optional[int] = None,
+    tracking_fps: Optional[float] = 30.0,
+    half_precision: bool = True,
     verdict_kwargs: Optional[dict] = None,
     serve_times: Optional[np.ndarray] = None,
+    audio_strike_times: Optional[np.ndarray] = None,
+    target_serve_times: Optional[np.ndarray] = None,
+    target_motion_times: Optional[np.ndarray] = None,
     require_serve_evidence: bool = False,
     progress: Callable[[str], None] = lambda _m: None,
     cancel_check: Callable[[], None] = lambda: None,
@@ -620,26 +802,44 @@ def verify_segments_detailed(
     verdict_kwargs.setdefault("max_extend_s", max_extend_s)
     verdict_kwargs.setdefault("require_serve_evidence", require_serve_evidence)
 
-    # Candidates often share padding. Track each connected padded window once and reuse
-    # its reconstructed trajectory for every contained verdict.
-    grouped: List[Tuple[float, float, List[Segment]]] = []
-    for s, e in sorted(segments):
-        ts, te = max(0.0, s - pre_pad_s), e + max(post_pad_s, max_extend_s)
-        if grouped and ts <= grouped[-1][1]:
-            gs, ge, members = grouped[-1]
-            grouped[-1] = (gs, max(ge, te), [*members, (s, e)])
-        else:
-            grouped.append((ts, te, [(s, e)]))
+    grouped = _group_tracking_windows(
+        segments, pre_pad_s, post_pad_s, max_extend_s, max_tracking_group_s)
 
     kept: List[Segment] = []
     diagnostics: List[CandidateVerification] = []
+    track_cache: List[Tuple[Segment, Any]] = []
+    total_tracking_s = sum(end - start for start, end, _members in grouped)
+    completed_tracking_s = 0.0
+    last_reported_percent = -1
+    actual_batch_size: Optional[int] = None
     for track_start, track_end, members in grouped:
         cancel_check()
+        group_s = track_end - track_start
+
+        def tracking_progress(done_frames: int, total_frames: int, batch: int) -> None:
+            nonlocal last_reported_percent, actual_batch_size
+            actual_batch_size = batch
+            fraction = done_frames / max(1, total_frames)
+            done_s = completed_tracking_s + group_s * min(1.0, fraction)
+            percent = int(round(100.0 * done_s / max(total_tracking_s, 1e-9)))
+            if percent == last_reported_percent and done_frames < total_frames:
+                return
+            last_reported_percent = percent
+            progress(
+                f"ball tracking progress {percent}% "
+                f"({done_s:.1f}/{total_tracking_s:.1f}s, batch {batch})")
+
         track = track_tracknet(
             video, model=model, start_s=track_start, end_s=track_end,
             batch_size=inference_batch_size,
+            tracking_fps=tracking_fps,
+            half_precision=half_precision,
+            court=court,
+            progress_callback=tracking_progress,
             cancel_check=cancel_check,
         )
+        track_cache.append(((track_start, track_end), track))
+        completed_tracking_s += group_s
         st = smooth_track(track, max_gap_s=smooth_max_gap_s)
         for s, e in members:
             candidate_kwargs = dict(verdict_kwargs)
@@ -649,9 +849,22 @@ def verify_segments_detailed(
                     (candidate_serve_times >= s - pre_pad_s)
                     & (candidate_serve_times <= e + max(post_pad_s, max_extend_s))]
                 candidate_kwargs["serve_times"] = candidate_serve_times
+            for name, values in (
+                ("audio_strike_times", audio_strike_times),
+                ("target_serve_times", target_serve_times),
+                ("target_motion_times", target_motion_times),
+            ):
+                if values is None:
+                    continue
+                candidate_values = np.asarray(values, float)
+                candidate_values = candidate_values[
+                    (candidate_values >= s - pre_pad_s)
+                    & (candidate_values <= e + max(post_pad_s, max_extend_s))]
+                candidate_kwargs[name] = candidate_values
             v = rally_verdict(st, court, s, e, **candidate_kwargs)
             output: Optional[Segment] = None
             peak_ball_speed_kmh: Optional[float] = None
+            speed_estimate: Optional[dict[str, Any]] = None
             if v.state == "accept":
                 output = (v.start, v.end)
                 if court is not None:
@@ -662,18 +875,24 @@ def verify_segments_detailed(
                     )
                     values = speeds[reliable]
                     if values.size >= 3:
-                        # A robust near-peak is more useful than one jumpy maximum and is
-                        # explicitly approximate for a single-camera ground homography.
-                        peak_ball_speed_kmh = float(np.percentile(values, 95))
+                        interval_count = int(np.sum(
+                            (st.t >= v.start) & (st.t <= v.end)))
+                        speed_estimate = _ground_plane_speed_estimate(
+                            values, values.size / max(interval_count, 1))
+                        if speed_estimate is not None:
+                            peak_ball_speed_kmh = float(speed_estimate["value_kmh"])
             if output is not None:
                 kept.append(output)
             diagnostics.append(CandidateVerification(
                 candidate=(s, e), tracked_window=(track_start, track_end),
                 verdict=v, output=output,
-                peak_ball_speed_kmh=peak_ball_speed_kmh))
+                peak_ball_speed_kmh=peak_ball_speed_kmh,
+                ball_speed_estimate=speed_estimate))
             progress(f"    candidate {s:.2f}-{e:.2f}s: {v.state} "
                      f"[{v.reason_code}] {v.reason}")
-    result = VerificationReport(_dedupe_non_overlapping(kept), diagnostics)
+    result = VerificationReport(
+        _dedupe_non_overlapping(kept), diagnostics, track_cache=track_cache,
+        inference_batch_size=actual_batch_size)
     counts = result.as_dict()["counts"]
     progress("  ball arbiter: "
              f"{counts['accept']} accepted, {counts['reject']} rejected, "

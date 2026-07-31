@@ -3,6 +3,9 @@ import pytest
 
 from rally.signals.court import Court
 from rally.signals.court_detect import (
+    _canonical_outer_corners,
+    _detect_in_stationary_gray,
+    _plausible_target_alignment,
     classify_lines,
     corners_from_lines,
     line_intersection,
@@ -80,3 +83,59 @@ def test_from_image_corners_roundtrip():
     img = court.to_image([[0, 0], [DOUBLES_W, 0], [DOUBLES_W, COURT_L], [0, COURT_L]])
     assert img[0] == pytest.approx((250, 850), abs=1.0)
     assert img[2] == pytest.approx((900, 320), abs=1.0)
+
+
+def test_stationary_detector_keeps_cluttered_low_angle_full_court():
+    """Regression for input_5: the near baseline ranks below many longer lines."""
+    corners = ((-3, 979), (1808, 924), (1079, 680), (859, 674))
+    court = Court.from_image_corners(*corners)
+    gray = np.zeros((1080, 1920), np.uint8)
+    from rally.signals.court import court_model_polylines
+    for segment in court_model_polylines():
+        points = np.round(court.to_image(segment)).astype(int)
+        cv2.line(gray, tuple(points[0]), tuple(points[1]), 255, 3)
+    # Long non-court horizontals model fences, nets, and neighboring-court paint that
+    # previously exhausted the 24-entry baseline pool before the target near baseline.
+    for index in range(32):
+        y = 360 + 7 * index
+        cv2.line(gray, (0, y), (1919, y + 3), 140, 1)
+
+    found = _detect_in_stationary_gray(gray, min_score=0.55)
+    assert found is not None
+    detected, score = found
+    assert score > 0.9
+    assert np.allclose(detected.corners_img, np.asarray(corners), atol=25.0)
+
+
+def test_target_alignment_rejects_input5_clip_multicourt_alias():
+    shape = (1080, 1920)
+    full_video_target = (
+        (-3.2, 978.95), (1808.18, 924.06),
+        (1079.03, 680.44), (858.65, 673.71),
+    )
+    short_clip_alias = (
+        (-113.0, 762.0), (1960.0, 709.0),
+        (1469.0, 453.0), (861.0, 427.0),
+    )
+    deep_neighbor_sideline_alias = (
+        (166.0, 919.0), (2020.0, 914.0),
+        (1104.0, 681.0), (859.0, 674.0),
+    )
+    assert _plausible_target_alignment(full_video_target, shape)
+    assert not _plausible_target_alignment(short_clip_alias, shape)
+    assert not _plausible_target_alignment(deep_neighbor_sideline_alias, shape)
+
+
+def test_court_keypoint_adapter_uses_outer_hull_and_canonical_order():
+    outer = np.array([
+        [250, 850], [1050, 850], [900, 320], [400, 320],
+    ], dtype=float)
+    # A 14-keypoint court model also emits service-line and centre-line intersections.
+    interior = np.array([
+        [520, 500], [780, 500], [500, 650], [800, 650], [650, 580],
+        [600, 420], [700, 420], [650, 700], [560, 760], [740, 760],
+    ], dtype=float)
+    points = np.concatenate([interior[3:], outer[[2, 0, 3, 1]], interior[:3]])
+    corners = _canonical_outer_corners(points)
+    assert corners is not None
+    assert np.allclose(corners, outer, atol=1.0)

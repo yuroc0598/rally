@@ -1,194 +1,254 @@
-"""Train and cross-validate a serve classifier on labelled candidates.
+"""Train a serve classifier with held-out-*match* validation.
 
-Reads candidates/labels.csv (from rally.tools.serve_dataset, with is_serve filled in),
-extracts audio + visual features for each candidate, and runs leave-one-out
-cross-validation with logistic regression. Because the dataset is tiny, LOO is the
-honest estimate of accuracy — and it's compared against the majority-class baseline so
-you can see whether the model actually learns anything beyond "guess the common class".
+The input is the versioned multi-match JSON produced by::
 
-Usage:
-    python -m rally.tools.serve_train samples/tennis_short.mp4 candidates/labels.csv
+    python -m rally.tools.serve_dataset from-web \
+      --job match-a a.mp4 a-labels.json \
+      --job match-b b.mp4 b-labels.json \
+      --job match-c c.mp4 c-labels.json --out serve-training.json
+
+Samples from one match are never split between training and validation. Artifacts are
+saved with a conservative live-eligibility gate; the live pipeline revalidates that gate
+before loading an explicitly configured artifact.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
-from ..signals.audio import detect_strikes_stream
-from ..config import RallyConfig
-from ..io.ffmpeg import iter_audio_mono
+from .serve_learning import (
+    ARTIFACT_SCHEMA,
+    DATASET_SCHEMA,
+    FEATURE_NAMES,
+    FEATURE_SCHEMA,
+    dataset_fingerprint,
+    held_out_match_splits,
+    live_gate,
+)
 
 
-def _clusters(onsets, gap_s=2.5):
-    cl = [[float(onsets[0])]]
-    for t in onsets[1:]:
-        (cl[-1].append(float(t)) if t - cl[-1][-1] <= gap_s else cl.append([float(t)]))
-    return cl
+def _metrics(y: np.ndarray, prediction: np.ndarray) -> dict[str, float | int]:
+    y = np.asarray(y, dtype=int)
+    prediction = np.asarray(prediction, dtype=int)
+    if y.shape != prediction.shape or y.size == 0:
+        raise ValueError("metrics need equally sized, non-empty arrays")
+    tp = int(np.sum((prediction == 1) & (y == 1)))
+    fp = int(np.sum((prediction == 1) & (y == 0)))
+    fn = int(np.sum((prediction == 0) & (y == 1)))
+    tn = int(np.sum((prediction == 0) & (y == 0)))
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    specificity = tn / (tn + fp) if tn + fp else 0.0
+    return {
+        "accuracy": float((tp + tn) / y.size),
+        "balanced_accuracy": float((recall + specificity) / 2.0),
+        "precision": float(tp / (tp + fp)) if tp + fp else 0.0,
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+    }
 
 
-def extract_features(video: str, labels_csv: str):
-    import cv2
-    from ultralytics import YOLO
-    from ..signals.player import discover_yolo_weights
-
-    cfg = RallyConfig()
-    rows = list(csv.DictReader(open(labels_csv)))
-    rows = [r for r in rows if r["is_serve"] in ("0", "1")]
-    if not rows:
-        raise ValueError("labels CSV contains no rows labeled is_serve=0/1")
-
-    onsets = detect_strikes_stream(
-        iter_audio_mono(video, cfg.audio_sr, chunk_s=60.0), cfg.audio_sr, cfg)
-    if onsets.size == 0:
-        raise ValueError("no audio strike candidates were detected")
-    cl = _clusters(onsets)
-    firsts = np.array([c[0] for c in cl])
-
-    det = YOLO(discover_yolo_weights("yolov8n.pt"))
-    cap = cv2.VideoCapture(video)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not cap.isOpened() or not np.isfinite(fps) or fps <= 0:
-        cap.release()
-        raise ValueError(f"could not decode video or determine frame rate: {video}")
-
-    def feet(t):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
-        ok, fr = cap.read()
-        if not ok:
-            return []
-        h, w = fr.shape[:2]
-        r = det.predict(fr, conf=0.3, classes=[0], verbose=False)[0]
-        return [((b[0] + b[2]) / 2 / w, b[3] / h) for b in r.boxes.xyxy.cpu().numpy()]
-
-    # global baseline estimate from feet at all candidate times
-    X, y, names = [], [], ["gap_before", "n_strikes", "near_disp", "backmost_y", "frontmost_y"]
-    per = []
-    used_clusters: set[int] = set()
-    for r in rows:
-        ps = float(r["point_start_s"])
-        fs = ps + cfg.toss_preroll_s
-        ci = int(np.argmin(np.abs(firsts - fs)))
-        if abs(float(firsts[ci]) - fs) > 1.0:
-            raise ValueError(
-                f"label {r['index']} has no audio cluster within 1s of its expected strike")
-        if ci in used_clusters:
-            raise ValueError(f"multiple labels map to audio cluster {ci}; fix candidate alignment")
-        used_clusters.add(ci)
-        c = cl[ci]
-        gap_before = c[0] - cl[ci - 1][-1] if ci > 0 else 30.0
-        n_strikes = len(c)
-        # visual around the serve
-        near0 = None
-        disp = 0.0
-        backs, fronts = [], []
-        t = c[0] - 2.0
-        while t <= c[0] + 0.3:
-            fs_pts = feet(t)
-            if fs_pts:
-                backs.append(max(p[1] for p in fs_pts))
-                fronts.append(min(p[1] for p in fs_pts))
-                near = [p for p in fs_pts if p[1] > 0.5]
-                if near:
-                    p = max(near, key=lambda z: z[1])
-                    if near0 is None:
-                        near0 = p
-                    disp = max(disp, np.hypot(p[0] - near0[0], p[1] - near0[1]))
-            t += 0.3
-        if len(backs) < 2:
-            raise ValueError(
-                f"insufficient player detections around label {r['index']} ({len(backs)} frames)")
-        backmost = max(backs) if backs else 0.0
-        frontmost = min(fronts) if fronts else 1.0
-        X.append([gap_before, n_strikes, disp, backmost, frontmost])
-        y.append(int(r["is_serve"]))
-        per.append((r["index"], ps, int(r["is_serve"])))
-    cap.release()
-    return np.array(X, float), np.array(y, int), names, per
+def load_dataset(path: str | Path) -> dict[str, Any]:
+    with Path(path).open() as handle:
+        dataset = json.load(handle)
+    if dataset.get("schema_version") != DATASET_SCHEMA:
+        raise ValueError(f"unsupported dataset schema: {dataset.get('schema_version')!r}")
+    if dataset.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError(f"unsupported feature schema: {dataset.get('feature_schema')!r}")
+    if dataset.get("feature_names") != list(FEATURE_NAMES):
+        raise ValueError("dataset feature order does not match this trainer")
+    if not isinstance(dataset.get("samples"), list) or not dataset["samples"]:
+        raise ValueError("dataset has no samples")
+    return dataset
 
 
-def evaluate(X, y, names, per, model_out=None):
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import StratifiedKFold
-    from sklearn.preprocessing import StandardScaler
+def _arrays(dataset: dict[str, Any]):
+    samples = dataset["samples"]
+    X = np.asarray([
+        [float(sample["features"][name]) for name in FEATURE_NAMES]
+        for sample in samples
+    ], dtype=float)
+    y = np.asarray([int(sample["label"]) for sample in samples], dtype=int)
+    groups = np.asarray([str(sample["match_id"]) for sample in samples], dtype=object)
+    rules = np.asarray([int(sample.get("rule_prediction", 0)) for sample in samples], dtype=int)
+    rule_available = np.asarray(
+        [bool(sample.get("rule_available", False)) for sample in samples], dtype=bool)
+    if not np.isfinite(X).all():
+        raise ValueError("dataset contains non-finite features")
+    if set(np.unique(y)) - {0, 1}:
+        raise ValueError("serve labels must be binary")
+    if np.unique(y).size != 2:
+        raise ValueError("training needs both serve and non-serve labels")
+    return X, y, groups, rules, rule_available
 
-    n = len(y)
-    classes, counts = np.unique(y, return_counts=True)
-    if n < 4 or classes.size != 2 or counts.min() < 2:
-        raise ValueError("serve evaluation needs both classes with at least two samples each")
-    maj = 1 if y.sum() >= n / 2 else 0
-    base_acc = max(y.sum(), n - y.sum()) / n
 
-    def make_clf():
-        # random forest handles small tabular data and non-linear splits well;
-        # falls back gracefully with class balancing.
-        return RandomForestClassifier(n_estimators=300, class_weight="balanced",
-                                      min_samples_leaf=2, random_state=0)
+def _default_estimator():
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError as exc:  # pragma: no cover - depends on optional training extra
+        raise RuntimeError(
+            "serve training needs scikit-learn; install the 'training' optional extra"
+        ) from exc
+    return RandomForestClassifier(
+        n_estimators=500,
+        class_weight="balanced",
+        min_samples_leaf=2,
+        random_state=0,
+        n_jobs=-1,
+    )
 
-    # cross-validation: stratified k-fold when there's enough data, else leave-one-out
-    preds = np.zeros(n, int)
-    if n >= 20 and y.sum() >= 5 and (n - y.sum()) >= 5:
-        k = min(5, int(y.sum()), int(n - y.sum()))
-        cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=0)
-        scheme = f"{k}-fold stratified CV"
-        for tr, te in cv.split(X, y):
-            sc = StandardScaler().fit(X[tr])
-            clf = make_clf().fit(sc.transform(X[tr]), y[tr])
-            preds[te] = clf.predict(sc.transform(X[te]))
-    else:
-        scheme = "leave-one-out"
-        for i in range(n):
-            tr = [j for j in range(n) if j != i]
-            sc = StandardScaler().fit(X[tr])
-            clf = make_clf()
-            clf.fit(sc.transform(X[tr]), y[tr])
-            preds[i] = clf.predict(sc.transform(X[i:i + 1]))[0]
-    print(f"\nvalidation scheme: {scheme}")
 
-    acc = (preds == y).mean()
-    tp = int(((preds == 1) & (y == 1)).sum()); fp = int(((preds == 1) & (y == 0)).sum())
-    fn = int(((preds == 0) & (y == 1)).sum()); tn = int(((preds == 0) & (y == 0)).sum())
-    prec = tp / (tp + fp) if tp + fp else 0.0
-    rec = tp / (tp + fn) if tp + fn else 0.0
+EstimatorFactory = Callable[[], Any]
 
-    print(f"\nsamples: {n}  ({int(y.sum())} serve, {int(n - y.sum())} non-serve)")
-    print(f"majority-class baseline accuracy: {base_acc:.0%} (predict '{['non-serve','serve'][maj]}')")
-    print(f"\ncross-validated RandomForest:")
-    print(f"  accuracy = {acc:.0%}   precision = {prec:.0%}   recall = {rec:.0%}")
-    print(f"  confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
-    print(f"\nper-candidate (idx, start, true, pred):")
-    for (idx, ps, ytrue), p in zip(per, preds):
-        flag = "" if p == ytrue else "   <-- wrong"
-        print(f"  {idx:>2}  {ps:6.1f}  true={ytrue}  pred={int(p)}{flag}")
 
-    # feature importances from a model fit on all data
-    sc = StandardScaler().fit(X)
-    full = make_clf().fit(sc.transform(X), y)
-    print("\nfeature importances (model fit on all data):")
-    for nm, imp in sorted(zip(names, full.feature_importances_), key=lambda z: -z[1]):
-        print(f"  {nm:>11}: {imp:.2f}")
+def evaluate_dataset(dataset: dict[str, Any], *, model_out: str | None = None,
+                     estimator_factory: EstimatorFactory = _default_estimator
+                     ) -> dict[str, Any]:
+    X, y, groups, rule_prediction, rule_available = _arrays(dataset)
+    splits = held_out_match_splits(groups)
+    predictions = np.full(y.shape, -1, dtype=int)
+    fold_records: list[dict[str, Any]] = []
+    valid_folds = 0
+    for train, test in splits:
+        held_out = str(groups[test[0]])
+        record = {
+            "held_out_match": held_out,
+            "train_samples": int(train.size),
+            "test_samples": int(test.size),
+        }
+        if np.unique(y[train]).size != 2:
+            record.update(status="invalid", reason="training side has only one class")
+            fold_records.append(record)
+            continue
+        estimator = estimator_factory()
+        estimator.fit(X[train], y[train])
+        predictions[test] = np.asarray(estimator.predict(X[test]), dtype=int)
+        record["status"] = "used"
+        fold_records.append(record)
+        valid_folds += 1
 
-    verdict = "USEFUL — beats baseline" if acc > base_acc + 0.05 else \
-        ("marginal" if acc >= base_acc else "NOT useful — at/below baseline")
-    print(f"\nVERDICT: {verdict}  (CV {acc:.0%} vs baseline {base_acc:.0%})")
+    predicted = predictions >= 0
+    if not np.any(predicted):
+        raise ValueError("no held-out match fold had both classes on its training side")
+    model_metrics = _metrics(y[predicted], predictions[predicted])
+    rule_metrics = _metrics(y, rule_prediction)
+    unique_matches = list(dict.fromkeys(str(group) for group in groups))
+    positives = int(y.sum())
+    negatives = int(y.size - positives)
+    gate = live_gate(
+        model_metrics, rule_metrics,
+        matches=len(unique_matches), samples=int(y.size),
+        positives=positives, negatives=negatives,
+        valid_folds=valid_folds,
+        rule_coverage=float(rule_available.mean()),
+    )
+    stable_context_alignment = bool(dataset.get("stable_context_alignment", False))
+    if not stable_context_alignment:
+        gate = {
+            **gate,
+            "allowed": False,
+            "status": "blocked",
+            "reasons": [
+                *gate.get("reasons", []),
+                "all samples need stable observation/group ids for live deployment",
+            ],
+        }
 
+    full_model = estimator_factory()
+    full_model.fit(X, y)
+    importances = getattr(full_model, "feature_importances_", None)
+    importance_records = [] if importances is None else [
+        {"feature": name, "importance": round(float(importance), 6)}
+        for name, importance in sorted(
+            zip(FEATURE_NAMES, importances), key=lambda item: -float(item[1]))
+    ]
+    artifact = {
+        "artifact_schema": ARTIFACT_SCHEMA,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "feature_schema": FEATURE_SCHEMA,
+        "feature_names": list(FEATURE_NAMES),
+        "estimator": {
+            "module": type(full_model).__module__,
+            "class": type(full_model).__name__,
+        },
+        "training": {
+            "dataset_schema": dataset["schema_version"],
+            "dataset_sha256": dataset_fingerprint(dataset),
+            "matches": len(unique_matches),
+            "samples": int(y.size),
+            "positive": positives,
+            "negative": negatives,
+            "stable_context_alignment": stable_context_alignment,
+        },
+        "evaluation": {
+            "scheme": "leave-one-match-out",
+            "group_key": "match_id",
+            "folds": fold_records,
+            "model": model_metrics,
+            "rules": rule_metrics,
+            "rule_coverage": float(rule_available.mean()),
+            "feature_importance": importance_records,
+        },
+        "live_gate": gate,
+        "live_loading": {
+            "enabled": bool(gate["allowed"]),
+            "eligible": bool(gate["allowed"]),
+            "note": ("live loader must independently revalidate this gate before use"),
+        },
+        "model": full_model,
+    }
     if model_out:
-        import joblib
-        joblib.dump({"scaler": sc, "model": full, "features": names}, model_out)
-        print(f"saved model -> {model_out}")
-    return acc, base_acc
+        try:
+            import joblib
+        except ImportError as exc:  # pragma: no cover - part of sklearn installations
+            raise RuntimeError("saving a serve artifact needs joblib") from exc
+        destination = Path(model_out)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(artifact, destination)
+    return artifact
+
+
+def _print_report(artifact: dict[str, Any]) -> None:
+    training = artifact["training"]
+    evaluation = artifact["evaluation"]
+    model = evaluation["model"]
+    rules = evaluation["rules"]
+    print(
+        f"validation: leave-one-match-out across {training['matches']} matches; "
+        f"{training['samples']} samples "
+        f"({training['positive']} serve, {training['negative']} non-serve)"
+    )
+    print(
+        f"model balanced accuracy={model['balanced_accuracy']:.1%}, "
+        f"precision={model['precision']:.1%}, recall={model['recall']:.1%}"
+    )
+    print(
+        f"rules balanced accuracy={rules['balanced_accuracy']:.1%}, "
+        f"precision={rules['precision']:.1%}, recall={rules['recall']:.1%}; "
+        f"coverage={evaluation['rule_coverage']:.1%}"
+    )
+    gate = artifact["live_gate"]
+    print(f"live gate: {gate['status']}")
+    for reason in gate["reasons"]:
+        print(f"  - {reason}")
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="rally.tools.serve_train")
-    p.add_argument("video")
-    p.add_argument("labels_csv")
-    p.add_argument("--model-out", default=None, help="save the fitted model to this path (joblib)")
-    args = p.parse_args(argv)
-    X, y, names, per = extract_features(args.video, args.labels_csv)
-    evaluate(X, y, names, per, model_out=args.model_out)
+    parser = argparse.ArgumentParser(prog="rally.tools.serve_train")
+    parser.add_argument("dataset", help="JSON from 'serve_dataset from-web'")
+    parser.add_argument("--model-out", default=None,
+                        help="write a guarded offline joblib artifact")
+    args = parser.parse_args(argv)
+    artifact = evaluate_dataset(load_dataset(args.dataset), model_out=args.model_out)
+    _print_report(artifact)
+    if args.model_out:
+        print(f"saved guarded offline artifact -> {args.model_out}")
     return 0
 
 

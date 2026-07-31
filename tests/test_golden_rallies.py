@@ -9,6 +9,14 @@ To evaluate an already-produced pipeline sidecar without repeating inference, us
 
     RALLY_GOLDEN_SIDECAR_1=/path/to/rallies-1.json \
     RALLY_GOLDEN_SIDECAR_2=/path/to/rallies-2.json \
+    RALLY_GOLDEN_SIDECAR_3=/path/to/rallies-3.json \
+    RALLY_GOLDEN_SIDECAR_4=/path/to/rallies-4.json \
+    RALLY_GOLDEN_SIDECAR_5=/path/to/rallies-5.json \
+        pytest -q tests/test_golden_rallies.py
+
+To retain the analysis sidecar and processed video for the web golden-data view, set::
+
+    RALLY_RUN_GOLDEN=1 RALLY_GOLDEN_ARTIFACTS=.rally_golden \
         pytest -q tests/test_golden_rallies.py
 """
 
@@ -25,11 +33,19 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GOLDEN_ROOT = ROOT / "samples" / "golden"
 BOUNDARY_TOLERANCE_S = 2.0
 TRACKNET_SHA256 = "c735bc1a1b13a35f179c6492f778ef4ebb9bffd512a96f4d970b32e076653076"
 
 _POINT_LINE = re.compile(r"^\s*Point\s+(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _TIMESTAMP = re.compile(r"(?<![\d:])(\d+(?::[0-5]?\d)?)(?![\d:])")
+_OBJECT = re.compile(r"\{(.*?)\}", re.DOTALL)
+
+
+def _object_field(block: str, name: str) -> str | None:
+    match = re.search(
+        rf'["\']?{re.escape(name)}["\']?\s*:\s*([^,\n}}]+)', block, re.I)
+    return match.group(1).strip().strip('"\'') if match else None
 
 
 @dataclass(frozen=True)
@@ -54,8 +70,8 @@ class GoldenDataset:
 GOLDEN_DATASETS = (
     GoldenDataset(
         number=1,
-        video=ROOT / "samples" / "test_input_1.mp4",
-        annotation=ROOT / "samples" / "test_output_rally_1.txt",
+        video=GOLDEN_ROOT / "input_1.mp4",
+        annotation=GOLDEN_ROOT / "res_1.txt",
         video_sha256=(
             "4e443ad9d52d7ed54e241534176216634edf4b0f9e51d2fa1faf1dd18fd4221a"
         ),
@@ -73,8 +89,8 @@ GOLDEN_DATASETS = (
     ),
     GoldenDataset(
         number=2,
-        video=ROOT / "samples" / "test_input_2.mp4",
-        annotation=ROOT / "samples" / "test_output_rally_2.txt",
+        video=GOLDEN_ROOT / "input_2.mp4",
+        annotation=GOLDEN_ROOT / "res_2.txt",
         video_sha256=(
             "a1b1b1e7046edfed2f624d37c320f2f88a3d71b98fbc3761709611654f2182d7"
         ),
@@ -88,6 +104,81 @@ GOLDEN_DATASETS = (
             GoldenPoint((203.0,), 217.0),
             GoldenPoint((229.0,), 244.0),
             GoldenPoint((271.0,), 282.0),
+        ),
+    ),
+    GoldenDataset(
+        number=3,
+        video=GOLDEN_ROOT / "input_3.mp4",
+        annotation=GOLDEN_ROOT / "res_3.txt",
+        video_sha256=(
+            "9b00c5f34779d82323cea1e6b4758406816b7cbda0f108167fccdb72072cfc24"
+        ),
+        expected=(
+            GoldenPoint((0.0,), 8.0),
+            GoldenPoint((20.0,), 30.0),
+            GoldenPoint((52.0,), 60.0),
+            GoldenPoint((78.0,), 92.0),
+            GoldenPoint((106.0,), 115.0),
+            GoldenPoint((184.0, 196.0), 217.0),
+            GoldenPoint((230.0, 239.0), 249.0),
+            GoldenPoint((257.0,), 265.0),
+            GoldenPoint((276.0,), 290.0),
+        ),
+    ),
+    GoldenDataset(
+        number=4,
+        video=GOLDEN_ROOT / "input_4.mp4",
+        annotation=GOLDEN_ROOT / "res_4.txt",
+        video_sha256=(
+            "5167f8c3ca8862a40219a856d4791465f80cebdc44ac8b812497500ee36f3cf7"
+        ),
+        expected=(
+            GoldenPoint((14.0,), 24.0),
+            GoldenPoint((31.0,), 40.0),
+            GoldenPoint((49.0,), 56.0),
+            GoldenPoint((63.0,), 83.0),
+            GoldenPoint((97.0,), 105.0),
+            GoldenPoint((116.0,), 130.0),
+            GoldenPoint((137.0,), 152.0),
+            GoldenPoint((162.0,), 173.0),
+            GoldenPoint((243.0,), 253.0),
+            GoldenPoint((267.0,), 287.0),
+        ),
+    ),
+    GoldenDataset(
+        number=5,
+        video=GOLDEN_ROOT / "input_5.mov",
+        annotation=GOLDEN_ROOT / "res_5.txt",
+        video_sha256=(
+            "b63cde1989920a78ec5ca710af253036cb2425a7267e7b5a5878108d9b8e0aaa"
+        ),
+        expected=(
+            GoldenPoint((40.0,), 50.0),
+            GoldenPoint((60.0,), 68.0),
+            GoldenPoint((76.0,), 100.0),
+            GoldenPoint((112.0,), 122.0),
+            GoldenPoint((135.0,), 158.0),
+            GoldenPoint((195.0,), 208.0),
+            GoldenPoint((264.0,), 280.0),
+            GoldenPoint((286.0,), 300.0),
+            GoldenPoint((315.0,), 325.0),
+            GoldenPoint((335.0,), 342.0),
+            GoldenPoint((351.0,), 376.0),
+            GoldenPoint((403.0,), 418.0),
+            GoldenPoint((440.0,), 455.0),
+            GoldenPoint((474.0,), 491.0),
+            GoldenPoint((510.0,), 518.0),
+            GoldenPoint((542.0,), 564.0),
+            GoldenPoint((582.0,), 593.0),
+            GoldenPoint((648.0,), 661.0),
+            GoldenPoint((670.0,), 688.0),
+            GoldenPoint((705.0,), 711.0),
+            GoldenPoint((723.0,), 738.0),
+            GoldenPoint((745.0,), 753.0),
+            GoldenPoint((777.0,), 787.0),
+            GoldenPoint((796.0,), 813.0),
+            GoldenPoint((831.0,), 845.0),
+            GoldenPoint((874.0,), 890.0),
         ),
     ),
 )
@@ -115,9 +206,28 @@ def load_annotated_points(path: Path) -> list[GoldenPoint]:
     at either the original serve or the retry, but it must remain one point and end at the
     annotated point end.
     """
+    text = path.read_text(encoding="utf-8")
+    structured = []
+    for block in _OBJECT.findall(text):
+        index = _object_field(block, "point_index")
+        start = _object_field(block, "point_start_time")
+        end = _object_field(block, "point_end_time")
+        if index is None or start is None or end is None:
+            continue
+        second = _object_field(block, "second_serve_start_time")
+        starts = [_seconds(start)]
+        if second is not None:
+            starts.append(_seconds(second))
+        structured.append((int(index), GoldenPoint(tuple(starts), _seconds(end))))
+    if structured:
+        point_numbers = [index for index, _point in structured]
+        points = [point for _index, point in structured]
+        _validate_annotation_sequence(path, point_numbers, points)
+        return points
+
     points: list[GoldenPoint] = []
     point_numbers: list[int] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(text.splitlines(), 1):
         match = _POINT_LINE.match(line)
         if match is None:
             continue
@@ -136,6 +246,13 @@ def load_annotated_points(path: Path) -> list[GoldenPoint]:
         point_numbers.append(int(match.group(1)))
         points.append(GoldenPoint(starts, end))
 
+    _validate_annotation_sequence(path, point_numbers, points)
+    return points
+
+
+def _validate_annotation_sequence(
+    path: Path, point_numbers: list[int], points: list[GoldenPoint],
+) -> None:
     expected_numbers = list(range(1, len(points) + 1))
     if point_numbers != expected_numbers:
         raise ValueError(
@@ -146,7 +263,6 @@ def load_annotated_points(path: Path) -> list[GoldenPoint]:
         for previous, current in zip(points, points[1:])
     ):
         raise ValueError(f"{path}: point intervals overlap or are out of order")
-    return points
 
 
 def assert_rallies_within_boundary_tolerance(
@@ -199,10 +315,25 @@ def _segments_from_sidecar(path: Path) -> list[tuple[float, float]]:
 
 
 @pytest.mark.parametrize(
-    "dataset", GOLDEN_DATASETS, ids=lambda dataset: f"dataset-{dataset.number}"
+    "dataset", GOLDEN_DATASETS, ids=lambda dataset: dataset.video.stem
 )
 def test_ground_truth_annotation_allows_original_or_retry_serve_start(dataset):
     assert load_annotated_points(dataset.annotation) == list(dataset.expected)
+
+
+def test_registered_golden_datasets_cover_every_labeled_root_pair():
+    """Root-level input/res pairs are golden; nested ``unlabeled`` files are not."""
+    registered_videos = {dataset.video for dataset in GOLDEN_DATASETS}
+    registered_annotations = {dataset.annotation for dataset in GOLDEN_DATASETS}
+    labeled_videos = {
+        path for path in GOLDEN_ROOT.glob("input_*") if path.is_file()
+    }
+    labeled_annotations = set(GOLDEN_ROOT.glob("res_*.txt"))
+
+    assert registered_videos == labeled_videos
+    assert registered_annotations == labeled_annotations
+    assert all(path.parent == GOLDEN_ROOT for path in registered_videos)
+    assert all(path.parent == GOLDEN_ROOT for path in registered_annotations)
 
 
 def test_boundary_gate_accepts_errors_up_to_two_seconds_independently():
@@ -233,7 +364,7 @@ def test_boundary_gate_rejects_large_errors_and_wrong_point_counts(predicted):
 
 
 @pytest.mark.parametrize(
-    "dataset", GOLDEN_DATASETS, ids=lambda dataset: f"dataset-{dataset.number}"
+    "dataset", GOLDEN_DATASETS, ids=lambda dataset: dataset.video.stem
 )
 def test_sample_video_matches_all_golden_rallies(dataset, tmp_path):
     cached_sidecar = os.environ.get(dataset.sidecar_environment_variable)
@@ -253,9 +384,17 @@ def test_sample_video_matches_all_golden_rallies(dataset, tmp_path):
         from rally.config import RallyConfig
         from rally.pipeline import trim
 
-        sidecar = tmp_path / f"golden-predicted-{dataset.number}.json"
+        artifact_root = os.environ.get("RALLY_GOLDEN_ARTIFACTS")
+        artifact_dir = (
+            Path(artifact_root).resolve() / dataset.video.stem
+            if artifact_root else tmp_path
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        sidecar = artifact_dir / "rallies.json"
+        output = artifact_dir / "rallies.mp4" if artifact_root else None
         result = trim(
             str(dataset.video),
+            output_path=str(output) if output else None,
             cfg=RallyConfig(),
             json_path=str(sidecar),
             detect_players=True,

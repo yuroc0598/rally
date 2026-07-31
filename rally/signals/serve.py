@@ -16,6 +16,7 @@ import numpy as np
 from .ball import BallTrack
 
 Segment = Tuple[float, float]
+TrackCache = Sequence[tuple[Segment, BallTrack]]
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ def classify_ball_serve(
     frame_width: int,
     frame_height: int,
     cfg,
+    court=None,
 ) -> BallServeObservation:
     """Classify serve-like ball motion around the first few candidate impacts.
 
@@ -54,12 +56,31 @@ def classify_ball_serve(
         return BallServeObservation(
             point, True, False, None, 0.0, 0.0, 0.0, False, 0)
 
-    x0, x1 = cfg.match_ball_court_x
-    y0, y1 = cfg.match_ball_court_y
     xn = np.asarray(track.x, float) / float(frame_width)
     yn = np.asarray(track.y, float) / float(frame_height)
     visible = np.isfinite(xn) & np.isfinite(yn)
-    in_court = visible & (xn >= x0) & (xn <= x1) & (yn >= y0) & (yn <= y1)
+    if court is not None:
+        # Image-relative bounds include portions of neighboring courts in wide match
+        # footage.  Once calibrated, only samples mapping onto the selected tennis court
+        # may support a serve; off-court hits and motion are background evidence.
+        from .court import COURT_L, DOUBLES_W
+
+        image_points = np.stack(
+            [np.asarray(track.x, float), np.asarray(track.y, float)], axis=1)
+        court_points = court.to_court(image_points)
+        margin_m = 0.75
+        in_court = (
+            visible
+            & np.isfinite(court_points).all(axis=1)
+            & (court_points[:, 0] >= -margin_m)
+            & (court_points[:, 0] <= DOUBLES_W + margin_m)
+            & (court_points[:, 1] >= -margin_m)
+            & (court_points[:, 1] <= COURT_L + margin_m)
+        )
+    else:
+        x0, x1 = cfg.match_ball_court_x
+        y0, y1 = cfg.match_ball_court_y
+        in_court = visible & (xn >= x0) & (xn <= x1) & (yn >= y0) & (yn <= y1)
 
     best = (0.0, 0.0, 0, None, 0.0, 0.0, False)
     for strike in strikes:
@@ -113,15 +134,45 @@ def classify_ball_serve(
     )
 
 
+def _cached_track_window(
+    cache: TrackCache | None, start: float, end: float,
+) -> BallTrack | None:
+    """Return a continuous raw TrackNet slice when the arbiter already decoded it."""
+    if not cache:
+        return None
+    pieces: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for (_cache_start, _cache_end), track in cache:
+        if track.t.size == 0:
+            continue
+        mask = (track.t >= start - 0.10) & (track.t <= end + 0.10)
+        if np.any(mask):
+            pieces.append((track.t[mask], track.x[mask], track.y[mask]))
+    if not pieces:
+        return None
+    t = np.concatenate([piece[0] for piece in pieces])
+    x = np.concatenate([piece[1] for piece in pieces])
+    y = np.concatenate([piece[2] for piece in pieces])
+    order = np.argsort(t, kind="stable")
+    t, x, y = t[order], x[order], y[order]
+    unique = np.r_[True, np.diff(t) > 1e-9]
+    t, x, y = t[unique], x[unique], y[unique]
+    if t.size < 3 or t[0] > start + 0.10 or t[-1] < end - 0.10:
+        return None
+    return BallTrack(t, x, y)
+
+
 def observe_ball_serves(
     video: str,
     points: Sequence[Segment],
     onsets: np.ndarray,
     weights_path: str,
     cfg,
+    court=None,
+    track_cache: TrackCache | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
     cancel_check: Callable[[], None] = lambda: None,
 ) -> list[BallServeObservation]:  # pragma: no cover - heavy model integration
-    """Track only short early-point windows, loading TrackNet once for all candidates."""
+    """Classify serve windows, reusing arbiter tracks before running TrackNet again."""
     import cv2
 
     from .ball import load_ball_model, track_tracknet
@@ -136,9 +187,11 @@ def observe_ball_serves(
         raise RuntimeError("could not determine frame size for serve validation")
 
     ordered = np.sort(np.asarray(onsets, dtype=float))
-    model = load_ball_model(weights_path)
+    model = None
     observations: list[BallServeObservation] = []
-    for point in points:
+    cache_hits = 0
+    total = len(points)
+    for index, point in enumerate(points, 1):
         cancel_check()
         strikes = ordered[(ordered >= point[0] - 1e-9) & (ordered <= point[1] + 1e-9)]
         considered = strikes[: int(cfg.match_serve_strikes_to_check)]
@@ -146,12 +199,26 @@ def observe_ball_serves(
             observations.append(BallServeObservation(
                 (float(point[0]), float(point[1])), True, False, None,
                 0.0, 0.0, 0.0, False, 0))
+            if progress_callback is not None:
+                progress_callback(index, total, cache_hits)
             continue
         start = max(0.0, float(considered[0]) - cfg.match_ball_serve_pre_s)
         end = min(float(point[1]), float(considered[-1]) + cfg.match_ball_serve_post_s)
-        track = track_tracknet(
-            video, model=model, start_s=start, end_s=end,
-            batch_size=cfg.ball_inference_batch_size, cancel_check=cancel_check)
+        track = _cached_track_window(track_cache, start, end)
+        if track is not None:
+            cache_hits += 1
+        else:
+            if model is None:
+                model = load_ball_model(weights_path)
+            track = track_tracknet(
+                video, model=model, start_s=start, end_s=end,
+                batch_size=cfg.ball_inference_batch_size,
+                tracking_fps=cfg.ball_tracking_fps,
+                half_precision=cfg.ball_half_precision,
+                court=court,
+                cancel_check=cancel_check)
         observations.append(classify_ball_serve(
-            point, considered, track, width, height, cfg))
+            point, considered, track, width, height, cfg, court=court))
+        if progress_callback is not None:
+            progress_callback(index, total, cache_hits)
     return observations

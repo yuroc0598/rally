@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rally — tennis rally trimmer</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260728-ui6" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260730-cleanup1" />
   </head>
   <body>
     <header class="topbar">
@@ -16,7 +16,10 @@
         </div>
       </div>
       <div class="top-actions">
-        <button id="galleryButton" type="button" class="ghost">Gallery</button>
+        <nav class="top-tabs" aria-label="Application sections">
+          <button id="galleryButton" type="button" class="ghost active">Gallery</button>
+          <button id="goldenButton" type="button" class="ghost">Golden datasets</button>
+        </nav>
         <span id="globalStatus" class="pill">Idle</span>
       </div>
     </header>
@@ -84,6 +87,18 @@
         </div>
       </section>
 
+      <!-- ================= GOLDEN DATASETS ================= -->
+      <section id="goldenView" class="view hidden">
+        <div class="golden-head">
+          <div>
+            <h2>Golden datasets</h2>
+            <p class="muted">Read-only evaluation fixtures. These are pipeline evaluation runs, not uploaded jobs.</p>
+          </div>
+          <span id="goldenSummary" class="pill">Loading…</span>
+        </div>
+        <div id="goldenGrid" class="golden-grid"></div>
+      </section>
+
       <!-- ================= DETAIL ================= -->
       <section id="detailView" class="view hidden">
         <div class="detail-bar">
@@ -127,7 +142,7 @@
                 </div>
                 <div class="video-shell interactive-player">
                   <video id="outputVideo" controls playsinline preload="metadata"></video>
-                  <div id="ballSpeed" class="ball-speed" title="Approximate court-plane peak speed for this point">Ball speed —</div>
+                  <div id="ballSpeed" class="ball-speed" title="Uncertain single-camera ground-plane estimate; not full 3-D ball speed">Ball speed —</div>
                   <div id="playerHitLayer" class="player-hit-layer" aria-label="Video gestures">
                     <button id="previousPointZone" type="button" aria-label="Double-click for previous point" title="Double-click: previous point"></button>
                     <button id="nextPointZone" type="button" aria-label="Double-click for next point" title="Double-click: next point"></button>
@@ -291,6 +306,6 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=20260728-ui6"></script>
+    <script src="/static/app.js?v=20260730-cleanup1"></script>
   </body>
 </html>

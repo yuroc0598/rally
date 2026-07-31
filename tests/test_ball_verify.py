@@ -3,12 +3,19 @@ import numpy as np
 from rally.fusion.ball_verify import (
     _audio_aligned_trajectory_end,
     _dedupe_non_overlapping,
+    _group_tracking_windows,
     _net_crossings,
     rally_verdict,
     verify_segments_detailed,
 )
-from rally.signals.ball import BallTrack
-from rally.signals.trajectory import smooth_track
+from rally.signals.ball import (
+    BallTrack,
+    _target_court_heatmap_candidates,
+    resolve_ball_batch_size,
+)
+from rally.signals.ball import ball_in_play_channel
+from rally.signals.court import DOUBLES_W, NET_Y
+from rally.signals.trajectory import SmoothTrack, smooth_track
 
 
 class FakeCourt:
@@ -32,6 +39,50 @@ def test_verdict_accepts_a_live_rally():
     assert v.n_net_crossings >= 2
     assert v.n_bounces >= 2
     assert v.start <= 1.0 and v.end <= 4.0 + 3.0
+
+
+def test_match_verdict_abstains_when_target_court_is_unavailable():
+    v = rally_verdict(_rally_track(), None, 0.0, 4.0, require_court=True)
+
+    assert v.state == "indeterminate"
+    assert v.reason_code == "target_court_geometry_required"
+
+
+def test_tracking_window_grouping_caps_transitive_overlap():
+    candidates = [(0.0, 10.0), (9.0, 20.0), (19.0, 30.0)]
+    groups = _group_tracking_windows(
+        candidates, pre_pad_s=2.0, post_pad_s=2.0,
+        max_extend_s=3.0, max_group_s=20.0)
+
+    assert len(groups) > 1
+    assert all(end - start <= 20.0 for start, end, _members in groups)
+    assert [member for _start, _end, members in groups for member in members] == candidates
+
+
+def test_cuda_batch_size_scales_with_free_memory(monkeypatch):
+    monkeypatch.delenv("RALLY_BALL_BATCH_SIZE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def mem_get_info(_device):
+            return 48 * 1024 ** 3, 80 * 1024 ** 3
+
+    fake_torch = type("FakeTorch", (), {"cuda": FakeCuda})
+    device = type("Device", (), {"type": "cuda"})()
+
+    assert resolve_ball_batch_size(device, 0, torch_module=fake_torch) == 16
+    assert resolve_ball_batch_size(device, 7, torch_module=fake_torch) == 7
+
+
+def test_tracknet_candidates_are_filtered_before_neighbor_court_association():
+    candidates = [(5.0, 5.0), (50.0, 5.0), (5.0, 50.0)]
+
+    kept = _target_court_heatmap_candidates(
+        candidates, FakeCourt(), 1.0, 1.0,
+        sideline_margin_m=1.0, baseline_margin_m=3.0,
+    )
+
+    assert kept == [(5.0, 5.0)]
 
 
 def test_trajectory_end_hint_ignores_audio_after_outgoing_motion_ended():
@@ -165,9 +216,95 @@ def test_verdict_snaps_start_to_serve():
 def test_net_crossings_counts_side_changes():
     t = np.arange(0.0, 3.0, 1 / 30.0)
     y = 11.885 + 8.0 * np.cos(2 * np.pi * t / 1.0)   # crosses net twice per period
-    st = smooth_track(BallTrack(t, 100 + 5 * t, y))
+    st = smooth_track(BallTrack(t, 5.0 + 0.2 * t, y))
     in_play = np.ones(t.size, bool)
     assert _net_crossings(st, FakeCourt(), in_play) >= 4
+
+
+def test_neighboring_court_motion_cannot_supply_rally_structure():
+    t = np.arange(0.0, 4.0, 1 / 30.0)
+    y = NET_Y + 8.0 * np.cos(2 * np.pi * t / 0.8)
+    # Identity court mapping puts this otherwise rally-shaped trajectory well right of
+    # the target doubles court. Its apparent crossings and bounces must not validate it.
+    st = smooth_track(BallTrack(t, np.full(t.size, DOUBLES_W + 5.0), y))
+    in_play = np.ones(t.size, bool)
+    assert _net_crossings(st, FakeCourt(), in_play) == 0
+
+    verdict = rally_verdict(st, FakeCourt(), 0.0, 4.0)
+    assert verdict.state == "reject"
+    assert verdict.reason_code == "reliable_no_rally_structure"
+    assert verdict.n_net_crossings == 0
+    assert verdict.n_bounces == 0
+
+
+def test_whole_video_ball_channel_filters_neighboring_court_motion():
+    t = np.arange(0.0, 3.0, 0.1)
+    track = BallTrack(
+        t=t, x=np.full(t.size, DOUBLES_W + 5.0), y=NET_Y + np.sin(t * 8.0))
+    timeline = np.arange(0.0, 3.0, 0.2)
+
+    assert np.max(ball_in_play_channel(track, timeline)) > 0.0
+    assert np.max(ball_in_play_channel(track, timeline, court=FakeCourt())) == 0.0
+
+
+def test_fragmented_audio_aligned_neighboring_point_is_explicitly_rejected():
+    t = np.arange(0.0, 4.0, 0.1)
+    measured = np.zeros(t.size, bool)
+    measured[5:10] = True
+    measured[18:23] = True
+    measured[30:35] = True
+    track = SmoothTrack(
+        t=t, x=np.full(t.size, DOUBLES_W + 8.0),
+        y=NET_Y + np.sin(t * 8.0), vx=np.full(t.size, 40.0),
+        vy=np.full(t.size, 40.0), confidence=np.ones(t.size), measured=measured,
+    )
+    verdict = rally_verdict(
+        track, FakeCourt(), 0.0, 4.0,
+        serve_times=np.array([0.6, 1.9, 3.1]),
+    )
+    assert verdict.state == "reject"
+    assert verdict.reason_code == "audio_aligned_activity_outside_target_court"
+    assert verdict.n_live_components == 3
+
+
+def test_neighbor_track_abstains_when_target_court_has_independent_serve_evidence():
+    t = np.arange(0.0, 4.0, 0.1)
+    measured = np.zeros(t.size, bool)
+    measured[5:10] = True
+    measured[18:23] = True
+    measured[30:35] = True
+    track = SmoothTrack(
+        t=t, x=np.full(t.size, DOUBLES_W + 8.0),
+        y=NET_Y + np.sin(t * 8.0), vx=np.full(t.size, 40.0),
+        vy=np.full(t.size, 40.0), confidence=np.ones(t.size), measured=measured,
+    )
+    verdict = rally_verdict(
+        track, FakeCourt(), 0.0, 4.0,
+        serve_times=np.array([0.6, 1.9, 3.1]),
+        audio_strike_times=np.array([0.6, 1.9, 3.1]),
+        target_serve_times=np.array([0.7]),
+    )
+    assert verdict.state == "indeterminate"
+    assert verdict.reason_code == "fragmented_live_track"
+
+
+def test_one_noisy_target_motion_sample_does_not_hide_neighbor_contradiction():
+    t = np.arange(0.0, 4.0, 0.1)
+    measured = np.zeros(t.size, bool)
+    measured[5:10] = True
+    measured[18:23] = True
+    measured[30:35] = True
+    track = SmoothTrack(
+        t=t, x=np.full(t.size, DOUBLES_W + 8.0),
+        y=NET_Y + np.sin(t * 8.0), vx=np.full(t.size, 40.0),
+        vy=np.full(t.size, 40.0), confidence=np.ones(t.size), measured=measured,
+    )
+    verdict = rally_verdict(
+        track, FakeCourt(), 0.0, 4.0,
+        serve_times=np.array([0.6, 1.9, 3.1]),
+        target_motion_times=np.array([2.0]),
+    )
+    assert verdict.reason_code == "audio_aligned_activity_outside_target_court"
 
 
 def test_net_crossings_zero_without_court():
@@ -208,7 +345,12 @@ def test_verify_segments_keeps_rally_rejects_dead(monkeypatch):
     report = verify_segments_detailed(
         "dummy.mp4", [(10.0, 14.0)], court=FakeCourt(), model=object())
     assert report.candidates[0].peak_ball_speed_kmh is not None
-    assert report.as_dict()["candidates"][0]["peak_ball_speed_kmh"] > 0
+    speed = report.as_dict()["candidates"][0]
+    assert speed["peak_ball_speed_kmh"] > 0
+    assert speed["ball_speed_estimate"]["uncertain"] is True
+    assert speed["ball_speed_estimate"]["uncertainty_kmh"] > 0
+    assert speed["ball_speed_estimate"]["sample_count"] >= 3
+    assert "not full 3-D velocity" in speed["ball_speed_estimate"]["limitations"][0]
 
 
 def test_detailed_report_separates_accepts_from_indeterminate_fallback(monkeypatch):

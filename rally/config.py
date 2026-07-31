@@ -8,9 +8,45 @@ single-camera recording of a singles match (the scenario in the design doc).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Optional
+
+
+DEFAULT_YOLO_DETECTION_MODEL = "yolo12n.pt"
+DEFAULT_YOLO_POSE_MODEL = "yolov8n-pose.pt"  # legacy fallback backend only
+DEFAULT_RTMPOSE_MODEL = (
+    "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/"
+    "rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip"
+)
+
+
+def _model_from_env(name: str, default: str) -> str:
+    """Resolve a non-empty model override when each config instance is created."""
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else default
+
+
+def _optional_path_from_env(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else None
+
+
+def _pose_backend_from_env() -> str:
+    explicit = os.environ.get("RALLY_PLAYER_POSE_BACKEND")
+    if explicit and explicit.strip():
+        return explicit.strip().lower()
+    # Preserve compatibility with the former Ultralytics-only override.
+    return "yolo" if _optional_path_from_env("RALLY_YOLO_POSE_MODEL") else "rtmlib"
+
+
+def _pose_model_from_env() -> str:
+    return (
+        _optional_path_from_env("RALLY_PLAYER_POSE_MODEL")
+        or _optional_path_from_env("RALLY_YOLO_POSE_MODEL")
+        or DEFAULT_RTMPOSE_MODEL
+    )
 
 
 @dataclass
@@ -61,6 +97,22 @@ class RallyConfig:
     ball_channel: bool = False  # run ball tracking over the whole video as a fusion vote
     player_pose: bool = False   # run pose over the video as a confidence-weighted vote (slow)
     player_pose_fps: float = 2.0
+    # YOLO12 detects/crops target-court players. RTMLib then performs top-down pose
+    # estimation inside those boxes; this is substantially more useful for small far-side
+    # servers than whole-frame pose inference. A legacy Ultralytics pose backend remains
+    # available for explicitly configured deployments.
+    player_detection_model: str = field(default_factory=lambda: _model_from_env(
+        "RALLY_YOLO_DETECTION_MODEL", DEFAULT_YOLO_DETECTION_MODEL))
+    player_pose_backend: str = field(default_factory=_pose_backend_from_env)
+    player_pose_model: str = field(default_factory=_pose_model_from_env)
+    rtmpose_runtime: str = field(default_factory=lambda: _model_from_env(
+        "RALLY_RTMPOSE_RUNTIME", "onnxruntime").lower())
+    rtmpose_device: str = field(default_factory=lambda: _model_from_env(
+        "RALLY_RTMPOSE_DEVICE", "auto").lower())
+    # Optional human-label-trained classifier. The loader independently rechecks its
+    # held-out-match gate before it can affect a live decision.
+    serve_model: Optional[str] = field(default_factory=lambda: _optional_path_from_env(
+        "RALLY_SERVE_MODEL"))
 
     # ---- motion / camera ----------------------------------------------------
     motion_full_score: float = 0.04    # frame-diff energy (0..1) that saturates motion score
@@ -134,6 +186,8 @@ class RallyConfig:
     match_position_max_span: float = 0.045
     match_position_min_stable_fraction: float = 0.75
     match_position_min_score: float = 0.25
+    match_position_support_min_stable_fraction: float = 0.66
+    match_position_support_min_score: float = 0.50
     match_position_court_baseline_depth: float = 0.08
     match_position_far_baseline_y: tuple[float, float] = (0.36, 0.56)
     match_position_near_baseline_y: tuple[float, float] = (0.72, 0.98)
@@ -162,17 +216,21 @@ class RallyConfig:
     match_fragment_merge_gap_s: float = 6.5
     match_attempt_merge_min_gap_s: float = 8.0
     match_attempt_merge_gap_s: float = 15.0
-    match_point_start_preroll_s: float = 4.0
+    match_point_start_preroll_s: float = 3.7
     # A quiet far-side serve can be absent from the audio channel. The near receiver is
-    # normally still through the service motion and starts moving shortly after contact,
-    # so a stable-to-active transition opens a recall-only TrackNet proposal. It is never
-    # sufficient by itself; match validation still requires serve-ball/setup evidence.
+    # normally still through the service motion and starts moving shortly after contact.
+    # A target-court stable-to-active transition is also independent serve evidence; when
+    # audio is missing it opens a compact TrackNet proposal to recover the whole point.
     match_player_activity_speed: float = 0.018
     match_player_activity_min_s: float = 0.8
     match_player_stable_s: float = 1.5
     match_player_stable_span: float = 0.020
     match_receiver_reaction_lag_s: float = 0.5
     match_player_hint_near_y_min: float = 0.55
+    # Player motion is a recovery path only when audio did not already propose the serve.
+    # This prevents ordinary point/reset activity from expanding TrackNet over the match.
+    match_player_hint_audio_guard_s: float = 1.5
+    match_player_proposal_s: float = 4.5
 
     # ---- court-geometry serve detection (opt-in; needs calibration + YOLO) ---
     # One-time fixed-camera calibration: 4 image points (px) = near-left & near-right
@@ -193,13 +251,23 @@ class RallyConfig:
     # bounce on one side / ball lands out). CPU-slow (~0.3s/frame) — runs only over kept
     # rally segments, not the whole video.
     ball_weights: Optional[str] = None      # path to a 3-frame TrackNet .pt
-    ball_inference_batch_size: int = 4      # batch CNN forwards; trajectory decode stays ordered
+    # 0 selects a CUDA-memory-aware batch (CPU remains batch 1). Explicit positive values
+    # are retained for reproducible evaluation or constrained devices.
+    ball_inference_batch_size: int = 0
+    # TrackNet is trained on temporal frame stacks; cap high-frame-rate sources instead of
+    # running the same expensive CNN at 60/120 FPS with little additional evidence.
+    ball_tracking_fps: float = 30.0
+    ball_half_precision: bool = True
     ball_tail_s: float = 1.0                 # real footage kept after the point-ending bounce
     ball_max_extend_s: float = 3.0           # how far past the current end to look
     # A local TrackNet component can end at an occlusion in the middle of a long rally.
     # End hints may tighten modest audio overrun, but must not erase a large portion of a
     # point merely because the later trajectory is fragmented.
     ball_end_hint_max_uncalibrated_trim_s: float = 5.0
+    # When TrackNet explicitly abstains because a multi-hit trajectory is fragmented,
+    # retain a small amount of the still-active visual proposal after the last detected
+    # impact. This recovers quiet final strokes without publishing the whole broad window.
+    arbiter_fragmented_end_recovery_s: float = 2.0
 
     # ---- ball-as-arbiter (SwingVision-style; needs TrackNet weights; court optional) --
     # The cheap channels only *propose* candidate windows; the ball trajectory then decides
@@ -218,7 +286,8 @@ class RallyConfig:
     # no-court if it can't find one confidently. Manual court_corners, if given, take
     # precedence. Disable only if the detector locks onto the wrong lines.
     court_auto: bool = True                    # auto-detect the court homography
-    court_weights: Optional[str] = None       # reserved: future court-keypoint model (not yet implemented; classical is used)
+    court_weights: Optional[str] = field(default_factory=lambda: _optional_path_from_env(
+        "RALLY_COURT_WEIGHTS"))              # optional keypoint checkpoint; classical fallback remains
     arbiter_pre_pad_s: float = 2.0            # track this far before each candidate (catch the serve)
     arbiter_post_pad_s: float = 2.0           # track this far after (catch the point end)
     arbiter_min_speed_px_s: float = 25.0      # image speed above which the ball counts as "live"
@@ -238,6 +307,9 @@ class RallyConfig:
     # ranked and capped in both individual and aggregate duration.
     arbiter_motion_max_active_frac: float = 0.35
     arbiter_max_candidate_s: float = 45.0
+    # Candidate padding may overlap transitively across most of a match. Decode/cache at
+    # most this many seconds per TrackNet group so cancellation and progress stay timely.
+    arbiter_max_tracking_group_s: float = 60.0
     # Keep short clips complete and avoid an abrupt 80% discard at every duration: the
     # total tracking budget is at least this many seconds (clipped to video duration).
     arbiter_min_total_s: float = 120.0
@@ -287,6 +359,11 @@ class RallyConfig:
     # ---- cut ----------------------------------------------------------------
     reencode: bool = True              # True = frame-accurate re-encode; False = fast stream-copy
 
+    @property
+    def target_court_required(self) -> bool:
+        """Whether evidence must be attributable to one calibrated tennis court."""
+        return self.play_mode != "casual"
+
     def __post_init__(self) -> None:
         # Reject NaN/inf before range comparisons: every comparison with NaN is false,
         # otherwise one bad web/API value can silently turn decoder scores into NaN.
@@ -302,16 +379,26 @@ class RallyConfig:
         for name, value in vars(self).items():
             if not finite_numbers(value):
                 raise ValueError(f"{name} must contain only finite numbers")
+        for name in ("player_detection_model", "player_pose_model"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty model name or path")
+        if self.player_pose_backend not in {"rtmlib", "yolo"}:
+            raise ValueError("player_pose_backend must be 'rtmlib' or 'yolo'")
+        if self.rtmpose_runtime not in {"onnxruntime", "opencv"}:
+            raise ValueError("rtmpose_runtime must be 'onnxruntime' or 'opencv'")
+        if self.rtmpose_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("rtmpose_device must be 'auto', 'cpu', or 'cuda'")
         if self.exit_threshold > self.enter_threshold:
             raise ValueError("exit_threshold must be <= enter_threshold")
         for name in ("analysis_fps", "player_fps", "audio_sr", "player_pose_fps",
-                     "serve_track_fps", "match_setup_fps"):
+                     "serve_track_fps", "match_setup_fps", "ball_tracking_fps"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.proxy_height <= 0:
             raise ValueError("proxy_height must be positive")
-        if self.ball_inference_batch_size < 1:
-            raise ValueError("ball_inference_batch_size must be positive")
+        if self.ball_inference_batch_size < 0:
+            raise ValueError("ball_inference_batch_size must be non-negative (0 = auto)")
         for name in ("enter_threshold", "exit_threshold", "move_thresh"):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
@@ -333,17 +420,20 @@ class RallyConfig:
             "match_point_start_preroll_s",
             "match_player_activity_speed", "match_player_activity_min_s",
             "match_player_stable_s", "match_player_stable_span",
-            "match_receiver_reaction_lag_s",
+            "match_receiver_reaction_lag_s", "match_player_hint_audio_guard_s",
+            "match_player_proposal_s",
             "match_overhead_window_s", "match_position_post_strike_s",
             "match_position_track_step", "match_position_max_span",
             "match_ball_serve_pre_s",
             "match_ball_serve_post_s",
             "arbiter_pre_pad_s", "arbiter_post_pad_s", "arbiter_min_in_play_span_s",
             "arbiter_fragment_join_gap_s",
-            "arbiter_max_candidate_s", "arbiter_min_total_s", "arbiter_max_total_s",
+            "arbiter_max_candidate_s", "arbiter_max_tracking_group_s",
+            "arbiter_min_total_s", "arbiter_max_total_s",
             "point_start_buffer_s", "point_end_buffer_s", "inter_point_gap_s",
             "ball_tail_s", "ball_max_extend_s",
             "ball_end_hint_max_uncalibrated_trim_s",
+            "arbiter_fragmented_end_recovery_s",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
@@ -364,10 +454,14 @@ class RallyConfig:
             raise ValueError("match_ready_knee_deg must be in (0, 180]")
         if self.match_ready_stance_ratio < 0:
             raise ValueError("match_ready_stance_ratio must be non-negative")
-        if not 0.0 <= self.match_position_min_stable_fraction <= 1.0:
-            raise ValueError("match_position_min_stable_fraction must be in [0, 1]")
-        if not 0.0 <= self.match_position_min_score <= 1.0:
-            raise ValueError("match_position_min_score must be in [0, 1]")
+        for name in (
+            "match_position_min_stable_fraction",
+            "match_position_min_score",
+            "match_position_support_min_stable_fraction",
+            "match_position_support_min_score",
+        ):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
         if not 0.0 <= self.match_position_court_baseline_depth <= 0.5:
             raise ValueError("match_position_court_baseline_depth must be in [0, 0.5]")
         for name in ("match_position_far_baseline_y", "match_position_near_baseline_y"):
@@ -411,7 +505,9 @@ class RallyConfig:
                      "arbiter_player_recovery_min_coverage"):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
-        if self.arbiter_max_candidate_s <= 0 or self.arbiter_max_total_s <= 0:
+        if (self.arbiter_max_candidate_s <= 0
+                or self.arbiter_max_tracking_group_s <= 0
+                or self.arbiter_max_total_s <= 0):
             raise ValueError("arbiter candidate/total workload limits must be positive")
         if self.min_rally_strikes < 1 or self.arbiter_min_bounces < 0:
             raise ValueError("strike/bounce counts must be non-negative (rally strikes >= 1)")

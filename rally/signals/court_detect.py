@@ -20,13 +20,153 @@ guarded and returns ``None`` on failure so the caller falls back to manual ``cou
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .court import Court, court_model_polylines
 
 Line = Tuple[float, float, float, float]   # x1, y1, x2, y2
+
+
+def _canonical_outer_corners(points: np.ndarray) -> Optional[np.ndarray]:
+    """Reduce court keypoints to ``NL, NR, FR, FL`` image corners.
+
+    Court models in the wild expose either four outer corners or all line intersections.
+    Taking the convex hull supports both without baking one vendor's keypoint indices into
+    the pipeline.  The result is still passed through :func:`valid_court_quad`, so an
+    incomplete/occluded prediction is an abstention rather than a bad calibration.
+    """
+    import cv2
+
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] < 4:
+        return None
+    hull = cv2.convexHull(pts).reshape(-1, 2)
+    if hull.shape[0] > 4:
+        perimeter = float(cv2.arcLength(hull.reshape(-1, 1, 2), True))
+        for fraction in np.linspace(0.005, 0.08, 32):
+            reduced = cv2.approxPolyDP(
+                hull.reshape(-1, 1, 2), fraction * perimeter, True,
+            ).reshape(-1, 2)
+            if reduced.shape[0] == 4:
+                hull = reduced
+                break
+    if hull.shape[0] != 4:
+        return None
+
+    # Baseline-view footage places the near baseline below the far baseline.  Sorting the
+    # two upper/lower hull vertices also makes the adapter independent of model ordering.
+    by_y = hull[np.argsort(hull[:, 1])]
+    far = by_y[:2][np.argsort(by_y[:2, 0])]
+    near = by_y[2:][np.argsort(by_y[2:, 0])]
+    return np.asarray([near[0], near[1], far[1], far[0]], dtype=float)
+
+
+def _keypoint_quads(result: Any, frame_shape, *, min_conf: float = 0.25
+                    ) -> List[Tuple[np.ndarray, float]]:
+    """Adapt one Ultralytics pose result into validated court quadrilaterals."""
+    keypoints = getattr(result, "keypoints", None)
+    xy = getattr(keypoints, "xy", None)
+    if xy is None:
+        return []
+    xy = xy.detach().cpu().numpy() if hasattr(xy, "detach") else np.asarray(xy)
+    if xy.ndim == 2:
+        xy = xy[None, ...]
+    conf = getattr(keypoints, "conf", None)
+    if conf is not None:
+        conf = conf.detach().cpu().numpy() if hasattr(conf, "detach") else np.asarray(conf)
+        if conf.ndim == 1:
+            conf = conf[None, ...]
+    box_conf = getattr(getattr(result, "boxes", None), "conf", None)
+    if box_conf is not None:
+        box_conf = (box_conf.detach().cpu().numpy()
+                    if hasattr(box_conf, "detach") else np.asarray(box_conf))
+
+    candidates: List[Tuple[np.ndarray, float]] = []
+    for index, points in enumerate(xy):
+        visible = np.isfinite(points).all(axis=1)
+        point_conf = None
+        if conf is not None and index < len(conf):
+            point_conf = np.asarray(conf[index], float)
+            visible &= point_conf >= min_conf
+        corners = _canonical_outer_corners(points[visible])
+        if corners is None or not valid_court_quad(corners, frame_shape):
+            continue
+        confidence = float(np.mean(point_conf[visible])) if point_conf is not None else 1.0
+        if box_conf is not None and index < len(box_conf):
+            confidence *= float(box_conf[index])
+        candidates.append((corners, confidence))
+    return candidates
+
+
+def _detect_with_keypoint_model(
+    frames: Sequence[np.ndarray], weights: str, *, min_score: float,
+    progress: Callable[[str], None],
+) -> Optional[Tuple[Court, float, int]]:
+    """Return a multi-frame court consensus from an Ultralytics keypoint checkpoint.
+
+    A custom model is optional.  Runtime/import/schema failures deliberately abstain so
+    the deterministic line detector remains available as the safe fallback.
+    """
+    if not frames:
+        return None
+    path = Path(weights).expanduser()
+    if not path.is_file():
+        progress(f"  court keypoint weights not found: {path} -> using classical detector")
+        return None
+    try:
+        from ultralytics import YOLO
+        from .player import resolve_yolo_device
+
+        model = YOLO(str(path))
+        results = model.predict(
+            source=list(frames), device=resolve_yolo_device(), verbose=False,
+            conf=0.15,
+        )
+    except Exception as exc:
+        progress(f"  court keypoint model unavailable ({exc}) -> using classical detector")
+        return None
+
+    candidates: List[Tuple[np.ndarray, float]] = []
+    for frame, result in zip(frames, results):
+        edges = None
+        for corners, confidence in _keypoint_quads(result, frame.shape):
+            try:
+                court = Court.from_image_corners(*corners)
+            except Exception:
+                continue
+            if edges is None:
+                import cv2
+                edges = cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 40, 120)
+            # Learned confidence alone cannot distinguish a target court from a neighboring
+            # one.  Require at least modest agreement with stationary painted lines.
+            line_score = score_court(edges, court, band_px=max(3, frame.shape[1] // 400))
+            if line_score >= max(0.25, 0.5 * min_score):
+                candidates.append((corners, confidence * line_score))
+    if not candidates:
+        return None
+
+    scale = float(np.hypot(*frames[0].shape[:2]))
+    quads = np.stack([corners for corners, _score in candidates])
+    neighbour_sets = []
+    for quad in quads:
+        distance = np.sqrt(np.mean(np.sum((quads - quad) ** 2, axis=2), axis=1))
+        neighbour_sets.append(np.flatnonzero(distance <= 0.035 * scale))
+    cluster = max(neighbour_sets, key=lambda ids: (
+        ids.size, float(np.median([candidates[i][1] for i in ids]))))
+    min_support = 1 if len(frames) == 1 else 2
+    if cluster.size < min_support:
+        progress("  court keypoint model rejected: no multi-frame geometric consensus")
+        return None
+    corners = np.median(quads[cluster], axis=0)
+    if not valid_court_quad(corners, frames[0].shape):
+        return None
+    court = Court.from_image_corners(*corners)
+    score = float(np.median([candidates[i][1] for i in cluster]))
+    return court, score, int(cluster.size)
 
 
 def normalize_hough_lines(raw) -> List[Line]:
@@ -237,6 +377,32 @@ def _cluster_by(values, distance: float, limit: int):
     return [feature for feature, _key in kept]
 
 
+def _plausible_target_alignment(corners, frame_shape) -> bool:
+    """Reject shallow, laterally sheared multi-court aliases.
+
+    In a baseline view a shallow near edge can be legitimate when the optical axis still
+    follows the court. The dangerous alias combines a shallow near edge with a large
+    sideways jump between the near/far baseline centres, typically by borrowing lines
+    from adjacent courts. Deep near baselines remain valid regardless of that soft drift
+    guard because strong perspective can amplify ordinary camera offset.
+    """
+    pts = np.asarray(corners, float)
+    h, w = frame_shape[:2]
+    near_centre = np.mean(pts[:2], axis=0)
+    far_centre = np.mean(pts[2:], axis=0)
+    # The general quad validator tolerates wider off-frame intersections for manual and
+    # unusual views. Automatic target selection is stricter: borrowing a neighboring
+    # sideline commonly puts one near corner 5--6% beyond the frame while preserving an
+    # excellent line score.
+    target_margin_x = 0.03 * w
+    corners_near_frame = bool(
+        np.all(pts[:, 0] >= -target_margin_x)
+        and np.all(pts[:, 0] <= (w - 1) + target_margin_x))
+    near_is_deep = near_centre[1] >= 0.78 * h
+    centre_drift_is_small = abs(near_centre[0] - far_centre[0]) <= 0.08 * w
+    return corners_near_frame and bool(near_is_deep or centre_drift_is_small)
+
+
 def _detect_in_stationary_gray(gray: np.ndarray, min_score: float = 0.55
                                ) -> Optional[Tuple[Court, float]]:
     """Detect a perspective court from a temporal-median grayscale frame.
@@ -252,82 +418,116 @@ def _detect_in_stationary_gray(gray: np.ndarray, min_score: float = 0.55
     gray = np.asarray(gray, np.uint8)
     h, w = gray.shape[:2]
     edges = cv2.Canny(gray, 40, 120)
-    raw = cv2.HoughLinesP(
-        edges, 1, np.pi / 720, threshold=20,
-        # Court paint is repeatedly occluded by the net and players.  A generous gap is
-        # safe here because full-model scoring and quad conditioning follow Hough.
-        minLineLength=max(60, int(0.03 * w)), maxLineGap=max(30, int(0.08 * w)),
-    )
-    features = [_line_features(line, w) for line in normalize_hough_lines(raw)]
-    features = [feature for feature in features if feature is not None]
-    if not features:
-        return None
+    def hough_features(max_gap_frac: float):
+        raw = cv2.HoughLinesP(
+            edges, 1, np.pi / 720, threshold=20,
+            # Court paint is repeatedly occluded by the net and players. Normal views can
+            # bridge larger gaps; shallow views need shorter joins so lines from adjacent
+            # courts are not fused into one misleading diagonal.
+            minLineLength=max(60, int(0.03 * w)),
+            maxLineGap=max(30, int(max_gap_frac * w)),
+        )
+        found = [_line_features(line, w) for line in normalize_hough_lines(raw)]
+        return [feature for feature in found if feature is not None]
 
-    baseline_values = []
-    for feature in features:
-        slope, _intercept, length, centre_y, _line = feature
-        if abs(slope) <= 0.08 and 0.35 * h <= centre_y <= 0.90 * h \
-                and length >= 0.06 * w:
-            baseline_values.append((feature, (centre_y, 0.0)))
-    baselines = _cluster_by(baseline_values, max(5.0, 0.007 * h), limit=24)
-    far_lines = [f for f in baselines if 0.38 * h <= f[3] <= 0.65 * h]
-    near_lines = [f for f in baselines if 0.68 * h <= f[3] <= 0.90 * h]
-    if not far_lines or not near_lines:
-        return None
-
-    hypotheses: List[Tuple[Court, float]] = []
-    band_px = max(3, int(round(0.003 * w)))
-    for far in far_lines:
-        for near in near_lines:
-            far_y, near_y = far[3], near[3]
-            # A shallower pair on this view is usually the near baseline + net: the
-            # resulting half-court is projectively self-similar and can score deceptively
-            # well as a full court.  Require enough image height for both court halves.
-            if not 0.24 * h <= near_y - far_y <= 0.43 * h:
-                continue
-
-            side_values = {"left": [], "right": []}
-            for feature in features:
-                slope, intercept, length, _centre_y, _line = feature
-                if length < 0.06 * w or not 0.15 <= abs(slope) <= 0.90:
+    def build_hypotheses(
+        features, *, far_band: Tuple[float, float],
+        near_band: Tuple[float, float], separation_band: Tuple[float, float],
+    ) -> List[Tuple[Court, float]]:
+        baseline_values = []
+        for feature in features:
+            slope, _intercept, length, centre_y, _line = feature
+            if abs(slope) <= 0.08 and 0.35 * h <= centre_y <= 0.90 * h \
+                    and length >= 0.06 * w:
+                baseline_values.append((feature, (centre_y, 0.0)))
+        # Long fence, net, and neighboring-court lines can outnumber the target court's
+        # near baseline. Keep enough distinct y-levels for the full target baseline to
+        # survive ranking; geometric pairing and full-model scoring do the real pruning.
+        baselines = _cluster_by(
+            baseline_values, max(5.0, 0.007 * h), limit=64)
+        far_lines = [
+            feature for feature in baselines
+            if far_band[0] * h <= feature[3] <= far_band[1] * h
+        ]
+        near_lines = [
+            feature for feature in baselines
+            if near_band[0] * h <= feature[3] <= near_band[1] * h
+        ]
+        hypotheses: List[Tuple[Court, float]] = []
+        band_px = max(3, int(round(0.003 * w)))
+        for far in far_lines:
+            for near in near_lines:
+                far_y, near_y = far[3], near[3]
+                if not separation_band[0] * h <= near_y - far_y <= separation_band[1] * h:
                     continue
-                x_far = (far_y - intercept) / slope
-                x_near = (near_y - intercept) / slope
-                if (slope < 0 and -0.10 * w <= x_near <= 0.40 * w
-                        and 0.25 * w <= x_far <= 0.70 * w and x_near < x_far):
-                    side_values["left"].append((feature, (x_near, x_far)))
-                elif (slope > 0 and 0.60 * w <= x_near <= 1.10 * w
-                      and 0.30 * w <= x_far <= 0.80 * w and x_far < x_near):
-                    side_values["right"].append((feature, (x_near, x_far)))
 
-            left = _cluster_by(side_values["left"], 0.025 * w, limit=12)
-            right = _cluster_by(side_values["right"], 0.025 * w, limit=12)
-            for left_line in left:
-                for right_line in right:
-                    corners = (
-                        line_intersection(near[4], left_line[4]),
-                        line_intersection(near[4], right_line[4]),
-                        line_intersection(far[4], right_line[4]),
-                        line_intersection(far[4], left_line[4]),
-                    )
-                    if not valid_court_quad(
-                            corners, gray.shape, min_area_frac=0.06,
-                            off_frame_margin_frac=0.06):
+                side_values = {"left": [], "right": []}
+                for feature in features:
+                    slope, intercept, length, _centre_y, _line = feature
+                    # A low baseline camera can place the near doubles corners close to the
+                    # image edges, producing genuinely steep sidelines. The old 0.90 cap
+                    # rejected these courts and left adjacent-court motion uncalibrated.
+                    if length < 0.06 * w or not 0.15 <= abs(slope) <= 1.60:
                         continue
-                    pts = np.asarray(corners, float)
-                    near_centre_x = 0.5 * (pts[0, 0] + pts[1, 0])
-                    far_centre_x = 0.5 * (pts[2, 0] + pts[3, 0])
-                    if not (0.30 * w <= near_centre_x <= 0.70 * w
-                            and 0.35 * w <= far_centre_x <= 0.65 * w):
-                        continue
-                    try:
-                        court = Court.from_image_corners(*corners)
-                    except Exception:
-                        continue
-                    score = score_court(edges, court, band_px=band_px)
-                    hypotheses.append((court, score))
+                    x_far = (far_y - intercept) / slope
+                    x_near = (near_y - intercept) / slope
+                    if (slope < 0 and -0.10 * w <= x_near <= 0.40 * w
+                            and 0.25 * w <= x_far <= 0.70 * w and x_near < x_far):
+                        side_values["left"].append((feature, (x_near, x_far)))
+                    elif (slope > 0 and 0.60 * w <= x_near <= 1.10 * w
+                          and 0.30 * w <= x_far <= 0.80 * w and x_far < x_near):
+                        side_values["right"].append((feature, (x_near, x_far)))
+
+                left = _cluster_by(side_values["left"], 0.025 * w, limit=16)
+                right = _cluster_by(side_values["right"], 0.025 * w, limit=16)
+                for left_line in left:
+                    for right_line in right:
+                        corners = (
+                            line_intersection(near[4], left_line[4]),
+                            line_intersection(near[4], right_line[4]),
+                            line_intersection(far[4], right_line[4]),
+                            line_intersection(far[4], left_line[4]),
+                        )
+                        if not valid_court_quad(
+                                corners, gray.shape, min_area_frac=0.06,
+                                off_frame_margin_frac=0.06):
+                            continue
+                        pts = np.asarray(corners, float)
+                        near_centre_x = 0.5 * (pts[0, 0] + pts[1, 0])
+                        far_centre_x = 0.5 * (pts[2, 0] + pts[3, 0])
+                        if not (0.30 * w <= near_centre_x <= 0.70 * w
+                                and 0.35 * w <= far_centre_x <= 0.65 * w):
+                            continue
+                        if not _plausible_target_alignment(pts, gray.shape):
+                            continue
+                        try:
+                            court = Court.from_image_corners(*corners)
+                        except Exception:
+                            continue
+                        score = score_court(edges, court, band_px=band_px)
+                        hypotheses.append((court, score))
+        return hypotheses
+
+    features = hough_features(0.08)
+    hypotheses = build_hypotheses(
+        features, far_band=(0.38, 0.65), near_band=(0.68, 0.90),
+        # Elevated/wide-angle baseline cameras can compress the full playing rectangle
+        # to roughly 15% of image height. Full-model reprojection, area, perspective, and
+        # centre-alignment checks below reject net/service-line aliases more reliably than
+        # a hard depth cutoff.
+        separation_band=(0.14, 0.43))
     if not hypotheses:
         return None
+    # Net/service-line subsets can score better than the complete court because the same
+    # painted-line pattern is projectively self-similar. If the image provides a valid
+    # deeper near baseline, it owns the view; retain shallow hypotheses only for cameras
+    # where no deep full-court geometry is available at all.
+    deep_hypotheses = [
+        candidate for candidate in hypotheses
+        if float(np.mean(candidate[0].corners_img[:2, 1])) >= 0.78 * h
+    ]
+    if deep_hypotheses:
+        hypotheses = deep_hypotheses
     hypotheses.sort(key=lambda item: item[1], reverse=True)
     best = hypotheses[0]
     if best[1] < min_score:
@@ -383,25 +583,27 @@ def detect_court(video: str, cfg=None, *, n_frames: int = 12, min_score: float =
                  progress: Callable[[str], None] = lambda _m: None) -> Optional[Court]:
     """Sample frames across ``video`` and return the best-scoring court homography, or None.
 
-    Uses the classical Hough detector. ``cfg.court_weights`` is a reserved placeholder for a
-    future trained keypoint-model backend (not yet implemented); if set, we note it and use
-    the classical path anyway. Returns ``None`` when no frame yields a confident court, so
-    the caller falls back to manual calibration.
+    When ``cfg.court_weights`` names an Ultralytics court-keypoint checkpoint, its
+    multi-frame consensus is tried first. The classical detector remains the fallback.
+    Returns ``None`` when neither backend yields a confident court, so the caller safely
+    abstains from target-court claims.
     """
     import cv2
 
-    if cfg is not None and getattr(cfg, "court_weights", None):
-        progress("  court_weights set but the keypoint backend isn't implemented yet "
-                 "-> using classical court detection")
-
     cap = cv2.VideoCapture(video)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if total <= 0:
         cap.release()
         return None
     idxs = np.linspace(total * 0.05, total * 0.95, n_frames).astype(int)
+    early_total = min(total, int(round(130.0 * fps))) if fps > 0 else total
+    early_idxs = np.linspace(
+        early_total * 0.05, early_total * 0.95, n_frames).astype(int)
     candidates: List[Tuple[Court, float]] = []
+    sampled_frames: List[np.ndarray] = []
     gray_frames: List[np.ndarray] = []
+    early_gray_frames: List[np.ndarray] = []
     frame_shape = None
     for fi in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
@@ -409,22 +611,64 @@ def detect_court(video: str, cfg=None, *, n_frames: int = 12, min_score: float =
         if not ok:
             continue
         frame_shape = frame.shape
+        sampled_frames.append(frame)
         gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         found = _detect_in_frame(frame, min_score)
         if found:
             candidates.append(found)
+    if not np.array_equal(early_idxs, idxs):
+        for fi in early_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok, frame = cap.read()
+            if ok:
+                early_gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     cap.release()
+
+    court_weights = getattr(cfg, "court_weights", None) if cfg is not None else None
+    if court_weights:
+        learned = _detect_with_keypoint_model(
+            sampled_frames, str(court_weights), min_score=min_score, progress=progress)
+        if learned is not None:
+            court, score, support = learned
+            progress(
+                f"  court detected by keypoint model in {support}/{len(sampled_frames)} "
+                f"sampled frames (consensus score {score:.2f})")
+            return court
 
     # The camera is stationary: aggregate all successfully sampled frames before falling
     # back to noisier per-frame hypotheses.  Unlike simply voting on per-frame extrema,
     # this lets line fragments occluded by different players reinforce one geometry.
+    aggregate = None
     if len(gray_frames) >= 3:
         stationary = np.median(np.stack(gray_frames, axis=0), axis=0).astype(np.uint8)
         aggregate = _detect_in_stationary_gray(stationary, min_score=min_score)
-        if aggregate is not None:
-            progress(f"  court detected from {len(gray_frames)} stationary-frame samples "
-                     f"(edge-overlap score {aggregate[1]:.2f})")
-            return aggregate[0]
+    early_aggregate = None
+    if len(early_gray_frames) >= 3:
+        early_stationary = np.median(
+            np.stack(early_gray_frames, axis=0), axis=0).astype(np.uint8)
+        early_aggregate = _detect_in_stationary_gray(
+            early_stationary, min_score=min_score)
+
+    # A fixed-camera court should not depend on video duration. For long recordings the
+    # all-video median can accumulate lighting/player-state aliases, so reuse the clean
+    # first-130-second geometry when the global median abstains or agrees with it.
+    if early_aggregate is not None:
+        use_early = aggregate is None
+        if aggregate is not None and frame_shape is not None:
+            h, w = frame_shape[:2]
+            distance = float(np.sqrt(np.mean(np.sum(
+                (early_aggregate[0].corners_img.astype(float)
+                 - aggregate[0].corners_img.astype(float)) ** 2, axis=1))))
+            use_early = distance <= 0.035 * float(np.hypot(w, h))
+        if use_early:
+            progress(
+                f"  court detected from {len(early_gray_frames)} early stationary-frame "
+                f"samples (edge-overlap score {early_aggregate[1]:.2f})")
+            return early_aggregate[0]
+    if aggregate is not None and early_aggregate is None:
+        progress(f"  court detected from {len(gray_frames)} stationary-frame samples "
+                 f"(edge-overlap score {aggregate[1]:.2f})")
+        return aggregate[0]
     if not candidates or frame_shape is None:
         return None
 

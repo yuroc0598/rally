@@ -16,10 +16,68 @@ The output is a :class:`BallTrack` (time, x, y image px, visibility). Feed it to
 
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
+# Keep uploads/CPU preprocessing concurrent while limiting simultaneous TrackNet streams.
+# Two streams overlap video decoding and GPU execution well; four independent models tend
+# to reduce per-job throughput and make CUDA memory peaks unpredictable.
+_GPU_TRACK_SLOTS = _positive_env_int("RALLY_GPU_TRACK_SLOTS", 2)
+_GPU_TRACK_SEMAPHORE = threading.BoundedSemaphore(_GPU_TRACK_SLOTS)
+_HEATMAP_DECODE_WORKERS = _positive_env_int(
+    "RALLY_HEATMAP_DECODE_WORKERS", min(4, max(1, os.cpu_count() or 1)))
+_HEATMAP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_HEATMAP_DECODE_WORKERS, thread_name_prefix="tracknet-heatmap")
+
+
+def resolve_ball_batch_size(device, requested: Optional[int] = None, *, torch_module=None) -> int:
+    """Resolve an explicit or memory-aware TrackNet inference batch size."""
+    if requested is not None and int(requested) > 0:
+        return int(requested)
+    env_batch = os.environ.get("RALLY_BALL_BATCH_SIZE")
+    if env_batch is not None:
+        return _positive_env_int("RALLY_BALL_BATCH_SIZE", 1)
+    if getattr(device, "type", str(device).split(":", 1)[0]) != "cuda":
+        return 1
+    if torch_module is None:
+        import torch as torch_module
+    try:
+        free_bytes = int(torch_module.cuda.mem_get_info(device)[0])
+    except Exception:
+        return 4
+    gib = free_bytes / float(1024 ** 3)
+    # TrackNet's 256-class heatmaps are the dominant allocation. Large accelerator cards
+    # can amortize video decode, host/device copies, and kernel launch overhead with a
+    # materially larger batch; retain conservative sizes on ordinary consumer GPUs.
+    if gib >= 60.0:
+        return 32
+    if gib >= 36.0:
+        return 16
+    if gib >= 20.0:
+        return 8
+    if gib >= 10.0:
+        return 4
+    return 2
 
 
 @dataclass
@@ -51,7 +109,6 @@ def track_motion(video: str, fps_a: Optional[float] = None,
 
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames_gray = []
     ts, xs, ys = [], [], []
     prev_ball = None
     misses = 0
@@ -133,16 +190,26 @@ def track_motion(video: str, fps_a: Optional[float] = None,
 # ---------------------------------------------------------------------------
 # TrackNet backend (3-frame heatmap CNN, PyTorch; needs pretrained weights)
 # ---------------------------------------------------------------------------
-def _decode_heatmap(feature_map_360x640: np.ndarray, prev=None,
-                    speed_limit_px: float = 200.0, scale: int = 1):
+def _heatmap_candidates(feature_map_360x640: np.ndarray, scale: int = 1):
+    """Extract TrackNet circles independently of chronological association."""
     import cv2
     hm = feature_map_360x640.astype(np.uint8)
+    # Most between-point frames are pure background. HoughCircles still scans the entire
+    # 640x360 map before returning None, so preserve the exact result with a cheap guard.
+    if not np.any(hm > 127):
+        return []
     _, binm = cv2.threshold(hm, 127, 255, cv2.THRESH_BINARY)
     circles = cv2.HoughCircles(binm, cv2.HOUGH_GRADIENT, dp=1, minDist=1,
                                param1=50, param2=2, minRadius=2, maxRadius=7)
     if circles is None:
+        return []
+    return [(c[0] * scale, c[1] * scale) for c in circles[0]]
+
+
+def _select_heatmap_candidate(feature_map_360x640: np.ndarray, cands, prev=None,
+                              speed_limit_px: float = 200.0, scale: int = 1):
+    if not cands:
         return None
-    cands = [(c[0] * scale, c[1] * scale) for c in circles[0]]
     if prev is not None:
         near = [c for c in cands if np.hypot(c[0] - prev[0], c[1] - prev[1]) <= speed_limit_px]
         if not near:
@@ -151,17 +218,50 @@ def _decode_heatmap(feature_map_360x640: np.ndarray, prev=None,
     # With no prior, prefer the strongest heatmap peak instead of OpenCV's arbitrary
     # Hough ordering. Once a track exists, continuity above remains the primary signal.
     def heat(c):
+        hm = feature_map_360x640
         x = int(np.clip(round(c[0] / scale), 0, hm.shape[1] - 1))
         y = int(np.clip(round(c[1] / scale), 0, hm.shape[0] - 1))
         return int(hm[y, x])
     return max(cands, key=heat)
 
 
-def discover_ball_weights(models_dir: Optional[str] = None) -> Optional[str]:
-    """Find a bundled TrackNet checkpoint so ball mode works with no explicit path.
+def _target_court_heatmap_candidates(
+    candidates, court, scale_x: float, scale_y: float, *,
+    sideline_margin_m: float, baseline_margin_m: float,
+):
+    """Filter candidate centres before association can lock onto a neighboring ball."""
+    if court is None or not candidates:
+        return list(candidates)
+    from .court import COURT_L, DOUBLES_W
 
-    Looks for ``models/tracknet*.pt`` first (the expected name), then any ``models/*.pt``
-    that isn't a YOLO file. Returns the path or ``None`` if none is present.
+    image_candidates = np.asarray([
+        (candidate[0] * scale_x, candidate[1] * scale_y)
+        for candidate in candidates
+    ], dtype=float)
+    court_candidates = court.to_court(image_candidates)
+    return [
+        candidate for candidate, mapped in zip(candidates, court_candidates)
+        if (np.isfinite(mapped).all()
+            and -sideline_margin_m <= mapped[0] <= DOUBLES_W + sideline_margin_m
+            and -baseline_margin_m <= mapped[1] <= COURT_L + baseline_margin_m)
+    ]
+
+
+def _decode_heatmap(feature_map_360x640: np.ndarray, prev=None,
+                    speed_limit_px: float = 200.0, scale: int = 1):
+    """Compatibility wrapper for candidate extraction plus chronological association."""
+    candidates = _heatmap_candidates(feature_map_360x640, scale=scale)
+    return _select_heatmap_candidate(
+        feature_map_360x640, candidates, prev=prev,
+        speed_limit_px=speed_limit_px, scale=scale)
+
+
+def discover_ball_weights(models_dir: Optional[str] = None) -> Optional[str]:
+    """Find a locally installed TrackNet checkpoint so ball mode needs no explicit path.
+
+    Only TrackNet-named files are eligible. Falling back to an arbitrary ``.pt`` can load
+    a pose, court, or learned serve checkpoint as the ball network and fail after an
+    expensive job has already started. Discovery proves neither provenance nor licence.
     """
     import os
     from pathlib import Path
@@ -174,10 +274,8 @@ def discover_ball_weights(models_dir: Optional[str] = None) -> Optional[str]:
         if not models_dir:
             models_dir = str(Path(__file__).resolve().parents[2] / "models")
 
-    for pat in ("tracknet*.pt", "*tracknet*.pt", "*.pt"):
+    for pat in ("tracknet*.pt", "*tracknet*.pt"):
         for path in sorted(Path(models_dir).glob(pat)):
-            if "yolo" in path.name.lower():
-                continue
             return str(path)
     return None
 
@@ -224,9 +322,11 @@ def load_ball_model(weights_path: str, device=None):
     dev = resolve_device(torch) if device is None else torch.device(device)
     model.to(dev)
     if dev.type == "cuda":
-        # Fixed-resolution inference benefits from cuDNN autotuning.  This never changes
-        # the CPU fallback and keeps the model in full precision for detection stability.
+        # Fixed-resolution inference benefits from cuDNN autotuning. Track-time precision
+        # selection happens later so the CPU fallback remains full precision.
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
     print(f"[ball] TrackNet ball tracker running on {dev}")
     return model
 
@@ -235,10 +335,16 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
                    start_s: float = 0.0, end_s: Optional[float] = None,
                    width: int = 640, height: int = 360, speed_limit_px: float = 200.0,
                    batch_size: Optional[int] = None,
+                   tracking_fps: Optional[float] = 30.0,
+                   half_precision: bool = True,
+                   court=None,
+                   court_sideline_margin_m: float = 1.0,
+                   court_baseline_margin_m: float = 3.0,
+                   progress_callback: Callable[[int, int, int], None] | None = None,
                    cancel_check: Callable[[], None] = lambda: None) -> BallTrack:
     """Ball positions per frame via the 3-frame PyTorch TrackNet (BallTrackerNet).
 
-    Three consecutive frames are stacked (9 channels) so the net sees the ball's motion —
+    Three sampled frames are stacked (9 channels) so the net sees the ball's motion —
     far more reliable for a small/blurry ball than any single-frame detector. Optionally
     restrict to ``[start_s, end_s]`` (to process one rally) and pass a preloaded ``model``.
     Pure PyTorch — no TensorFlow.
@@ -251,17 +357,27 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
     # Run inputs on whatever device the model lives on (GPU when available).  CNN outputs
     # are batched, while heatmap/data-association decoding remains strictly chronological.
     device = next(model.parameters()).device
-    if batch_size is None:
-        import os
-        default_batch = 4 if device.type == "cuda" else 1
-        batch_size = int(os.environ.get("RALLY_BALL_BATCH_SIZE", default_batch))
-    batch_size = max(1, int(batch_size))
+    if device.type == "cuda" and half_precision:
+        model.half()
+    model_dtype = next(model.parameters()).dtype
+    batch_size = resolve_ball_batch_size(device, batch_size, torch_module=torch)
 
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    start_f = max(0, int(round((start_s - 2 / fps) * fps)))  # 2 frames of lead for the 3-stack
+    sample_stride = max(
+        1, int(round(fps / max(float(tracking_fps or fps), 1e-6))))
+    effective_fps = fps / sample_stride
+    # Two sampled frames of lead are required for the first 3-frame stack.
+    start_f = max(0, int(round((start_s - 2 / effective_fps) * fps)))
+    start_f -= start_f % sample_stride
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
     end_f = None if end_s is None else int(round(end_s * fps))
+    source_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    last_f = max(
+        start_f - 1,
+        (source_frames - 1 if end_f is None else min(source_frames - 1, end_f)),
+    )
+    total_frames = max(0, (last_f - start_f) // sample_stride + 1)
     scale_x = scale_y = None
     buf, ts, xs, ys = [], [], [], []
     pending_inputs = []
@@ -271,21 +387,39 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
     pending_reacq = None
     pending_count = 0
     fi = start_f
-    reacquire_after = max(3, int(round(0.25 * fps)))
+    reacquire_after = max(3, int(round(0.25 * effective_fps)))
+    next_progress_fraction = 0.0
 
-    def decode_map(fm, output_index: int) -> None:
+    def report_progress(*, force: bool = False) -> None:
+        nonlocal next_progress_fraction
+        if progress_callback is None:
+            return
+        done = len(ts)
+        fraction = done / max(1, total_frames)
+        if force or fraction + 1e-9 >= next_progress_fraction:
+            progress_callback(done, total_frames, batch_size)
+            next_progress_fraction = min(1.0, fraction + 0.05)
+
+    def decode_map(fm, output_index: int, candidates) -> None:
         nonlocal prev, misses, pending_reacq, pending_count
         pos = None
         base_gate = speed_limit_px / max(scale_x, 1)
+        candidates = _target_court_heatmap_candidates(
+            candidates, court, scale_x, scale_y,
+            sideline_margin_m=court_sideline_margin_m,
+            baseline_margin_m=court_baseline_margin_m,
+        )
         if prev is not None and misses < reacquire_after:
             pv = (prev[0] / scale_x, prev[1] / scale_y)
-            decoded = _decode_heatmap(fm, prev=pv, speed_limit_px=base_gate)
+            decoded = _select_heatmap_candidate(
+                fm, candidates, prev=pv, speed_limit_px=base_gate)
             if decoded is not None:
                 pos = (decoded[0] * scale_x, decoded[1] * scale_y)
         else:
             pv = (None if pending_reacq is None else
                   (pending_reacq[0] / scale_x, pending_reacq[1] / scale_y))
-            decoded = _decode_heatmap(fm, prev=pv, speed_limit_px=base_gate)
+            decoded = _select_heatmap_candidate(
+                fm, candidates, prev=pv, speed_limit_px=base_gate)
             if decoded is None:
                 pending_reacq = None
                 pending_count = 0
@@ -310,45 +444,69 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
         if not pending_inputs:
             return
         cancel_check()
-        inp = torch.stack(pending_inputs, dim=0).to(device, non_blocking=True)
+        inp = torch.stack(pending_inputs, dim=0)
+        if device.type == "cuda":
+            inp = inp.pin_memory()
+        inp = inp.to(device=device, dtype=model_dtype, non_blocking=True)
         maps = model(inp).argmax(dim=1).cpu().numpy()
         cancel_check()
-        for output_index, fm in zip(pending_indices, maps):
-            decode_map(fm.reshape((height, width)), output_index)
+        frame_maps = [fm.reshape((height, width)) for fm in maps]
+        candidate_sets = list(_HEATMAP_EXECUTOR.map(_heatmap_candidates, frame_maps))
+        for output_index, fm, candidates in zip(
+                pending_indices, frame_maps, candidate_sets):
+            decode_map(fm, output_index, candidates)
         pending_inputs.clear()
         pending_indices.clear()
+        report_progress()
 
-    with torch.inference_mode():
-        while True:
-            cancel_check()
-            ok, fr = cap.read()
-            if not ok or (end_f is not None and fi > end_f):
-                break
-            if scale_x is None:
-                scale_x, scale_y = fr.shape[1] / width, fr.shape[0] / height
-            buf.append(cv2.resize(fr, (width, height)))
-            if len(buf) > 3:
-                buf.pop(0)
-            ts.append(fi / fps)
-            xs.append(np.nan)
-            ys.append(np.nan)
-            if len(buf) == 3:
-                imgs = np.concatenate((buf[2], buf[1], buf[0]), axis=2).astype(np.float32) / 255.0
-                pending_inputs.append(torch.from_numpy(np.rollaxis(imgs, 2, 0)).float())
-                pending_indices.append(len(xs) - 1)
-                if len(pending_inputs) >= batch_size:
-                    flush_batch()
-            else:
-                misses += 1
-            fi += 1
-        flush_batch()
-    cap.release()
+    slot = _GPU_TRACK_SEMAPHORE if device.type == "cuda" else nullcontext()
+    try:
+        with slot, torch.inference_mode():
+            report_progress(force=True)
+            while True:
+                cancel_check()
+                if end_f is not None and fi > end_f:
+                    break
+                ok = cap.grab()
+                if not ok:
+                    break
+                frame_index = fi
+                fi += 1
+                if (frame_index - start_f) % sample_stride:
+                    continue
+                ok, fr = cap.retrieve()
+                if not ok:
+                    break
+                if scale_x is None:
+                    scale_x, scale_y = fr.shape[1] / width, fr.shape[0] / height
+                buf.append(cv2.resize(fr, (width, height)))
+                if len(buf) > 3:
+                    buf.pop(0)
+                ts.append(frame_index / fps)
+                xs.append(np.nan)
+                ys.append(np.nan)
+                if len(buf) == 3:
+                    imgs = np.concatenate(
+                        (buf[2], buf[1], buf[0]), axis=2,
+                    ).astype(np.float32) / 255.0
+                    pending_inputs.append(
+                        torch.from_numpy(np.rollaxis(imgs, 2, 0)).float())
+                    pending_indices.append(len(xs) - 1)
+                    if len(pending_inputs) >= batch_size:
+                        flush_batch()
+                else:
+                    misses += 1
+            flush_batch()
+            report_progress(force=True)
+    finally:
+        cap.release()
     return BallTrack(np.array(ts), np.array(xs), np.array(ys))
 
 
 def ball_in_play_channel(track: BallTrack, timeline: np.ndarray,
                          window_s: float = 1.0, min_speed_px: float = 3.0,
-                         min_displacement_px: float = 0.75) -> np.ndarray:
+                         min_displacement_px: float = 0.75, court=None,
+                         court_margin_m: float = 0.75) -> np.ndarray:
     """Per-analysis-frame ball-in-play evidence (0..1) for the rally fusion.
 
     For each timeline time, the fraction of nearby tracked frames where the ball is both
@@ -383,6 +541,18 @@ def ball_in_play_channel(track: BallTrack, timeline: np.ndarray,
     np.divide(displacement, dt, out=step_speed, where=adjacent)
     sp[1:] = step_speed
     active = vis & (sp > min_speed_px)
+    if court is not None and np.any(active):
+        from .court import COURT_L, DOUBLES_W
+
+        indices = np.flatnonzero(active)
+        coords = court.to_court(np.stack([track.x[indices], track.y[indices]], axis=1))
+        inside = (
+            (coords[:, 0] >= -court_margin_m)
+            & (coords[:, 0] <= DOUBLES_W + court_margin_m)
+            & (coords[:, 1] >= -court_margin_m)
+            & (coords[:, 1] <= COURT_L + court_margin_m)
+        )
+        active[indices[~inside]] = False
     # Prefix counts plus vectorised binary searches replace one full-track mask per
     # timeline sample.  Memory stays O(N+T), and no T-by-N temporary is created.
     lo = np.searchsorted(tt, timeline - window_s / 2, side="left")

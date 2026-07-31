@@ -20,14 +20,6 @@ const fmtTime = (s) => {
   return h ? `${h}:${mm}` : mm;
 };
 const fmtDur = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${(s || 0).toFixed(1)}s`);
-const fmtBytes = (b) => {
-  if (!b) return "—";
-  const u = ["B", "KB", "MB", "GB"];
-  let i = 0;
-  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
-  return `${b.toFixed(b < 10 && i ? 1 : 0)} ${u[i]}`;
-};
-
 let toastTimer = null;
 function toast(msg, kind = "info") {
   const el = $("#toast");
@@ -52,12 +44,16 @@ async function api(path, opts = {}) {
 // --------------------------------------------------------------------------- //
 const state = {
   jobs: [],
+  golden: [],
+  goldenSignature: "",
   current: null,        // full public job object
   pollTimer: null,
+  goldenPollTimer: null,
+  goldenGeneration: 0,
+  galleryRequest: 0,
   processingClockTimer: null,
   waveform: null,       // {duration, strikes[], segments[]}
   editSegments: null,   // [[start,end], ...] working copy while editing
-  dirty: false,
   detailJobId: null,    // requested detail, even while its GET is in flight
   detailGeneration: 0, // invalidates stale job/waveform responses after navigation/mutation
   videoTab: null,
@@ -81,6 +77,7 @@ function detailRequestIsCurrent(id, generation) {
 // gallery                                                                     //
 // --------------------------------------------------------------------------- //
 async function refreshGallery() {
+  const request = ++state.galleryRequest;
   try {
     const jobs = [];
     let offset = 0, total = 0;
@@ -92,6 +89,7 @@ async function refreshGallery() {
       offset += page.length;
       if (!page.length) break;
     } while (offset < total);
+    if (request !== state.galleryRequest) return;
     state.jobs = jobs;
   } catch (e) {
     toast(`Could not load videos: ${e.message}`, "error");
@@ -137,7 +135,7 @@ function statusClass(job) {
   if (["complete", "ready"].includes(s)) return "ok";
   if (["failed", "error"].includes(s)) return "err";
   if (["no_output", "cancelled"].includes(s)) return "warn";
-  if (["running", "queued", "cancelling", "starting", "audio", "visual", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
+  if (["running", "queued", "cancelling", "starting", "audio", "visual", "ball_tracking", "pose", "serve", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
   return "";
 }
 
@@ -273,17 +271,107 @@ function uploadJob(file, openWhenBatchFinishes = false) {
 // --------------------------------------------------------------------------- //
 function showView(which) {
   $("#galleryView").classList.toggle("hidden", which !== "gallery");
+  $("#goldenView").classList.toggle("hidden", which !== "golden");
   $("#detailView").classList.toggle("hidden", which !== "detail");
+  $("#galleryButton").classList.toggle("active", which === "gallery");
+  $("#goldenButton").classList.toggle("active", which === "golden");
+}
+
+async function openGolden() {
+  stopGoldenPolling();
+  const generation = state.goldenGeneration;
+  stopPolling();
+  stopProcessingClock();
+  beginDetailGeneration(null);
+  state.current = null;
+  $("#originalVideo").pause();
+  $("#outputVideo").pause();
+  showView("golden");
+  window.scrollTo(0, 0);
+  await refreshGolden(generation);
+  if (generation !== state.goldenGeneration || $("#goldenView").classList.contains("hidden")) return;
+  scheduleGoldenPoll(generation);
+}
+
+function scheduleGoldenPoll(generation) {
+  if (state.goldenPollTimer || generation !== state.goldenGeneration) return;
+  state.goldenPollTimer = setTimeout(async () => {
+    state.goldenPollTimer = null;
+    await refreshGolden(generation);
+    if (generation === state.goldenGeneration && !$("#goldenView").classList.contains("hidden")) {
+      scheduleGoldenPoll(generation);
+    }
+  }, 10000);
+}
+
+function stopGoldenPolling() {
+  clearTimeout(state.goldenPollTimer);
+  state.goldenPollTimer = null;
+  state.goldenGeneration += 1;
+}
+
+async function refreshGolden(generation = state.goldenGeneration) {
+  if (generation !== state.goldenGeneration || $("#goldenView").classList.contains("hidden")) return;
+  try {
+    const data = await api("/api/golden");
+    if (generation !== state.goldenGeneration || $("#goldenView").classList.contains("hidden")) return;
+    const datasets = data.datasets || [];
+    const signature = JSON.stringify(datasets);
+    if (signature !== state.goldenSignature) {
+      state.golden = datasets;
+      state.goldenSignature = signature;
+      renderGolden();
+    }
+  } catch (e) {
+    toast(`Could not load golden datasets: ${e.message}`, "error");
+  }
+}
+
+function renderGolden() {
+  const grid = $("#goldenGrid");
+  grid.innerHTML = "";
+  $("#goldenSummary").textContent = `${state.golden.length} labeled dataset${state.golden.length === 1 ? "" : "s"}`;
+  if (!state.golden.length) {
+    grid.innerHTML = `<div class="empty card">No labeled golden datasets found.</div>`;
+    return;
+  }
+  for (const dataset of state.golden) {
+    const ready = Boolean(dataset.media?.output);
+    const article = document.createElement("article");
+    article.className = "golden-card card";
+    article.innerHTML = `
+      <div class="golden-card-head">
+        <div>
+          <h3>${escapeHtml(dataset.name)}</h3>
+          <p class="muted small">${dataset.expected_points} labeled points${dataset.predicted_points == null ? "" : ` · ${dataset.predicted_points} detected`}</p>
+        </div>
+        <span class="job-state golden-state ${ready ? "ok" : "warn"}">${ready ? "Evaluation ready" : "Not evaluated"}</span>
+      </div>
+      <div class="golden-video-grid">
+        <div class="golden-video">
+          <div class="video-head"><h3>Golden input</h3><a class="ghost small" href="${dataset.media.input}" download>Download</a></div>
+          <video src="${dataset.media.input}" controls playsinline preload="metadata"></video>
+        </div>
+        <div class="golden-video">
+          <div class="video-head"><h3>Processed evaluation</h3>${dataset.media.metadata ? `<a class="ghost small" href="${dataset.media.metadata}" download>JSON</a>` : ""}</div>
+          ${ready
+            ? `<video src="${dataset.media.output}" controls playsinline preload="metadata"></video>`
+            : `<div class="golden-missing">No retained evaluation video yet.<br><span>Run the golden evaluator with artifact output enabled.</span></div>`}
+        </div>
+      </div>
+      <div class="golden-links"><a href="${dataset.media.ground_truth}" download>Ground truth: ${escapeHtml(dataset.annotation)}</a></div>`;
+    grid.appendChild(article);
+  }
 }
 
 async function openDetail(id) {
+  stopGoldenPolling();
   stopPolling();
   stopProcessingClock();
   const generation = beginDetailGeneration(id);
   state.current = null;
   state.waveform = null;
   state.editSegments = null;
-  state.dirty = false;
   state.videoTab = null;
   state.hadOutput = false;
   state.outputLayout = [];
@@ -309,6 +397,7 @@ async function openDetail(id) {
 }
 
 function backToGallery() {
+  stopGoldenPolling();
   stopPolling();
   stopProcessingClock();
   beginDetailGeneration(null);
@@ -345,9 +434,8 @@ function selectVideoTab(tab) {
 async function loadJob(id, generation = state.detailGeneration) {
   const job = await api(`/api/jobs/${id}`);
   if (!detailRequestIsCurrent(id, generation)) return null;
-  const first = !state.current || state.current.id !== id;
   state.current = job;
-  renderDetail(job, first);
+  renderDetail(job);
   const running = ["queued", "running"].includes(job.status);
   if (!running && (job.result || job.status === "complete" || job.status === "no_output")) {
     await loadWaveform(id, generation);
@@ -355,7 +443,7 @@ async function loadJob(id, generation = state.detailGeneration) {
   return detailRequestIsCurrent(id, generation) ? job : null;
 }
 
-function renderDetail(job, first) {
+function renderDetail(job) {
   $("#detailName").textContent = job.filename;
   const r = job.result || {};
   const info = r.info || {};
@@ -508,10 +596,21 @@ function currentOutputPoint(time = $("#outputVideo").currentTime) {
 function updateOutputOverlay() {
   const current = currentOutputPoint();
   $("#currentPoint").textContent = current ? `Point ${current.index + 1}` : "Point —";
-  const speed = current?.point?.peak_ball_speed_kmh;
-  $("#ballSpeed").textContent = Number.isFinite(speed)
-    ? `Ball ~${Math.round(speed)} km/h`
-    : "Ball speed unavailable";
+  const estimate = current?.point?.ball_speed_estimate;
+  const speed = estimate?.value_kmh ?? current?.point?.peak_ball_speed_kmh;
+  const uncertainty = estimate?.uncertainty_kmh;
+  const readout = $("#ballSpeed");
+  if (Number.isFinite(speed)) {
+    const spread = Number.isFinite(uncertainty) ? ` ± ${Math.round(uncertainty)}` : "";
+    readout.textContent = `Ball ~${Math.round(speed)}${spread} km/h · uncertain ground-plane estimate`;
+    const limitations = Array.isArray(estimate?.limitations)
+      ? estimate.limitations.join("; ")
+      : "Single-camera court-plane estimate; ball height and full 3-D speed are not recovered.";
+    readout.title = limitations;
+  } else {
+    readout.textContent = "Ball speed unavailable";
+    readout.title = "Requires reliable ball trajectory and court calibration.";
+  }
 }
 
 function seekOutputPoint(delta) {
@@ -547,19 +646,25 @@ function setLink(el, href) {
 // --------------------------------------------------------------------------- //
 function startPolling(id, generation = state.detailGeneration) {
   stopPolling();
-  state.pollTimer = setInterval(async () => {
+  const tick = async () => {
     if (!detailRequestIsCurrent(id, generation) || !state.current || state.current.id !== id) {
       return stopPolling();
     }
     try {
       const job = await loadJob(id, generation);
       if (!job) return;
-      if (!["queued", "running"].includes(job.status)) stopPolling();
-    } catch (_) { stopPolling(); }
-  }, 1500);
+      if (!["queued", "running"].includes(job.status)) return stopPolling();
+    } catch (_) {
+      // A transient request failure must not permanently freeze a running job view.
+    }
+    if (detailRequestIsCurrent(id, generation)) {
+      state.pollTimer = setTimeout(tick, 1500);
+    }
+  };
+  state.pollTimer = setTimeout(tick, 1500);
 }
 function stopPolling() {
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
 }
 
 // --------------------------------------------------------------------------- //
@@ -706,7 +811,6 @@ function renderSegments() {
 }
 
 function markDirty() {
-  state.dirty = true;
   $("#applySegments").disabled = false;
 }
 
@@ -722,7 +826,6 @@ function setupSegmentEditor() {
   $("#revertSegments").addEventListener("click", () => {
     const wf = state.waveform;
     state.editSegments = (wf?.segments || []).map((s) => [s.start, s.end]);
-    state.dirty = false;
     $("#applySegments").disabled = true;
     renderSegments(); drawTimeline();
     toast("Reverted to detected segments");
@@ -748,9 +851,8 @@ async function applySegments() {
     });
     if (!detailRequestIsCurrent(id, generation)) return;
     state.current = job;
-    state.dirty = false;
     state.editSegments = null;
-    renderDetail(job, false);
+    renderDetail(job);
     await loadWaveform(id, generation);
     // force reload of output video (cache-busted URL from server)
     const out = $("#outputVideo");
@@ -769,6 +871,7 @@ async function applySegments() {
 function setupDetailActions() {
   $("#backButton").addEventListener("click", backToGallery);
   $("#galleryButton").addEventListener("click", backToGallery);
+  $("#goldenButton").addEventListener("click", openGolden);
   $("#reprocessButton").addEventListener("click", async () => {
     if (!state.current) return;
     const id = state.current.id;
@@ -779,12 +882,20 @@ function setupDetailActions() {
       state.current = job;
       state.editSegments = null;
       state.waveform = null;
-      renderDetail(job, false);
+      renderDetail(job);
       toast("Re-processing…");
       startPolling(id, generation);
       loadJob(id, generation);
     } catch (e) {
-      if (detailRequestIsCurrent(id, generation)) toast(e.message, "error");
+      if (detailRequestIsCurrent(id, generation)) {
+        toast(e.message, "error");
+        try {
+          const job = await loadJob(id, generation);
+          if (job && ["queued", "running"].includes(job.status)) {
+            startPolling(id, generation);
+          }
+        } catch (_) { /* keep the current snapshot */ }
+      }
     }
   });
   $("#stopProcessingButton").addEventListener("click", async () => {
@@ -797,7 +908,7 @@ function setupDetailActions() {
       const job = await api(`/api/jobs/${id}/cancel`, { method: "POST" });
       if (!detailRequestIsCurrent(id, generation)) return;
       state.current = job;
-      renderDetail(job, false);
+      renderDetail(job);
       toast(job.status === "cancelled" ? "Processing stopped" : "Stopping processing…");
       if (["queued", "running"].includes(job.status)) startPolling(id, generation);
       else stopPolling();
@@ -805,6 +916,12 @@ function setupDetailActions() {
       if (detailRequestIsCurrent(id, generation)) {
         $("#stopProcessingButton").disabled = false;
         toast(e.message, "error");
+        try {
+          const job = await loadJob(id, generation);
+          if (job && ["queued", "running"].includes(job.status)) {
+            startPolling(id, generation);
+          }
+        } catch (_) { /* keep the current snapshot */ }
       }
     }
   });
@@ -836,6 +953,7 @@ setInterval(async () => {
 // labeling                                                                    //
 // --------------------------------------------------------------------------- //
 const lab = {
+  revision: null,
   mode: "player_identity",
   tasks: [],          // all tasks (both kinds)
   roster: [],
@@ -879,7 +997,7 @@ function reflectDraftSelection() {
 
 function resetLabelingState() {
   lab.tasks = []; lab.roster = []; lab.labels = {}; lab.index = 0; lab.draft = {};
-  if (lab.genTimer) { clearInterval(lab.genTimer); lab.genTimer = null; }
+  if (lab.genTimer) { clearTimeout(lab.genTimer); lab.genTimer = null; }
   $("#labWorkspace").classList.add("hidden");
   $("#labStatus").classList.remove("hidden");
 }
@@ -891,10 +1009,10 @@ function renderLabelingSection(job) {
     status.classList.remove("hidden");
     status.textContent = `Generating samples… ${l.detail || ""}`;
     $("#labGenerate").disabled = true;
-    if (!lab.genTimer) lab.genTimer = setInterval(() => pollLabeling(job.id), 1500);
+    scheduleLabelPoll(job.id);
   } else {
     $("#labGenerate").disabled = false;
-    if (lab.genTimer) { clearInterval(lab.genTimer); lab.genTimer = null; }
+    if (lab.genTimer) { clearTimeout(lab.genTimer); lab.genTimer = null; }
     if (l.status === "failed") {
       status.classList.remove("hidden");
       status.textContent = `Sample generation failed: ${l.error || "unknown error"}`;
@@ -907,18 +1025,28 @@ function renderLabelingSection(job) {
   setLink($("#labDownload"), `/api/jobs/${job.id}/labels/download`);
 }
 
+function scheduleLabelPoll(id) {
+  if (lab.genTimer) return;
+  lab.genTimer = setTimeout(async () => {
+    lab.genTimer = null;
+    await pollLabeling(id);
+  }, 1500);
+}
+
 async function pollLabeling(id) {
   try {
     const job = await api(`/api/jobs/${id}`);
-    if (state.current && state.current.id === id) state.current.labeling = job.labeling;
+    if (!state.current || state.current.id !== id) return;
+    state.current.labeling = job.labeling;
     const l = job.labeling || {};
     if (l.status === "generating") {
       $("#labStatus").textContent = `Generating samples… ${l.detail || ""}`;
+      scheduleLabelPoll(id);
     } else {
-      clearInterval(lab.genTimer); lab.genTimer = null;
+      clearTimeout(lab.genTimer); lab.genTimer = null;
       renderLabelingSection(job);
     }
-  } catch (_) { clearInterval(lab.genTimer); lab.genTimer = null; }
+  } catch (_) { clearTimeout(lab.genTimer); lab.genTimer = null; }
 }
 
 async function generateSamples() {
@@ -938,6 +1066,7 @@ async function generateSamples() {
         regenerate: true,
       }),
     });
+    if (!state.current || state.current.id !== id) return;
     toast("Generating samples…");
     $("#labStatus").classList.remove("hidden");
     $("#labStatus").textContent = "Generating samples…";
@@ -952,7 +1081,9 @@ async function loadLabelTasks(id) {
   let data;
   try { data = await api(`/api/jobs/${id}/label-tasks`); }
   catch (_) { return; }
+  if (!state.current || state.current.id !== id) return;
   lab.tasks = data.tasks || [];
+  lab.revision = data.revision || null;
   lab.roster = data.roster || [];
   lab.labels = data.labels || {};
   if (!lab.tasks.length) {
@@ -989,25 +1120,39 @@ function renderRoster() {
 }
 
 async function saveRoster() {
+  const jobId = state.current?.id;
+  if (!jobId) return;
   const roster = $$("#rosterList input").map((inp) => {
     const r = lab.roster.find((x) => x.id === inp.dataset.id) || { id: inp.dataset.id };
     return { ...r, name: inp.value.trim() || inp.dataset.id };
   });
   lab.roster = roster;
   renderPlayerChoices();
-  try { await api(`/api/jobs/${state.current.id}/roster`, {
+  try { await api(`/api/jobs/${jobId}/roster`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ roster }),
+    body: JSON.stringify({ revision: lab.revision, roster }),
   }); } catch (e) { toast(`Roster save failed: ${e.message}`, "error"); }
 }
 
 function renderPlayerChoices() {
-  const html = lab.roster.map((r) =>
-    `<button type="button" class="choice" data-k="player" data-v="${r.id}">${escapeHtml(r.name || r.id)}</button>`).join("");
-  $("#playerChoices").innerHTML = html;
-  $("#serverChoices").innerHTML = html + `<button type="button" class="choice" data-k="server" data-v="unknown">Unknown</button>`;
-  // server choices use key "server"
-  $$("#serverChoices .choice").forEach((b) => { if (b.dataset.v !== "unknown") b.dataset.k = "server"; });
+  const playerBox = $("#playerChoices");
+  const serverBox = $("#serverChoices");
+  playerBox.replaceChildren();
+  serverBox.replaceChildren();
+  const choice = (key, value, label) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "choice";
+    button.dataset.k = key;
+    button.dataset.v = value;
+    button.textContent = label;
+    return button;
+  };
+  lab.roster.forEach((r) => {
+    playerBox.appendChild(choice("player", r.id, r.name || r.id));
+    serverBox.appendChild(choice("server", r.id, r.name || r.id));
+  });
+  serverBox.appendChild(choice("server", "unknown", "Unknown"));
   reflectDraftSelection();
 }
 
@@ -1045,9 +1190,16 @@ function showTask() {
   const t = tasks[lab.index];
   $("#labWhich").textContent = `${lab.index + 1} / ${tasks.length}`;
   if (t.media_type === "image") {
-    stage.innerHTML = `<img src="${t.asset_url}" alt="player crop" />`;
+    const image = document.createElement("img");
+    image.src = t.asset_url;
+    image.alt = "player crop";
+    stage.replaceChildren(image);
   } else {
-    stage.innerHTML = `<video src="${t.asset_url}" controls autoplay loop muted playsinline></video>`;
+    const video = document.createElement("video");
+    video.src = t.asset_url;
+    video.controls = true; video.autoplay = true; video.loop = true;
+    video.muted = true; video.playsInline = true;
+    stage.replaceChildren(video);
   }
   // load existing label (or suggestion) into the draft
   const saved = lab.labels[t.id];
@@ -1068,7 +1220,9 @@ function renderThumbs(tasks) {
     el.type = "button";
     el.className = "lab-thumb" + (i === lab.index ? " active" : "") + (lab.labels[t.id] ? " done" : "");
     if (t.media_type === "image") {
-      el.innerHTML = `<img src="${t.asset_url}" loading="lazy" alt="" />`;
+      const image = document.createElement("img");
+      image.src = t.asset_url; image.loading = "lazy"; image.alt = "";
+      el.appendChild(image);
     } else {
       el.innerHTML = `<span class="clip-badge">▶</span>`;
     }
@@ -1087,13 +1241,16 @@ async function saveCurrentLabel(advance) {
   const tasks = labModeTasks();
   if (!tasks.length) return;
   const t = tasks[lab.index];
+  const jobId = state.current?.id;
+  if (!jobId) return;
   const values = { ...lab.draft };
   if (lab.mode === "serve_motion") values.notes = $("#serveNotes").value || undefined;
   try {
-    const res = await api(`/api/jobs/${state.current.id}/labels`, {
+    const res = await api(`/api/jobs/${jobId}/labels`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task_id: t.id, kind: t.kind, values }),
+      body: JSON.stringify({ revision: lab.revision, task_id: t.id, kind: t.kind, values }),
     });
+    if (!state.current || state.current.id !== jobId) return;
     lab.labels = res.labels;
     updateLabProgress();
     renderThumbs(tasks);

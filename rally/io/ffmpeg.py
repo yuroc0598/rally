@@ -197,14 +197,18 @@ def _has_filter(name: str) -> bool:
 def _video_encoder() -> Tuple[str, Tuple[str, ...]]:
     """Pick a *working* H.264 encoder + its rate-control args (probed once, cached).
 
-    We don't trust ``-encoders`` listings: ``ffmpeg-free`` advertises ``libopenh264`` but
+    We don't trust ``-encoders`` listings: hardware encoders may be listed on a host whose
+    driver cannot open an encode session, and ``ffmpeg-free`` advertises ``libopenh264`` but
     its runtime lib is often absent, so it fails only at encode time. Instead we do a tiny
     test-encode of each candidate and take the first that actually runs. Order prefers
-    browser-playable H.264 (``libx264`` → ``libopenh264``); ``mpeg4`` is a last resort so
+    a working NVIDIA H.264 encoder, then browser-playable CPU H.264
+    (``libx264`` → ``libopenh264``); ``mpeg4`` is a last resort so
     output is at least produced (note: MPEG-4 Part 2 does NOT play in an HTML5 ``<video>``).
     """
     ff = _require("ffmpeg")
     candidates = (
+        ("h264_nvenc", ("-preset", "p4", "-tune", "hq", "-rc", "vbr",
+                        "-cq", "20", "-b:v", "0")),
         ("libx264", ("-preset", "veryfast", "-crf", "20")),
         ("libopenh264", ("-b:v", "6M")),
         ("mpeg4", ("-q:v", "3")),
@@ -304,23 +308,11 @@ def _has_audio(path: str) -> bool:
         return False
 
 
-def load_audio_mono(path: str, sr: int) -> np.ndarray:
-    """Decode the audio track to a mono float32 numpy array via an ffmpeg pipe."""
-    ffmpeg = _require("ffmpeg")
-    proc = subprocess.run(
-        [ffmpeg, "-v", "error", "-i", path, "-ac", "1", "-ar", str(sr),
-         "-f", "f32le", "-"],
-        capture_output=True, check=True,
-    )
-    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
-
-
 def iter_audio_mono(path: str, sr: int, *, chunk_s: float = 60.0) -> Iterator[np.ndarray]:
     """Stream mono float32 PCM from ffmpeg in bounded chunks.
 
-    Unlike :func:`load_audio_mono`, this never buffers the complete decoded track.  It is
-    the production path for multi-hour recordings; the eager helper remains useful for
-    small clips and callers that explicitly need an array.
+    Audio is never buffered for the complete recording, keeping memory bounded for
+    multi-hour inputs.
     """
     if sr <= 0 or chunk_s <= 0:
         raise ValueError("sr and chunk_s must be positive")

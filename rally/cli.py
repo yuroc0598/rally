@@ -32,6 +32,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="tennis sequence rules: auto detects match-like runs, match enables "
                         "them explicitly, casual disables serve-side validation")
     p.add_argument("--no-players", action="store_true", help="disable YOLO player-geometry channel")
+    p.add_argument(
+        "--player-detection-model", default=None,
+        help="Ultralytics person detector name/path (default yolo12n.pt; env: "
+             "RALLY_YOLO_DETECTION_MODEL)",
+    )
+    p.add_argument(
+        "--player-pose-model", default=None,
+        help="RTMPose ONNX path/URL, or Ultralytics pose checkpoint with "
+             "--player-pose-backend yolo (env: RALLY_PLAYER_POSE_MODEL)",
+    )
+    p.add_argument(
+        "--player-pose-backend", choices=("rtmlib", "yolo"), default=None,
+        help="pose implementation (default rtmlib; env: RALLY_PLAYER_POSE_BACKEND)",
+    )
 
     p.add_argument("--no-labels", action="store_true", help="do not draw 'Point N' labels")
     p.add_argument("--no-snap-serve", action="store_true",
@@ -71,11 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-court-auto", action="store_true",
                    help="disable automatic court detection (on by default; --court-corners/"
                         "--calibration override it; turn off if it locks onto the wrong lines)")
+    p.add_argument("--court-weights", default=None,
+                   help="optional Ultralytics court-keypoint checkpoint; validated before "
+                        "the classical court-detector fallback")
     p.add_argument("--require-serve-evidence", action="store_true",
                    help="precision mode: ball-validated candidates also need an audio strike near serve start")
     p.add_argument("--player-pose", action="store_true",
                    help="add player pose-activity as a confidence-weighted rally vote "
-                        "(YOLOv8-pose over the video; slow on CPU)")
+                        "(configured Ultralytics pose model over the video; slow on CPU)")
+    p.add_argument("--serve-model", default=None,
+                   help="guarded serve-classifier joblib; activated only after its "
+                        "held-out-match evaluation gate is revalidated")
     p.add_argument("--gap", type=float, default=None,
                    help="optional black delay between points (default 0; normally leave off)")
     p.add_argument("--start-buffer", type=float, default=None,
@@ -176,10 +196,20 @@ def _config_from_args(args) -> RallyConfig:
         overrides["ball_arbiter"] = False
     if args.no_court_auto:
         overrides["court_auto"] = False
+    if args.court_weights is not None:
+        overrides["court_weights"] = args.court_weights
     if args.require_serve_evidence:
         overrides["arbiter_require_serve_evidence"] = True
     if args.player_pose:
         overrides["player_pose"] = True
+    if args.player_detection_model is not None:
+        overrides["player_detection_model"] = args.player_detection_model
+    if args.player_pose_model is not None:
+        overrides["player_pose_model"] = args.player_pose_model
+    if args.player_pose_backend is not None:
+        overrides["player_pose_backend"] = args.player_pose_backend
+    if args.serve_model is not None:
+        overrides["serve_model"] = args.serve_model
     return RallyConfig(**overrides)
 
 

@@ -1,9 +1,14 @@
 import numpy as np
 
 from rally.signals.player import (
+    clean_track,
     estimate_court_region,
+    geometry_score_from_court_persons,
     geometry_score_from_persons,
+    persons_in_court,
+    target_court_box_indices,
 )
+from rally.signals.court import Court
 
 
 def test_estimate_court_region_from_clustered_feet():
@@ -47,3 +52,56 @@ def test_geometry_ignores_persons_outside_court():
 
 def test_geometry_none_region():
     assert geometry_score_from_persons([(0.5, 0.5, 0)], None) == 0.0
+
+
+def test_target_court_filter_excludes_neighboring_court_people():
+    # Target court is the central trapezoid; all detections remain inside the image, but
+    # the two people at the side belong to neighboring courts/spectator space.
+    court = Court.from_image_corners((20, 90), (80, 90), (65, 20), (35, 20))
+    people = [
+        (0.50, 0.82, 0.02),  # target near player
+        (0.50, 0.28, 0.01),  # target far player
+        (0.05, 0.55, 0.02),  # left adjacent court
+        (0.95, 0.55, 0.02),  # right adjacent court
+    ]
+    kept, coordinates = persons_in_court(
+        people, court, (100, 100), sideline_margin_m=0.2, baseline_margin_m=0.2)
+    assert kept == people[:2]
+    assert coordinates.shape == (2, 2)
+    assert geometry_score_from_court_persons(
+        people, court, (100, 100), sideline_margin_m=0.2,
+        baseline_margin_m=0.2) == 1.0
+
+
+def test_neighboring_players_cannot_create_target_geometry_vote():
+    court = Court.from_image_corners((20, 90), (80, 90), (65, 20), (35, 20))
+    neighbors = [(0.05, 0.30, 0.02), (0.95, 0.75, 0.02)]
+    assert geometry_score_from_court_persons(
+        neighbors, court, (100, 100), sideline_margin_m=0.2,
+        baseline_margin_m=0.2) == 0.0
+
+
+def test_pose_boxes_are_filtered_to_target_court_before_selection():
+    court = Court.from_image_corners((20, 90), (80, 90), (65, 20), (35, 20))
+    boxes = np.array([
+        [45, 45, 55, 82],   # target-court player
+        [0, 30, 10, 60],    # left neighboring court
+        [90, 30, 100, 60],  # right neighboring court
+    ], dtype=float)
+    assert target_court_box_indices(
+        boxes, court, (100, 100), sideline_margin_m=0.2,
+        baseline_margin_m=0.2) == [0]
+
+
+def test_clean_track_preserves_edges_and_long_detection_gaps_as_missing():
+    times = np.arange(8, dtype=float)
+    x = np.array([np.nan, 0.1, np.nan, 0.3, np.nan, np.nan, 0.6, np.nan])
+    y = x.copy()
+
+    clean_x, clean_y = clean_track(
+        times, x, y, speed_limit_mps=10.0, smooth_win=1, max_gap_dt_s=2.5)
+
+    assert np.isnan(clean_x[0]) and np.isnan(clean_x[-1])
+    assert np.isclose(clean_x[2], 0.2)
+    assert np.isnan(clean_x[4:6]).all()
+    assert np.array_equal(np.isnan(clean_x), np.isnan(clean_y))

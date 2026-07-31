@@ -18,10 +18,19 @@ by the dedicated TrackNet ball-motion check instead.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from ..config import (
+    DEFAULT_RTMPOSE_MODEL,
+    DEFAULT_YOLO_DETECTION_MODEL,
+    DEFAULT_YOLO_POSE_MODEL,
+)
+from ..domain.observations import PositionSetupObservation, ServeSetupObservation
+from .court import COURT_L, NET_Y
 
 Person = Tuple[float, float, float]          # (foot_x_norm, foot_y_norm, box_area_norm)
 Region = Tuple[float, float, float, float]   # (x0, y0, x1, y1) normalized
@@ -35,81 +44,10 @@ def resolve_yolo_device() -> str:
     return str(resolve_device())
 
 
-@dataclass(frozen=True)
-class ServeSetupObservation:
-    """Visible pre-strike state used by the match-sequence validator.
-
-    ``side`` is deliberately screen-left/screen-right, not deuce/ad. Without a reliable
-    court orientation and server identity, assigning tennis names would manufacture
-    certainty; alternation only needs the two stable screen-side states.
-    """
-
-    point: Segment
-    first_strike: float
-    side: Optional[str]
-    side_confidence: float
-    near_x: Optional[float]
-    near_x_std: Optional[float]
-    sampled_frames: int
-    pose_frames: int
-    ready_frames: int
-    serve_motion: bool
-    setup_evidence: bool
-    observable: bool
-    overhead_frames: int = 0
-    overhead_max_ratio: float = 0.0
-    overhead_strikes: tuple[float, ...] = ()
-    position_checked: bool = False
-    position_setup_evidence: bool = False
-    position_best_strike: Optional[float] = None
-    position_setup_strikes: tuple[float, ...] = ()
-    position_score: float = 0.0
-    position_server_end: Optional[str] = None
-    position_server_span: Optional[float] = None
-    position_player_tracks: int = 0
-    position_stable_tracks: int = 0
-    position_stable_fraction: float = 0.0
-    ball_checked: bool = False
-    ball_serve_evidence: bool = False
-    ball_best_strike: Optional[float] = None
-    ball_coverage: float = 0.0
-    ball_vertical_span: float = 0.0
-    ball_outgoing_span: float = 0.0
-    ball_ordered_evidence: bool = False
-    ball_measured_samples: int = 0
-
-    @property
-    def confirmed_serve(self) -> bool:
-        # A raised wrist alone is vulnerable to pose hallucination and ordinary
-        # overhead actions. It confirms a serve only in a stationary baseline setup.
-        # TrackNet's sustained toss/serve flight remains independently sufficient.
-        aligned_pose_setup = any(
-            abs(pose_strike - position_strike) <= 1e-6
-            for pose_strike in self.overhead_strikes
-            for position_strike in self.position_setup_strikes
-        )
-        return bool(self.ball_serve_evidence or aligned_pose_setup)
-
-
-@dataclass(frozen=True)
-class PositionSetupObservation:
-    """Player-formation evidence immediately before an early impact."""
-
-    point: Segment
-    best_strike: Optional[float]
-    setup_strikes: tuple[float, ...]
-    checked: bool
-    setup_evidence: bool
-    score: float
-    server_end: Optional[str]
-    server_span: Optional[float]
-    player_tracks: int
-    stable_tracks: int
-    stable_fraction: float
-    sampled_frames: int
-
-
-def discover_yolo_weights(name: str = "yolov8n.pt", models_dir: Optional[str] = None) -> str:
+def discover_yolo_weights(
+    name: str = DEFAULT_YOLO_DETECTION_MODEL,
+    models_dir: Optional[str] = None,
+) -> str:
     """Resolve a YOLO weight name to ``models/<name>`` when it lives there (we keep all
     weights — TrackNet + YOLO — in models/), else return the bare name so ultralytics can
     use its own cache or download it. Mirrors ``ball.discover_ball_weights``."""
@@ -130,17 +68,22 @@ def discover_yolo_weights(name: str = "yolov8n.pt", models_dir: Optional[str] = 
 class PlayerDetector:
     """Wraps a YOLO person detector. ``available`` is False when YOLO is missing."""
 
-    def __init__(self, model: str = "yolov8n.pt", conf: float = 0.3):
+    def __init__(self, model: str = DEFAULT_YOLO_DETECTION_MODEL, conf: float = 0.3):
         self.conf = conf
         self.model = None
         self.device = "cpu"
+        self.error: Optional[str] = None
         try:  # pragma: no cover - optional heavy dependency
             from ultralytics import YOLO
 
             self.device = resolve_yolo_device()
             self.model = YOLO(discover_yolo_weights(model))
+            if getattr(self.model, "task", None) not in {None, "detect"}:
+                raise ValueError(
+                    f"player detection requires a detect checkpoint, got {self.model.task!r}")
             self.model.to(self.device)
-        except Exception:
+        except Exception as exc:
+            self.error = str(exc)
             self.model = None
 
     @property
@@ -149,18 +92,28 @@ class PlayerDetector:
 
     def detect_persons(self, frame_bgr: np.ndarray) -> List[Person]:  # pragma: no cover
         """Normalized foot points for detected persons (class 0 = person)."""
+        return self.detect_persons_batch([frame_bgr])[0]
+
+    def detect_persons_batch(self, frames: Sequence[np.ndarray]) -> List[List[Person]]:
+        """Batch person inference while preserving one result list per input frame."""
         if self.model is None:
+            return [[] for _frame in frames]
+        if not frames:
             return []
-        h, w = frame_bgr.shape[:2]
         res = self.model.predict(
-            frame_bgr, conf=self.conf, classes=[0], verbose=False,
-            device=self.device)
-        persons: List[Person] = []
-        for r in res:
+            list(frames), conf=self.conf, classes=[0], verbose=False,
+            device=self.device, batch=min(16, len(frames)))
+        output: List[List[Person]] = []
+        for frame_bgr, r in zip(frames, res):
+            h, w = frame_bgr.shape[:2]
+            persons: List[Person] = []
             for box in r.boxes.xyxy.cpu().numpy():
                 x0, y0, x1, y1 = box
                 persons.append(((x0 + x1) / 2.0 / w, y1 / h, ((x1 - x0) * (y1 - y0)) / (w * h)))
-        return persons
+            output.append(persons)
+        if len(output) != len(frames):
+            raise RuntimeError("YOLO returned a different number of results than input frames")
+        return output
 
 
 def estimate_court_region(all_feet: Sequence[Tuple[float, float]],
@@ -201,10 +154,100 @@ def geometry_score_from_persons(persons: Sequence[Person], region: Optional[Regi
     return 1.0 if opposed else 0.5
 
 
+def persons_in_court(
+    persons: Sequence[Person], court, image_shape: Tuple[int, int], *,
+    sideline_margin_m: float = 1.5, baseline_margin_m: float = 3.0,
+) -> Tuple[List[Person], np.ndarray]:
+    """Keep detections whose foot point belongs to the calibrated target court.
+
+    YOLO foot points are normalized image coordinates. Mapping those points through the
+    target homography is materially safer than learning a rectangular ROI from everyone
+    seen in the video: spectators and players on a neighboring court must not expand the
+    very region used to decide whether they are relevant. Margins retain servers behind
+    the baseline and players pulled just outside a sideline.
+
+    Returns the retained detections and their aligned ``(court_x, court_y)`` coordinates.
+    """
+    from .court import COURT_L, DOUBLES_W
+
+    people = list(persons)
+    if not people:
+        return [], np.empty((0, 2), dtype=float)
+    h, w = image_shape[:2]
+    feet = np.array([[float(p[0]) * w, float(p[1]) * h] for p in people], dtype=float)
+    try:
+        coords = np.asarray(court.to_court(feet), dtype=float).reshape(-1, 2)
+    except Exception:
+        return [], np.empty((0, 2), dtype=float)
+    keep = (np.isfinite(coords).all(axis=1)
+            & (coords[:, 0] >= -sideline_margin_m)
+            & (coords[:, 0] <= DOUBLES_W + sideline_margin_m)
+            & (coords[:, 1] >= -baseline_margin_m)
+            & (coords[:, 1] <= COURT_L + baseline_margin_m))
+    indices = np.flatnonzero(keep)
+    return [people[int(i)] for i in indices], coords[indices]
+
+
+def target_court_box_indices(
+    boxes: np.ndarray, court, image_shape: Tuple[int, int], *,
+    sideline_margin_m: float = 1.5, baseline_margin_m: float = 3.0,
+) -> List[int]:
+    """Return indices of image-space boxes whose feet belong to the target court.
+
+    This is shared by the pose pass, whose boxes are kept aligned with keypoints and
+    therefore cannot be reduced to a plain list of :class:`Person` tuples first.
+    """
+    from .court import COURT_L, DOUBLES_W
+
+    values = np.asarray(boxes, dtype=float)
+    if values.size == 0:
+        return []
+    try:
+        values = values.reshape(-1, 4)
+    except ValueError:
+        return []
+    h, w = image_shape[:2]
+    if h <= 0 or w <= 0:
+        return []
+    feet = np.column_stack(((values[:, 0] + values[:, 2]) / 2.0, values[:, 3]))
+    try:
+        coords = np.asarray(court.to_court(feet), dtype=float).reshape(-1, 2)
+    except Exception:
+        return []
+    keep = (np.isfinite(coords).all(axis=1)
+            & (coords[:, 0] >= -sideline_margin_m)
+            & (coords[:, 0] <= DOUBLES_W + sideline_margin_m)
+            & (coords[:, 1] >= -baseline_margin_m)
+            & (coords[:, 1] <= COURT_L + baseline_margin_m))
+    return [int(index) for index in np.flatnonzero(keep)]
+
+
+def geometry_score_from_court_persons(
+    persons: Sequence[Person], court, image_shape: Tuple[int, int], *,
+    sideline_margin_m: float = 1.5, baseline_margin_m: float = 3.0,
+) -> float:
+    """Target-court player configuration score using court-metre net sides."""
+    inside, coords = persons_in_court(
+        persons, court, image_shape, sideline_margin_m=sideline_margin_m,
+        baseline_margin_m=baseline_margin_m)
+    n = len(inside)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 0.2
+    if n >= 3:
+        return 0.3
+    opposed = (coords[0, 1] < NET_Y) != (coords[1, 1] < NET_Y)
+    return 1.0 if opposed else 0.5
+
+
 # ---------------------------------------------------------------------------
 # near-player court tracking (speed-limited) + serve set-up
 # ---------------------------------------------------------------------------
-def track_near_player(video: str, court, fps_a: float = 5.0, model=None):
+def track_near_player(
+    video: str, court, fps_a: float = 5.0, model=None,
+    model_name: str = DEFAULT_YOLO_DETECTION_MODEL,
+):
     """Detect the near player each analysis frame -> (times, court_x, court_y) in metres.
 
     Near player = the largest person box whose foot is in the lower part of the frame.
@@ -215,7 +258,7 @@ def track_near_player(video: str, court, fps_a: float = 5.0, model=None):
 
     if model is None:
         from ultralytics import YOLO
-        model = YOLO(discover_yolo_weights("yolov8n.pt"))
+        model = YOLO(discover_yolo_weights(model_name))
     device = resolve_yolo_device()
     model.to(device)
     cap = cv2.VideoCapture(video)
@@ -231,14 +274,24 @@ def track_near_player(video: str, court, fps_a: float = 5.0, model=None):
                 ok, fr = cap.retrieve()
                 if not ok:
                     break
-                h = fr.shape[0]
                 r = model.predict(
                     fr, conf=0.3, classes=[0], verbose=False, device=device)[0]
-                boxes = [b for b in r.boxes.xyxy.cpu().numpy() if b[3] / h > 0.60]
+                all_boxes = r.boxes.xyxy.cpu().numpy()
+                target = target_court_box_indices(all_boxes, court, fr.shape[:2])
+                feet = np.stack([
+                    (all_boxes[:, 0] + all_boxes[:, 2]) / 2.0,
+                    all_boxes[:, 3],
+                ], axis=1) if len(all_boxes) else np.zeros((0, 2), dtype=float)
+                coords = court.to_court(feet) if len(feet) else feet
+                candidates = [i for i in target if coords[i, 1] <= NET_Y]
                 ts.append(fi / fps)
-                if boxes:
-                    b = max(boxes, key=lambda z: (z[2] - z[0]) * (z[3] - z[1]))
-                    c = court.to_court([[(b[0] + b[2]) / 2, b[3]]])[0]
+                if candidates:
+                    index = max(
+                        candidates,
+                        key=lambda i: ((all_boxes[i][2] - all_boxes[i][0])
+                                       * (all_boxes[i][3] - all_boxes[i][1])),
+                    )
+                    c = coords[index]
                     cx.append(float(c[0])); cy.append(float(c[1]))
                 else:
                     cx.append(np.nan); cy.append(np.nan)
@@ -275,19 +328,27 @@ def clean_track(times: np.ndarray, cx: np.ndarray, cy: np.ndarray,
             if np.hypot(cx[i] - gx[last_i], cy[i] - gy[last_i]) / dt <= speed_limit_mps:
                 gx[i], gy[i] = cx[i], cy[i]
                 last_i = i
-    idx = np.arange(n)
-    good = np.isfinite(gx)
-    if good.sum() >= 2:
-        gx = np.interp(idx, idx[good], gx[good])
-        gy = np.interp(idx, idx[good], gy[good])
-    if smooth_win > 1 and n >= smooth_win:
-        from scipy.signal import medfilt
-        k = smooth_win + (smooth_win + 1) % 2       # force odd
-        if k > n:                                    # kernel must not exceed sample count
-            k = n if n % 2 == 1 else n - 1
-        if k >= 3:
-            gx = medfilt(gx, k)
-            gy = medfilt(gy, k)
+    # Fill only bounded interior dropouts. np.interp over the whole array fabricates
+    # stationary history before the first detection, after decoder failure, and across
+    # arbitrarily long gaps—the exact pattern the serve-setup detector looks for.
+    good_indices = np.flatnonzero(np.isfinite(gx) & np.isfinite(gy))
+    for left, right in zip(good_indices, good_indices[1:]):
+        if right <= left + 1 or times[right] - times[left] > max_gap_dt_s:
+            continue
+        fraction = np.linspace(0.0, 1.0, right - left + 1)
+        gx[left:right + 1] = gx[left] + fraction * (gx[right] - gx[left])
+        gy[left:right + 1] = gy[left] + fraction * (gy[right] - gy[left])
+    if smooth_win > 1:
+        from scipy.ndimage import median_filter
+        finite = np.isfinite(gx) & np.isfinite(gy)
+        edges = np.diff(np.r_[False, finite, False].astype(np.int8))
+        for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            length = int(stop - start)
+            k = min(smooth_win + (smooth_win + 1) % 2,
+                    length if length % 2 else length - 1)
+            if k >= 3:
+                gx[start:stop] = median_filter(gx[start:stop], size=k, mode="nearest")
+                gy[start:stop] = median_filter(gy[start:stop], size=k, mode="nearest")
     return gx, gy
 
 
@@ -346,27 +407,40 @@ def refine_starts_with_serve(points: List[Segment], onsets: np.ndarray, times: n
 def pose_activity_track(
     video: str, timeline: np.ndarray, fps_a: float = 2.0,
     cancel_check: Callable[[], None] = lambda: None,
+    model_name: str = DEFAULT_YOLO_POSE_MODEL,
+    pose_backend: str = "yolo",
+    detection_model: str = DEFAULT_YOLO_DETECTION_MODEL,
+    rtmpose_runtime: str = "onnxruntime",
+    rtmpose_device: str = "auto",
+    court=None,
 ):
     """Per-analysis-frame pose-activity score + confidence for the near player.
 
-    Uses YOLOv8-pose. "Activity" = how far the racket arm is raised above the hips
+    Uses the configured Ultralytics pose model. "Activity" = how far the racket arm is
+    raised above the hips
     (0 = arms hanging / standing between points; ~1 = wrist at shoulder height, hitting/
     serving). Confidence = mean keypoint confidence × player size, so a small/blurred far
     player contributes ~0 (drops out of the fusion) while a clear near player votes fully.
-    Returns (pose_score, pose_conf) aligned to ``timeline`` (forward-filled between samples).
+    Returns ``(pose_score, pose_conf)`` aligned to ``timeline`` by the nearest real sample.
+    Times outside the sampled video extent remain zero rather than inheriting a stale pose.
     """
+    if pose_backend == "rtmlib":
+        return _rtmlib_pose_activity_track(
+            video, timeline, fps_a=fps_a, cancel_check=cancel_check,
+            detection_model=detection_model, pose_model=model_name,
+            runtime=rtmpose_runtime, pose_device=rtmpose_device, court=court)
+
     import cv2
     from ultralytics import YOLO
 
     timeline = np.asarray(timeline, float)
     score = np.zeros(timeline.size, float)
     conf = np.zeros(timeline.size, float)
-    try:
-        model = YOLO(discover_yolo_weights("yolov8n-pose.pt"))
-        device = resolve_yolo_device()
-        model.to(device)
-    except Exception:
-        return score, conf
+    model = YOLO(discover_yolo_weights(model_name))
+    if getattr(model, "task", None) not in {None, "pose"}:
+        raise ValueError(f"pose activity requires a pose checkpoint, got {model.task!r}")
+    device = resolve_yolo_device()
+    model.to(device)
 
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS) or fps_a
@@ -390,8 +464,17 @@ def pose_activity_track(
                     boxes = r.boxes.xyxy.cpu().numpy()
                     kp = r.keypoints.xy.cpu().numpy()
                     kc = r.keypoints.conf.cpu().numpy() if r.keypoints.conf is not None else None
-                    # near player = largest box with foot in lower half
-                    cand = [i for i in range(len(boxes)) if boxes[i][3] / h > 0.55]
+                    if court is not None:
+                        target = target_court_box_indices(boxes, court, fr.shape[:2])
+                        feet = np.stack([
+                            (boxes[:, 0] + boxes[:, 2]) / 2.0, boxes[:, 3],
+                        ], axis=1)
+                        coords = court.to_court(feet)
+                        cand = [i for i in target if coords[i, 1] <= NET_Y]
+                    else:
+                        # Uncalibrated compatibility path: near player is the largest box
+                        # with a foot in the lower half.
+                        cand = [i for i in range(len(boxes)) if boxes[i][3] / h > 0.55]
                     if cand:
                         i = max(cand, key=lambda j: (boxes[j][2] - boxes[j][0]) * (boxes[j][3] - boxes[j][1]))
                         k = kp[i]
@@ -423,13 +506,151 @@ def pose_activity_track(
     ss, sc = np.array(samp_s), np.array(samp_c)
     # nearest-sample fill onto the analysis timeline (searchsorted alone gives the *next*
     # sample -> a forward bias of up to 1/fps_a; pick whichever neighbour is closer)
+    half_step = 0.5 / max(float(fps_a), 1e-9)
+    valid = (
+        (timeline >= samp_t[0] - half_step)
+        & (timeline <= samp_t[-1] + half_step)
+    )
+    if not np.any(valid):
+        return score, conf
+    target = timeline[valid]
     if samp_t.size == 1:
-        idx = np.zeros(timeline.size, dtype=int)
+        idx = np.zeros(target.size, dtype=int)
     else:
-        pos = np.clip(np.searchsorted(samp_t, timeline), 1, samp_t.size - 1)
+        pos = np.clip(np.searchsorted(samp_t, target), 1, samp_t.size - 1)
         left = pos - 1
-        idx = np.where((timeline - samp_t[left]) <= (samp_t[pos] - timeline), left, pos)
-    return ss[idx], sc[idx]
+        idx = np.where((target - samp_t[left]) <= (samp_t[pos] - target), left, pos)
+    score[valid] = ss[idx]
+    conf[valid] = sc[idx]
+    return score, conf
+
+
+def _rtmlib_pose_activity_track(
+    video: str,
+    timeline: np.ndarray,
+    *,
+    fps_a: float,
+    cancel_check: Callable[[], None],
+    detection_model: str,
+    pose_model: str,
+    runtime: str,
+    pose_device: str,
+    court=None,
+):
+    """Bounded-memory RTMPose activity sampling on YOLO-selected player crops."""
+    import cv2
+
+    from .pose import CroppedRTMPose
+
+    timeline = np.asarray(timeline, float)
+    score = np.zeros(timeline.size, float)
+    confidence_out = np.zeros(timeline.size, float)
+    estimator = CroppedRTMPose(
+        detection_model=detection_model,
+        pose_model=pose_model,
+        runtime=runtime,
+        pose_device=pose_device,
+    )
+    cap = cv2.VideoCapture(video)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or fps_a)
+    stride = max(1, int(round(fps / fps_a)))
+    sample_times: list[float] = []
+    sample_scores: list[float] = []
+    sample_confidence: list[float] = []
+    pending_times: list[float] = []
+    pending_frames: list[np.ndarray] = []
+
+    def flush() -> None:
+        if not pending_frames:
+            return
+        results = estimator.predict(
+            pending_frames, court=court, target_required=court is not None,
+            confidence=0.2, image_size=960, batch_size=16)
+        for sample_time, frame, result in zip(
+                pending_times, pending_frames, results):
+            value = quality = 0.0
+            boxes = result.boxes
+            if len(boxes):
+                if court is not None:
+                    feet = np.column_stack((
+                        (boxes[:, 0] + boxes[:, 2]) / 2.0, boxes[:, 3]))
+                    coords = np.asarray(court.to_court(feet), dtype=float).reshape(-1, 2)
+                    candidates = [
+                        index for index in range(len(boxes))
+                        if np.isfinite(coords[index]).all()
+                        and coords[index, 1] <= NET_Y
+                    ]
+                else:
+                    height = frame.shape[0]
+                    candidates = [
+                        index for index, box in enumerate(boxes)
+                        if box[3] / height > 0.55
+                    ]
+                if candidates:
+                    selected = max(candidates, key=lambda index: (
+                        (boxes[index][2] - boxes[index][0])
+                        * (boxes[index][3] - boxes[index][1])))
+                    pose = result.keypoints[selected]
+                    conf = result.confidence[selected]
+                    shoulder_y = float(np.mean([pose[5][1], pose[6][1]]))
+                    hip_y = float(np.mean([pose[11][1], pose[12][1]]))
+                    wrists = [
+                        float(pose[index][1]) for index in (9, 10)
+                        if float(conf[index]) > 0.2
+                    ]
+                    torso = abs(hip_y - shoulder_y) + 1e-6
+                    value = float(np.clip(
+                        (hip_y - min(wrists)) / torso, 0.0, 1.0)) if wrists else 0.0
+                    area = ((boxes[selected][2] - boxes[selected][0])
+                            * (boxes[selected][3] - boxes[selected][1])
+                            / max(1.0, float(frame.shape[0] * frame.shape[1])))
+                    quality = float(np.clip(
+                        np.mean(conf[[5, 6, 9, 10, 11, 12]])
+                        * np.clip(area * 40.0, 0.0, 1.0), 0.0, 1.0))
+            sample_times.append(sample_time)
+            sample_scores.append(value)
+            sample_confidence.append(quality)
+        pending_times.clear()
+        pending_frames.clear()
+
+    frame_index = 0
+    try:
+        while True:
+            cancel_check()
+            if not cap.grab():
+                break
+            if frame_index % stride == 0:
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
+                pending_times.append(frame_index / fps)
+                pending_frames.append(frame)
+                if len(pending_frames) >= 16:
+                    flush()
+            frame_index += 1
+        flush()
+    finally:
+        cap.release()
+    if not sample_times:
+        return score, confidence_out
+    times = np.asarray(sample_times, dtype=float)
+    values = np.asarray(sample_scores, dtype=float)
+    qualities = np.asarray(sample_confidence, dtype=float)
+    half_step = 0.5 / max(float(fps_a), 1e-9)
+    valid = (timeline >= times[0] - half_step) & (timeline <= times[-1] + half_step)
+    if not np.any(valid):
+        return score, confidence_out
+    target = timeline[valid]
+    if times.size == 1:
+        indices = np.zeros(target.size, dtype=int)
+    else:
+        right = np.clip(np.searchsorted(times, target), 1, times.size - 1)
+        left = right - 1
+        indices = np.where(
+            target - times[left] <= times[right] - target, left, right)
+    score[valid] = values[indices]
+    confidence_out[valid] = qualities[indices]
+    return score, confidence_out
 
 
 # ---------------------------------------------------------------------------
@@ -640,36 +861,130 @@ def _joint_angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cosine)))
 
 
+def _body_pose_features(pose: np.ndarray, confidence: np.ndarray, cfg):
+    """Return ``(usable, ready_stance, overhead_wrist_ratio)`` for COCO-17 joints."""
+    body_joints = (5, 6, 11, 12, 13, 14, 15, 16)
+    if pose.shape[0] < 17 or confidence.shape[0] < 17:
+        return False, False, -1.0
+    body_quality = float(np.mean(confidence[list(body_joints)]))
+    if body_quality < 0.45:
+        return False, False, -1.0
+    knee_angles = []
+    for hip, knee, ankle in ((11, 13, 15), (12, 14, 16)):
+        if min(
+            float(confidence[hip]), float(confidence[knee]),
+            float(confidence[ankle]),
+        ) > 0.2:
+            angle = _joint_angle_deg(pose[hip], pose[knee], pose[ankle])
+            if np.isfinite(angle):
+                knee_angles.append(angle)
+    shoulder_mid = (pose[5] + pose[6]) / 2.0
+    hip_mid = (pose[11] + pose[12]) / 2.0
+    torso = float(np.linalg.norm(hip_mid - shoulder_mid))
+    stance = float("nan")
+    if torso > 1e-6 and min(
+            float(confidence[15]), float(confidence[16])) > 0.2:
+        stance = float(np.linalg.norm(pose[15] - pose[16]) / torso)
+    ready = bool(
+        (knee_angles and min(knee_angles) <= cfg.match_ready_knee_deg)
+        or (np.isfinite(stance) and stance >= cfg.match_ready_stance_ratio)
+    )
+    ratio = -1.0
+    if torso > 1e-6:
+        shoulder_y = float((pose[5][1] + pose[6][1]) / 2.0)
+        wrist_ratios = [
+            (shoulder_y - float(pose[wrist][1])) / torso
+            for wrist in (9, 10)
+            if float(confidence[wrist]) > 0.2
+            and (pose[wrist][0] > 0 or pose[wrist][1] > 0)
+        ]
+        ratio = max(wrist_ratios, default=-1.0)
+    return True, ready, float(ratio)
+
+
 def observe_serve_setups(
     video: str,
     points: Sequence[Segment],
     onsets: np.ndarray,
     cfg,
+    progress_callback: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], None] = lambda: None,
+    court=None,
 ) -> List[ServeSetupObservation]:  # pragma: no cover - exercised with optional YOLO
-    """Observe the visible player setup immediately before each candidate's first hit.
+    """Observe player setup and service motion around each candidate's early impacts.
 
-    A far-side serve is usually too small for dependable arm keypoints, so receiver posture
-    remains useful only as sequence context. Raw pose evidence requires the large near-side
-    player's wrist to rise substantially over the shoulder near an early impact; match
-    validation then pairs it with the separately measured stationary baseline formation.
-    TrackNet independently handles far-side and underarm serves.
+    The default backend uses YOLO12 to select target-court player boxes and RTMPose on each
+    crop, so both near- and far-side overhead actions can contribute. Match validation still
+    pairs pose with independently measured stationary-baseline/ball evidence; a raised arm
+    alone is never enough to publish a point.
     """
     import cv2
-    from ultralytics import YOLO
 
-    model = YOLO(discover_yolo_weights("yolov8n-pose.pt"))
-    device = resolve_yolo_device()
-    model.to(device)
     ordered_onsets = np.sort(np.asarray(onsets, dtype=float))
+    pose_backend = cfg.player_pose_backend
+    try:
+        if pose_backend == "rtmlib":
+            from .pose import CroppedRTMPose
+
+            model = CroppedRTMPose(
+                detection_model=cfg.player_detection_model,
+                pose_model=cfg.player_pose_model,
+                runtime=cfg.rtmpose_runtime,
+                pose_device=cfg.rtmpose_device,
+            )
+            device = model.pose_device
+        else:
+            from ultralytics import YOLO
+
+            model = YOLO(discover_yolo_weights(cfg.player_pose_model))
+            if getattr(model, "task", None) not in {None, "pose"}:
+                raise ValueError(
+                    f"serve setup requires a pose checkpoint, got {model.task!r}")
+            device = resolve_yolo_device()
+            model.to(device)
+    except Exception as exc:
+        default_model = (
+            DEFAULT_RTMPOSE_MODEL
+            if pose_backend == "rtmlib" else DEFAULT_YOLO_POSE_MODEL)
+        explicit_model = cfg.player_pose_model != default_model
+        if explicit_model or "out of memory" in str(exc).lower():
+            raise RuntimeError(
+                f"configured {pose_backend} serve pose model "
+                f"{cfg.player_pose_model!r} failed: {exc}"
+            ) from exc
+        # Pose is optional evidence. Preserve position/TrackNet validation with explicit
+        # zero-observation records when a default checkpoint has not been cached yet.
+        warnings.warn(
+            f"optional {pose_backend} serve pose model "
+            f"{cfg.player_pose_model!r} is unavailable: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        neutral: List[ServeSetupObservation] = []
+        for index, (start, end) in enumerate(points, 1):
+            strikes = ordered_onsets[
+                (ordered_onsets >= start - 1e-9) & (ordered_onsets <= end + 1e-9)]
+            neutral.append(ServeSetupObservation(
+                point=(float(start), float(end)),
+                first_strike=float(strikes[0]) if strikes.size else float(start),
+                side=None, side_confidence=0.0, near_x=None, near_x_std=None,
+                sampled_frames=0, pose_frames=0, ready_frames=0,
+                serve_motion=False, setup_evidence=False, observable=False,
+                target_court_filtered=court is not None,
+            ))
+            if progress_callback is not None:
+                progress_callback(index, len(points))
+        return neutral
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
         raise RuntimeError(f"OpenCV could not open {video}")
+    native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
     observations: List[ServeSetupObservation] = []
     step = 1.0 / float(cfg.match_setup_fps)
     try:
-        for point in points:
+        total = len(points)
+        for point_index, point in enumerate(points, 1):
             cancel_check()
             start, end = point
             strikes = ordered_onsets[
@@ -702,94 +1017,151 @@ def observe_serve_setups(
             overhead_max_ratio = 0.0
             overhead_strikes: set[float] = set()
             pose_frames = 0
-            sampled_frames = 0
-            for sample_time in sample_times:
-                cancel_check()
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(sample_time) * 1000.0)
-                ok, frame = cap.read()
-                if not ok:
-                    continue
-                sampled_frames += 1
+            samples: list[tuple[float, np.ndarray]] = []
+            # One keyframe seek per candidate, then an ordered scan. Re-seeking for every
+            # 100--250 ms sample repeatedly decodes the same GOP and dominates CUDA pose
+            # inference on ordinary H.264 match recordings.
+            if sample_times.size:
+                target_frames = np.maximum(
+                    0, np.round(sample_times * native_fps).astype(np.int64))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(target_frames[0]))
+                next_frame = int(target_frames[0])
+                for sample_time, target_frame in zip(sample_times, target_frames):
+                    cancel_check()
+                    ok = True
+                    while next_frame <= int(target_frame):
+                        ok = cap.grab()
+                        if not ok:
+                            break
+                        next_frame += 1
+                        if next_frame % 120 == 0:
+                            cancel_check()
+                    if not ok:
+                        break
+                    ok, frame = cap.retrieve()
+                    if ok:
+                        samples.append((float(sample_time), frame))
+            sampled_frames = len(samples)
+            frames = [frame for _time, frame in samples]
+            if pose_backend == "rtmlib":
+                results = model.predict(
+                    frames,
+                    court=court,
+                    target_required=cfg.target_court_required,
+                    confidence=0.15,
+                    image_size=int(cfg.match_pose_imgsz),
+                    batch_size=min(16, len(samples)),
+                ) if samples else []
+            else:
+                results = (model.predict(
+                    frames, conf=0.15, classes=[0], verbose=False,
+                    imgsz=int(cfg.match_pose_imgsz), device=device,
+                    batch=min(16, len(samples)),
+                ) if samples else [])
+            if len(results) != len(samples):
+                raise RuntimeError(
+                    "pose model returned a different number of results than sampled frames")
+            for (sample_time, frame), result in zip(samples, results):
                 height, width = frame.shape[:2]
-                result = model.predict(
-                    frame, conf=0.15, classes=[0], verbose=False,
-                    imgsz=int(cfg.match_pose_imgsz),
-                    device=device,
-                )[0]
-                if result.keypoints is None or len(result.boxes) == 0:
+                if pose_backend == "rtmlib":
+                    boxes = result.boxes
+                    keypoints = result.keypoints
+                    confidence = result.confidence
+                else:
+                    if result.keypoints is None or len(result.boxes) == 0:
+                        continue
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    keypoints = result.keypoints.xy.cpu().numpy()
+                    confidence = (result.keypoints.conf.cpu().numpy()
+                                  if result.keypoints.conf is not None else None)
+                if len(boxes) == 0:
                     continue
-                boxes = result.boxes.xyxy.cpu().numpy()
-                keypoints = result.keypoints.xy.cpu().numpy()
-                confidence = (result.keypoints.conf.cpu().numpy()
-                              if result.keypoints.conf is not None else None)
+                # RTMLib results are already target-filtered before pose inference. Repeat
+                # the same guard for the legacy YOLO-pose backend to keep both paths
+                # semantically identical.
+                target_required = cfg.target_court_required
+                target_indices = (
+                    set(target_court_box_indices(boxes, court, frame.shape[:2]))
+                    if court is not None else (set() if target_required else None)
+                )
                 candidates = [
                     i for i, box in enumerate(boxes)
-                    if box[3] / height > 0.55
+                    if (target_indices is None or i in target_indices)
                     and 0.06 < (box[0] + box[2]) / (2.0 * width) < 0.94
                 ]
                 if not candidates:
                     continue
-                # The near player is much larger than the far player. Selecting by area
-                # per point also permits the players to swap ends between games; a global
-                # nearest-neighbour identity would incorrectly stick to the far player.
-                selected = max(
-                    candidates,
-                    key=lambda i: ((boxes[i][2] - boxes[i][0])
-                                   * (boxes[i][3] - boxes[i][1])),
+                feet = np.column_stack((
+                    (boxes[:, 0] + boxes[:, 2]) / 2.0, boxes[:, 3]))
+                court_coords = (
+                    np.asarray(court.to_court(feet), dtype=float).reshape(-1, 2)
+                    if court is not None else None
                 )
-                box = boxes[selected]
-                pose = keypoints[selected]
-                conf = (confidence[selected] if confidence is not None
-                        else np.ones(pose.shape[0], dtype=float))
-                body_joints = (5, 6, 11, 12, 13, 14, 15, 16)
-                body_quality = float(np.mean(conf[list(body_joints)]))
-                if body_quality < 0.45:
+                features = {}
+                for index in candidates:
+                    pose = keypoints[index]
+                    conf = (confidence[index] if confidence is not None
+                            else np.ones(pose.shape[0], dtype=float))
+                    usable, ready, ratio = _body_pose_features(pose, conf, cfg)
+                    if usable:
+                        features[index] = (ready, ratio)
+                if not features:
                     continue
                 pose_frames += 1
-                if sample_start - 1e-6 <= sample_time <= sample_end + 1e-6:
-                    xs.append(float((box[0] + box[2]) / (2.0 * width)))
 
-                knee_angles = []
-                for hip, knee, ankle in ((11, 13, 15), (12, 14, 16)):
-                    if min(float(conf[hip]), float(conf[knee]), float(conf[ankle])) > 0.2:
-                        angle = _joint_angle_deg(pose[hip], pose[knee], pose[ankle])
-                        if np.isfinite(angle):
-                            knee_angles.append(angle)
-                shoulder_mid = (pose[5] + pose[6]) / 2.0
-                hip_mid = (pose[11] + pose[12]) / 2.0
-                torso = float(np.linalg.norm(hip_mid - shoulder_mid))
-                stance = float("nan")
-                if torso > 1e-6 and min(float(conf[15]), float(conf[16])) > 0.2:
-                    stance = float(np.linalg.norm(pose[15] - pose[16]) / torso)
-                ready = ((knee_angles and min(knee_angles) <= cfg.match_ready_knee_deg)
-                         or (np.isfinite(stance)
-                             and stance >= cfg.match_ready_stance_ratio))
-                ready_frames += int(bool(ready))
-
-                if torso > 1e-6:
-                    shoulder_y = float((pose[5][1] + pose[6][1]) / 2.0)
-                    wrist_ratios = []
-                    for wrist in (9, 10):
-                        if (float(conf[wrist]) > 0.2
-                                and (pose[wrist][0] > 0 or pose[wrist][1] > 0)):
-                            wrist_ratios.append(
-                                (shoulder_y - float(pose[wrist][1])) / torso)
-                    ratio = max(wrist_ratios, default=-1.0)
-                    near_early_impact = any(
-                        abs(float(sample_time) - float(strike))
-                        <= cfg.match_overhead_window_s + 1e-9
-                        for strike in serve_strikes
+                # Preserve deuce/ad tracking from the near player while allowing overhead
+                # service evidence from either baseline. Court coordinates are more stable
+                # than apparent box size when the server is on the far side.
+                near_candidates = [
+                    index for index in features
+                    if (
+                        court_coords is not None
+                        and np.isfinite(court_coords[index]).all()
+                        and court_coords[index, 1] <= NET_Y
+                    ) or (
+                        court_coords is None and boxes[index][3] / height > 0.55
                     )
-                    if near_early_impact:
-                        overhead_max_ratio = max(overhead_max_ratio, float(ratio))
-                        if ratio >= cfg.match_overhead_wrist_ratio:
-                            overhead_frames += 1
-                            nearest_strike = min(
-                                serve_strikes,
-                                key=lambda strike: abs(
-                                    float(sample_time) - float(strike)),
-                            )
-                            overhead_strikes.add(float(nearest_strike))
+                ]
+                if near_candidates:
+                    selected_near = max(
+                        near_candidates,
+                        key=lambda index: (
+                            (boxes[index][2] - boxes[index][0])
+                            * (boxes[index][3] - boxes[index][1])),
+                    )
+                    if sample_start - 1e-6 <= sample_time <= sample_end + 1e-6:
+                        box = boxes[selected_near]
+                        xs.append(float((box[0] + box[2]) / (2.0 * width)))
+                    ready_frames += int(features[selected_near][0])
+
+                near_early_impact = bool(serve_strikes.size) and any(
+                    abs(float(sample_time) - float(strike))
+                    <= cfg.match_overhead_window_s + 1e-9
+                    for strike in serve_strikes
+                )
+                if not near_early_impact:
+                    continue
+                frame_overhead = False
+                for index, (_ready, ratio) in features.items():
+                    at_baseline = True
+                    if court_coords is not None:
+                        y = float(court_coords[index, 1])
+                        at_baseline = bool(
+                            np.isfinite(y)
+                            and (y <= cfg.serve_baseline_y_m
+                                 or y >= COURT_L - cfg.serve_baseline_y_m)
+                        )
+                    if not at_baseline:
+                        continue
+                    overhead_max_ratio = max(overhead_max_ratio, float(ratio))
+                    frame_overhead |= ratio >= cfg.match_overhead_wrist_ratio
+                if frame_overhead:
+                    overhead_frames += 1
+                    nearest_strike = min(
+                        serve_strikes,
+                        key=lambda strike: abs(float(sample_time) - float(strike)),
+                    )
+                    overhead_strikes.add(float(nearest_strike))
 
             near_x = float(np.median(xs)) if xs else None
             x_std = float(np.std(xs)) if xs else None
@@ -814,7 +1186,10 @@ def observe_serve_setups(
                 overhead_frames=overhead_frames,
                 overhead_max_ratio=overhead_max_ratio,
                 overhead_strikes=tuple(sorted(overhead_strikes)),
+                target_court_filtered=court is not None,
             ))
+            if progress_callback is not None:
+                progress_callback(point_index, total)
     finally:
         cap.release()
     return observations
@@ -841,9 +1216,11 @@ class PlayerTracker:
         self.detector = detector
 
     def court_track(self, video: str, court, fps_a: float = 5.0,
-                    speed_limit_mps: float = 8.0) -> PlayerCourtTrack:
+                    speed_limit_mps: float = 8.0,
+                    detection_model: str = DEFAULT_YOLO_DETECTION_MODEL) -> PlayerCourtTrack:
         # reuse the detector's already-loaded YOLO model rather than loading a second copy
         model = self.detector.model if (self.detector and self.detector.available) else None
-        t, cx, cy = track_near_player(video, court, fps_a, model=model)
+        t, cx, cy = track_near_player(
+            video, court, fps_a, model=model, model_name=detection_model)
         cx, cy = clean_track(t, cx, cy, speed_limit_mps)
         return PlayerCourtTrack(t, cx, cy, court_speed(t, cx, cy))

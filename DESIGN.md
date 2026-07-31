@@ -29,6 +29,18 @@ Key decisions:
 - **Redundancy over any single cue.** Ball tracking and audio are the strongest positive
   signals; motion and optional player geometry remain supporting evidence.
 
+Current package boundaries:
+
+- `signals/` extracts measurements only; shared observation records live in `domain/`.
+- `fusion/` owns interval scoring, proposal ownership, ball verdicts, match rules, and
+  optional learned decisions. Exact interval policies are named in `fusion/intervals.py`.
+- `learning/` owns versioned feature/artifact schemas used identically by offline tools
+  and guarded runtime loading; `tools/` only adapts files, trains, and evaluates.
+- `pipeline.py` orchestrates stages using the typed signal/arbiter state in
+  `pipeline_types.py`; media publication is isolated in `io/publish.py`.
+- `web/` owns job/revision state and presentation. Training labels are exported data;
+  they do not bypass the held-out model gate or directly mutate detection rules.
+
 ## (a) The rally classifier: a segment model
 
 **Reality check from the literature (read in full, see part (b)):** the two cheapest
@@ -121,7 +133,9 @@ model within-segment structure; (2) asynchronous audio-event bigram wins → fus
 as an ordered event sequence.
 
 ### Hawk-Eye pipeline (arXiv 2511.04126) — the standard explicit stack
-- Players: YOLOv8 + court-polygon foot-point filter → top-2 by centre proximity.
+- Players: configurable Ultralytics YOLO (YOLO12 detection by default) + court-polygon
+  foot-point filter → top-2 by centre proximity. RTMLib applies top-down RTMPose only to
+  those target-court crops, including small far-side baseline players.
 - Ball: custom YOLOv5 (weak on serves/occlusion) + interpolation + Kalman.
 - Court: ResNet50 **14-keypoint** regressor (~3.8 px) → homography.
 - Shot detection: ball-velocity **angle change + magnitude jump**, scale-aware.
@@ -144,7 +158,14 @@ as an ordered event sequence.
   `court_corners`. On by default (auto court detection too; `--no-ball-arbiter` /
   `--no-court-auto` to disable), falling back to audio-primary if weights are absent;
   weights via
-  `rally.tools.fetch_models`. A ResNet50 court-keypoint model can replace the classical
-  detector at the documented hook for perspective-heavy footage.
-- **Phase 3:** labelled data → learned TCN + segment-model classifier; scoreboard OCR
-  + scoring automaton to reject warm-up and index points.
+  `rally.tools.fetch_models`. An optional Ultralytics court-keypoint checkpoint can run
+  first for perspective-heavy footage; predictions require multi-frame geometric and
+  painted-line consensus, with the classical detector retained as fallback.
+- **Phase 3 (guarded learning path implemented):** web `serve_motion` exports can be adapted
+  into a versioned multi-match dataset with audio plus compatible pose/court/ball
+  diagnostics. `rally.tools.serve_train` uses leave-one-match-out validation and emits a
+  guarded artifact only *eligible* for live integration when it beats the current rules
+  under minimum match/sample/coverage thresholds. An explicitly configured artifact is
+  loaded only after runtime recomputes that gate. The remaining Phase-3 work is a learned
+  TCN + segment-model classifier, and scoreboard OCR + scoring automaton to
+  reject warm-up and index points.

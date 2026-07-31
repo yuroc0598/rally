@@ -1,8 +1,7 @@
-"""FastAPI web UI for the rally trimmer.
+"""FastAPI composition root for processing jobs and the review UI.
 
-Thin layer over :func:`rally.pipeline.trim`. The core pipeline is imported and
-used unchanged; everything video-specific lives in the ``rally`` package and is
-treated as a black box here.
+Analysis remains in :mod:`rally.pipeline`; this module owns the mutable job lifecycle,
+upload API, media publication, editing, and human-label workflows.
 
 Design notes
 ------------
@@ -29,6 +28,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,11 +42,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
-from rally.config import RallyConfig
+from rally.config import DEFAULT_YOLO_DETECTION_MODEL, RallyConfig
 from rally.io.ffmpeg import (
     _require,
     add_real_context,
@@ -60,6 +59,14 @@ from rally.io.ffmpeg import (
 from rally.pipeline import timeline_array, trim
 from rally.signals.audio import detect_strikes_stream
 from rally.signals.player import estimate_court_region
+from rally.web.golden import discover_datasets, resolve_media_path
+from rally.web.schemas import (
+    MAX_LABEL_ITEMS as _MAX_LABEL_ITEMS,
+    LabelPayload,
+    LabelTaskRequest,
+    RosterUpdate,
+    SegmentEdit,
+)
 
 # --------------------------------------------------------------------------- #
 # module state                                                                #
@@ -67,6 +74,11 @@ from rally.signals.player import estimate_court_region
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
 DATA_DIR = Path(os.environ.get("RALLY_WEB_DATA", ".rally_web")).resolve()
+PROJECT_DIR = PACKAGE_DIR.parents[1]
+GOLDEN_DIR = Path(os.environ.get(
+    "RALLY_GOLDEN_DATA", PROJECT_DIR / "samples" / "golden")).resolve()
+GOLDEN_RESULTS_DIR = Path(os.environ.get(
+    "RALLY_GOLDEN_RESULTS", PROJECT_DIR / ".rally_golden")).resolve()
 
 
 def _recommended_web_workers(cpu_count: int | None, cuda_free_bytes: int | None) -> int:
@@ -129,9 +141,8 @@ _YOLO_MODEL: Any = None
 
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 _LABEL_KINDS = {"player_identity", "serve_motion"}
+_ROSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$")
 _DEFAULT_MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
-_MAX_LABEL_ITEMS = 50
-_MAX_EDIT_SEGMENTS = 100
 _MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 
 
@@ -156,6 +167,11 @@ def _now() -> str:
 
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _scavenge_stale_uploads() -> None:
+    """Remove abandoned temporary uploads once, during startup recovery only."""
+    _ensure_data_dir()
     cutoff = datetime.now(timezone.utc).timestamp() - 3600
     for path in DATA_DIR.glob(".upload-*"):
         try:
@@ -169,6 +185,11 @@ def _safe_filename(name: str | None) -> str:
     raw = Path(name or "upload.mp4").name
     stem = "".join(c if c.isalnum() or c in "._- " else "_" for c in raw).strip(" .")
     return stem or "upload.mp4"
+
+
+def _golden_datasets() -> list[dict[str, Any]]:
+    return discover_datasets(
+        GOLDEN_DIR, GOLDEN_RESULTS_DIR, video_extensions=_VIDEO_EXTS)
 
 
 def _job_dir(job_id: str) -> Path:
@@ -306,12 +327,16 @@ _STAGE_RULES = [
     ("duration=", "probing", "Reading video", 22),
     ("decoding audio", "audio", "Detecting ball strikes", 32),
     ("strikes detected", "audio", "Detecting ball strikes", 40),
-    ("sampling frames", "visual", "Analysing motion & players", 52),
-    ("co-deciding", "deciding", "Fusing signals", 66),
-    ("decoded", "deciding", "Points found", 74),
-    ("court serve detection", "refining", "Refining serves", 78),
-    ("ball point-end", "refining", "Refining rally ends", 82),
-    ("computing waveform", "waveform", "Building timeline", 86),
+    ("sampling frames", "visual", "Analysing motion & players", 45),
+    ("co-deciding", "deciding", "Building candidates", 52),
+    ("ball arbiter", "ball_tracking", "Tracking the ball", 54),
+    ("match-state validation: checking server pose", "pose", "Checking serve poses", 76),
+    ("match-state validation: checking stationary", "pose", "Checking player setup", 82),
+    ("match-state validation: checking ball", "serve", "Validating serves", 83),
+    ("decoded", "deciding", "Points found", 89),
+    ("court serve detection", "refining", "Refining serves", 89),
+    ("ball point-end", "refining", "Refining rally ends", 89),
+    ("computing waveform", "waveform", "Building timeline", 90),
     ("rendering", "rendering", "Rendering video", 92),
     ("cutting", "rendering", "Rendering video", 92),
     ("wrote", "writing", "Writing output", 95),
@@ -320,6 +345,27 @@ _STAGE_RULES = [
 
 def _stage_for_message(message: str) -> dict[str, Any]:
     text = message.lower()
+    tracking = re.search(r"ball tracking progress\s+(\d+)%", text)
+    if tracking:
+        completed = max(0, min(100, int(tracking.group(1))))
+        return {
+            "stage": "ball_tracking", "label": "Tracking the ball",
+            "percent": 54 + int(round(0.21 * completed)),
+        }
+    pose = re.search(r"match pose progress\s+(\d+)\s*/\s*(\d+)", text)
+    if pose:
+        done, total = int(pose.group(1)), max(1, int(pose.group(2)))
+        return {
+            "stage": "pose", "label": "Checking serve poses",
+            "percent": 76 + int(round(0.06 * min(100, 100 * done / total))),
+        }
+    serves = re.search(r"serve validation progress\s+(\d+)\s*/\s*(\d+)", text)
+    if serves:
+        done, total = int(serves.group(1)), max(1, int(serves.group(2)))
+        return {
+            "stage": "serve", "label": "Validating serves",
+            "percent": 83 + int(round(0.05 * min(100, 100 * done / total))),
+        }
     for needle, stage, label, percent in _STAGE_RULES:
         if needle in text:
             return {"stage": stage, "label": label, "percent": percent}
@@ -443,9 +489,10 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
         speed_candidates = (((clean.get("stages") or {}).get("ball_arbiter") or {})
                             .get("verification") or {}).get("candidates") or []
 
-        def speed_for(point: tuple[float, float]) -> Optional[float]:
+        def speed_for(point: tuple[float, float]) -> tuple[Optional[float], Optional[dict]]:
             best_overlap = 0.0
             best_speed: Optional[float] = None
+            best_estimate: Optional[dict] = None
             for candidate in speed_candidates:
                 output = candidate.get("output")
                 speed = candidate.get("peak_ball_speed_kmh")
@@ -456,13 +503,16 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
                 if overlap > best_overlap:
                     best_overlap = overlap
                     best_speed = float(speed)
-            return best_speed
+                    estimate = candidate.get("ball_speed_estimate")
+                    best_estimate = dict(estimate) if isinstance(estimate, dict) else None
+            return best_speed, best_estimate
 
         cursor = 0.0
         layout = []
         gap_s = float(cfg.inter_point_gap_s)
         for index, (point, clip) in enumerate(zip(points, clips)):
             clip_duration = max(0.0, clip[1] - clip[0])
+            speed, speed_estimate = speed_for(point)
             layout.append({
                 "index": index,
                 "source_start": round(clip[0], 3),
@@ -471,7 +521,8 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
                 "detected_end": round(point[1], 3),
                 "output_start": round(cursor, 3),
                 "output_end": round(cursor + clip_duration, 3),
-                "peak_ball_speed_kmh": speed_for(point),
+                "peak_ball_speed_kmh": speed,
+                "ball_speed_estimate": speed_estimate,
             })
             cursor += clip_duration
             if index < len(points) - 1:
@@ -829,11 +880,20 @@ def _write_waveform(job_id: str, src: Path, duration: float, cfg: RallyConfig, p
 # --------------------------------------------------------------------------- #
 # the worker                                                                   #
 # --------------------------------------------------------------------------- #
-def _segments_as_tuples(sidecar: dict[str, Any]) -> list[tuple[float, float]]:
-    return [(float(s["start"]), float(s["end"])) for s in sidecar.get("segments", [])]
-
-
 def _set_job_cancelled(job: dict[str, Any], detail: str = "Stopped by user") -> None:
+    output = Path(job["output_path"]) if job.get("output_path") else None
+    metadata = Path(job["json_path"]) if job.get("json_path") else None
+    if isinstance(job.get("result"), dict) and metadata is not None and metadata.exists():
+        output_ready = bool(output is not None and output.exists())
+        job["status"] = "complete" if output_ready else "no_output"
+        job["retryable"] = True
+        job["cancel_requested"] = False
+        job["error"] = None
+        _set_processing(
+            job, job["status"], "Previous result retained", 100,
+            f"{detail}; the last successful result is still available",
+        )
+        return
     percent = int((job.get("processing") or {}).get("percent") or 0)
     job["status"] = "cancelled"
     job["retryable"] = True
@@ -886,31 +946,19 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
         attempt_waveform_path = job_dir / f".waveform.{attempt_id}.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        stale_outputs: set[Path] = {output_path}
-
         def start(current: dict[str, Any]) -> None:
             if current.get("active_attempt_id") != attempt_id:
                 return
-            if current.get("output_path"):
-                stale_outputs.add(Path(current["output_path"]))
             current["status"] = "running"
             current["cancel_requested"] = False
             current["error"] = None
-            current["output_path"] = None
-            current["json_path"] = None
-            current["result"] = None
             _mark_labeling_stale(current)
             _set_processing(current, "starting", "Starting", 12, "Preparing output files")
 
         job = _mutate_job(job_id, start)
         if job.get("active_attempt_id") != attempt_id:
             return
-        # Unpublish in job.json before removing any old artifact, so a rerun can
-        # never serve the previous MP4 as if it were the new analysis.
-        for stale in stale_outputs:
-            stale.unlink(missing_ok=True)
         _archive_label_artifacts(job_id)
-        (job_dir / "waveform.json").unlink(missing_ok=True)
         _append_progress(job_id, "processing started", attempt_id=attempt_id)
         # Publish an original-video still immediately so the primary processed-video
         # panel has useful visual context throughout analysis and rendering. This is
@@ -958,6 +1006,8 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
                 return
             if output_ready:
                 os.replace(attempt_output_path, output_path)
+            else:
+                output_path.unlink(missing_ok=True)
             if attempt_waveform_path.exists():
                 os.replace(attempt_waveform_path, job_dir / "waveform.json")
             _atomic_write_json(json_path, sidecar)
@@ -1004,8 +1054,21 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
                     current["retryable"] = True
                     current["cancel_requested"] = False
                     current["error"] = str(exc)
-                    current["output_path"] = None
-                    _set_processing(current, "failed", "Failed", 100, str(exc))
+                    output = (Path(current["output_path"])
+                              if current.get("output_path") else None)
+                    metadata = (Path(current["json_path"])
+                                if current.get("json_path") else None)
+                    if (isinstance(current.get("result"), dict)
+                            and metadata is not None and metadata.exists()):
+                        current["status"] = (
+                            "complete" if output is not None and output.exists()
+                            else "no_output")
+                        _set_processing(
+                            current, current["status"], "Previous result retained", 100,
+                            f"Re-run failed: {exc}",
+                        )
+                    else:
+                        _set_processing(current, "failed", "Failed", 100, str(exc))
 
                 _mutate_job(job_id, fail)
                 _append_progress(
@@ -1029,7 +1092,6 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
 def _submit_job(job_id: str, *, reserved_upload: bool = False,
                 _recovering: bool = False) -> dict[str, Any]:
     """Atomically reserve one executor slot per job and queue it once."""
-    stale_outputs: set[Path] = {_job_dir(job_id) / "output" / "rallies.mp4"}
     with _LOCK:
         job = _read_json(_job_meta_path(job_id), None)
         if not job:
@@ -1056,8 +1118,6 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
             raise HTTPException(status_code=503, detail="processing queue is full")
         if reserved_upload and job_id not in _UPLOAD_RESERVED:
             raise RuntimeError("upload queue reservation was lost")
-        if job.get("output_path"):
-            stale_outputs.add(Path(job["output_path"]))
         attempt_id = uuid.uuid4().hex
         cancel_event = threading.Event()
         _CANCEL_EVENTS[job_id] = (attempt_id, cancel_event)
@@ -1066,9 +1126,6 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
         job["retryable"] = False
         job["cancel_requested"] = False
         job["error"] = None
-        job["output_path"] = None
-        job["json_path"] = None
-        job["result"] = None
         _mark_labeling_stale(job)
         job["updated_at"] = _now()
         _set_processing(job, "queued", "Queued", 8, "Waiting for a worker")
@@ -1078,10 +1135,7 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
         _atomic_write_json(_job_meta_path(job_id), job)
 
     try:
-        for stale in stale_outputs:
-            stale.unlink(missing_ok=True)
         _archive_label_artifacts(job_id)
-        (_job_dir(job_id) / "waveform.json").unlink(missing_ok=True)
         _append_progress(job_id, "queued for processing", attempt_id=attempt_id)
         future = _EXECUTOR.submit(_run_trim_job, job_id, attempt_id)
         with _LOCK:
@@ -1117,7 +1171,7 @@ def _recover_interrupted_jobs() -> dict[str, int]:
     running job has lost its owning worker; mark it failed/retryable instead of guessing
     that partially written artifacts are valid. In-process live jobs are always skipped.
     """
-    _ensure_data_dir()
+    _scavenge_stale_uploads()
     root = DATA_DIR.resolve()
     queued: list[str] = []
     interrupted = 0
@@ -1132,6 +1186,16 @@ def _recover_interrupted_jobs() -> dict[str, int]:
             job_id = str(job.get("id") or path.parent.name)
             if job_id in _ACTIVE or job_id in _SUBMITTED:
                 continue
+            labeling = job.get("labeling") or {}
+            if (labeling.get("status") == "generating"
+                    and job_id not in _LABEL_ACTIVE
+                    and job_id not in _LABEL_SUBMITTED):
+                message = "label generation was interrupted by a server restart; retry generation"
+                labeling.update(
+                    status="failed", error=message, detail=message, updated_at=_now())
+                job["labeling"] = labeling
+                job["updated_at"] = _now()
+                _atomic_write_json(path, job)
             status = job.get("status")
             if status == "queued":
                 queued.append(job_id)
@@ -1143,10 +1207,19 @@ def _recover_interrupted_jobs() -> dict[str, int]:
                 job["status"] = "failed"
                 job["retryable"] = True
                 job["error"] = message
-                job["output_path"] = None
-                job["json_path"] = None
+                retained = bool(
+                    isinstance(job.get("result"), dict)
+                    and job.get("json_path")
+                    and Path(job["json_path"]).is_file()
+                )
                 job["updated_at"] = _now()
-                _set_processing(job, "failed", "Interrupted", 100, message)
+                _set_processing(
+                    job, "failed",
+                    "Interrupted — previous result retained" if retained else "Interrupted",
+                    100,
+                    (f"{message}; the last successful result is still available"
+                     if retained else message),
+                )
                 log = job.setdefault("progress", [])
                 log.append({"at": _now(), "message": message})
                 del log[:-400]
@@ -1201,6 +1274,26 @@ def list_jobs(limit: int = 100, offset: int = 0) -> JSONResponse:
             continue
         jobs.append(_public_job(job))
     return JSONResponse({"jobs": jobs, "total": len(paths), "limit": limit, "offset": offset})
+
+
+@app.get("/api/golden")
+def list_golden_datasets() -> JSONResponse:
+    datasets = _golden_datasets()
+    return JSONResponse({"datasets": datasets, "total": len(datasets)})
+
+
+@app.get("/api/golden/{dataset_id}/media/{kind}")
+def get_golden_media(dataset_id: str, kind: str, download: bool = False) -> FileResponse:
+    path = resolve_media_path(
+        dataset_id, kind, GOLDEN_DIR, GOLDEN_RESULTS_DIR,
+        video_extensions=_VIDEO_EXTS)
+    if path is None:
+        raise HTTPException(status_code=404, detail="golden media not found")
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    disposition = "attachment" if download or kind in {"metadata", "ground-truth"} else "inline"
+    return FileResponse(
+        path, media_type=media_type, filename=path.name,
+        content_disposition_type=disposition)
 
 
 @app.post("/api/jobs")
@@ -1411,7 +1504,6 @@ def _capabilities() -> dict[str, Any]:
         "ball_arbiter": {
             "available": bool(weights) and torch_ok,
             "weights_present": bool(weights),
-            "weights_path": weights,
             "torch_installed": torch_ok,
             "hint": hint,
         },
@@ -1449,6 +1541,11 @@ def cancel_job(job_id: str) -> JSONResponse:
         job = _read_json(path, None)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
+        if job_id in _EDIT_ACTIVE:
+            raise HTTPException(
+                status_code=409,
+                detail="manual segment export cannot be stopped; previous result is retained",
+            )
         if job.get("status") not in {"queued", "running"}:
             raise HTTPException(status_code=409, detail="job is not currently processing")
         if job.get("cancel_requested"):
@@ -1488,7 +1585,7 @@ def cancel_job(job_id: str) -> JSONResponse:
 
 
 @app.get("/api/jobs/{job_id}/media/{kind}")
-def get_media(job_id: str, kind: str, download: bool = False) -> FileResponse:
+def get_media(job_id: str, kind: str, download: bool = False):
     job = _load_job(job_id)
     paths = {"original": job.get("original_path"), "thumbnail": job.get("thumbnail_path"),
              "output": job.get("output_path"), "metadata": job.get("json_path")}
@@ -1502,8 +1599,14 @@ def get_media(job_id: str, kind: str, download: bool = False) -> FileResponse:
             output = Path(job["output_path"]) if job.get("output_path") else None
             clean = _normalise_web_sidecar(
                 job, metadata, output_ready=bool(output and output.exists()))
-            if clean != metadata:
-                _atomic_write_json(path, clean)
+            disposition = "attachment" if download else "inline"
+            filename = f"{Path(job['filename']).stem}_rallies.json"
+            return JSONResponse(
+                clean,
+                headers={
+                    "Content-Disposition": f'{disposition}; filename="{filename}"',
+                },
+            )
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     disposition = "attachment" if download else "inline"
     stem = Path(job["filename"]).stem
@@ -1529,10 +1632,6 @@ def get_waveform(job_id: str) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # manual segment editing + re-export                                          #
 # --------------------------------------------------------------------------- #
-class SegmentEdit(BaseModel):
-    segments: list[list[float]] = Field(max_length=_MAX_EDIT_SEGMENTS)
-
-
 def _normalise_segments(raw: list[list[float]], duration: float) -> list[tuple[float, float]]:
     segs: list[tuple[float, float]] = []
     for item in raw:
@@ -1594,62 +1693,58 @@ def edit_segments(job_id: str, edit: SegmentEdit) -> JSONResponse:
             raise HTTPException(status_code=409, detail="job segments are already being edited")
         _EDIT_ACTIVE.add(job_id)
 
-    edit_started = False
-    out = _job_dir(job_id) / "output" / "rallies.mp4"
+    previous_job = dict(job)
+    attempt = uuid.uuid4().hex
+    output_dir = _job_dir(job_id) / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt_out = output_dir / f"rallies.edit.{attempt}.mp4"
+    attempt_json = output_dir / f"rallies.edit.{attempt}.json"
     try:
         result = job.get("result") or {}
         duration = float(result.get("total_seconds") or 0)
         segs = _normalise_segments(edit.segments, duration)
-        json_path = Path(job.get("json_path") or (_job_dir(job_id) / "output" / "rallies.json"))
         sidecar_job = dict(job)
-        # Build first, then publish the JSON only after job.json has stopped
-        # advertising the previous result.
+        # Build the replacement without mutating the currently published sidecar.
         sidecar_job["json_path"] = None
         sidecar = _rewrite_sidecar(sidecar_job, segs)
         sidecar = _normalise_web_sidecar(job, sidecar, output_ready=False)
 
-        stale_outputs: set[Path] = {out}
-
         def begin_edit(current: dict[str, Any]) -> None:
-            if current.get("output_path"):
-                stale_outputs.add(Path(current["output_path"]))
-            current["result"] = sidecar
-            current["json_path"] = None
-            current["output_path"] = None
             current["error"] = None
             current["status"] = "running"
             current["retryable"] = False
-            _mark_labeling_stale(current)
             _set_processing(current, "rendering", "Rendering video", 92,
                             "Applying manual segment edits" if segs
                             else "Saving empty segment selection")
 
         job = _mutate_job(job_id, begin_edit)
-        edit_started = True
-        for stale in stale_outputs:
-            stale.unlink(missing_ok=True)
-        _archive_label_artifacts(job_id)
 
         ok = False
         if segs:
             try:
                 cfg = _config_from_options(job.get("options", {}))
                 info = probe(job["original_path"])
-                ok = _render_output(Path(job["original_path"]), segs, out, cfg, info,
+                ok = _render_output(
+                    Path(job["original_path"]), segs, attempt_out, cfg, info,
                                     lambda m: _append_progress(job_id, m))
             except Exception as exc:
                 _append_progress(job_id, f"manual render failed: {exc}")
+                raise RuntimeError(f"manual video export failed: {exc}") from exc
+            if not ok or not attempt_out.is_file():
+                raise RuntimeError("manual video export produced no output")
 
-        ready = bool(segs) and ok and out.exists()
+        ready = bool(segs) and ok and attempt_out.exists()
         sidecar = _normalise_web_sidecar(job, sidecar, output_ready=ready)
-        _atomic_write_json(json_path, sidecar)
+        _atomic_write_json(attempt_json, sidecar)
 
         def finish_edit(current: dict[str, Any]) -> None:
             current["status"] = "complete" if ready else "no_output"
             current["retryable"] = False
             current["result"] = sidecar
-            current["json_path"] = str(json_path)
-            current["output_path"] = str(out) if ready else None
+            current["json_path"] = str(attempt_json)
+            current["output_path"] = str(attempt_out) if ready else None
+            current["error"] = None
+            _mark_labeling_stale(current)
             if ready:
                 _set_processing(current, "complete", "Ready", 100,
                                 f"{len(segs)} edited rallies — output ready")
@@ -1661,21 +1756,35 @@ def edit_segments(job_id: str, edit: SegmentEdit) -> JSONResponse:
                                 "All segments were removed")
 
         job = _mutate_job(job_id, finish_edit)
+        _archive_label_artifacts(job_id)
+        # The metadata pointer now owns the new immutable artifacts. Old files can be
+        # removed afterward without ever leaving the job with no valid published result.
+        for key in ("output_path", "json_path"):
+            old = previous_job.get(key)
+            if old and old not in {str(attempt_out), str(attempt_json)}:
+                Path(old).unlink(missing_ok=True)
         return JSONResponse(_public_job(job))
     except Exception as exc:
-        if edit_started:
-            out.unlink(missing_ok=True)
-            try:
-                def fail_edit(current: dict[str, Any]) -> None:
-                    current["status"] = "failed"
-                    current["retryable"] = True
-                    current["error"] = f"could not apply segment edits: {exc}"
-                    current["output_path"] = None
-                    _set_processing(current, "failed", "Failed", 100, current["error"])
+        attempt_out.unlink(missing_ok=True)
+        attempt_json.unlink(missing_ok=True)
+        try:
+            def fail_edit(current: dict[str, Any]) -> None:
+                current["status"] = previous_job.get("status", "complete")
+                current["retryable"] = False
+                current["result"] = previous_job.get("result")
+                current["json_path"] = previous_job.get("json_path")
+                current["output_path"] = previous_job.get("output_path")
+                current["labeling"] = previous_job.get("labeling", {})
+                current["error"] = f"could not apply segment edits: {exc}"
+                _set_processing(
+                    current,
+                    "complete" if current.get("output_path") else "no_output",
+                    "Previous result retained", 100, current["error"],
+                )
 
-                _mutate_job(job_id, fail_edit)
-            except HTTPException:
-                pass
+            _mutate_job(job_id, fail_edit)
+        except HTTPException:
+            pass
         raise
     finally:
         with _LOCK:
@@ -1704,24 +1813,6 @@ def delete_job(job_id: str) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # labelling: generate raw samples (player crops + serve clips) to annotate     #
 # --------------------------------------------------------------------------- #
-class LabelTaskRequest(BaseModel):
-    kinds: list[str] = Field(default=["player_identity", "serve_motion"],
-                             min_length=1, max_length=2)
-    max_items: int = Field(default=10, ge=1, le=_MAX_LABEL_ITEMS)
-    match_type: str = "auto"          # auto | singles | doubles
-    regenerate: bool = False
-
-
-class LabelPayload(BaseModel):
-    task_id: str = Field(min_length=1, max_length=100)
-    kind: str = Field(min_length=1, max_length=40)
-    values: dict[str, Any] = Field(default_factory=dict, max_length=20)
-
-
-class RosterUpdate(BaseModel):
-    roster: list[dict[str, Any]] = Field(max_length=20)
-
-
 def _labels_dir(job_id: str) -> Path:
     with _LOCK:
         job = _read_json(_job_meta_path(job_id), {})
@@ -1740,18 +1831,68 @@ def _assets_dir(job_id: str) -> Path:
     return _job_dir(job_id) / "label_assets"
 
 
-def _live_label_root_locked(job_id: str) -> tuple[dict[str, Any], Path]:
-    """Resolve the ready label revision while the caller holds ``_LOCK``."""
+def _label_root_locked(job_id: str, *, writable: bool) -> tuple[dict[str, Any], Path]:
+    """Resolve one stable revision; stale revisions are readable but never writable."""
     job = _read_json(_job_meta_path(job_id), None)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     lab = job.get("labeling") or {}
     revision = lab.get("revision")
-    if (lab.get("status") != "ready" or not revision or job_id in _LABEL_ACTIVE
+    allowed_status = {"ready"} if writable else {"ready", "stale"}
+    if (lab.get("status") not in allowed_status or not revision or job_id in _LABEL_ACTIVE
             or job_id in _LABEL_SUBMITTED or job_id in _EDIT_ACTIVE
             or job.get("status") in {"queued", "running"}):
-        raise HTTPException(status_code=409, detail="no stable ready label revision")
+        raise HTTPException(status_code=409, detail="no stable label revision")
     return job, _job_dir(job_id) / "label_revisions" / str(revision)
+
+
+def _live_label_root_locked(job_id: str) -> tuple[dict[str, Any], Path]:
+    """Backward-compatible name for mutation callers requiring the ready revision."""
+    return _label_root_locked(job_id, writable=True)
+
+
+def _clean_label_values(kind: str, values: dict[str, Any], roster_ids: set[str]) -> dict:
+    """Validate the finite annotation vocabulary before it reaches training exports."""
+    allowed = {
+        "player_identity": {
+            "player": roster_ids,
+            "quality": {"clear", "partial", "occluded", "not_player"},
+        },
+        "serve_motion": {
+            "is_serve": {"yes", "no", "unsure"},
+            "server": roster_ids | {"unknown"},
+            "side": {"deuce", "ad"},
+            "end": {"near", "far"},
+            "serve_type": {"flat", "slice", "kick"},
+            "outcome": {"in", "fault", "ace", "let"},
+        },
+    }[kind]
+    unknown = set(values) - set(allowed) - ({"notes"} if kind == "serve_motion" else set())
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"unknown label fields: {sorted(unknown)}")
+    clean: dict[str, Any] = {}
+    for key, choices in allowed.items():
+        if key not in values or values[key] in (None, ""):
+            continue
+        value = str(values[key])
+        if value not in choices:
+            raise HTTPException(status_code=422, detail=f"invalid {kind} value for {key}")
+        clean[key] = value
+    if kind == "serve_motion" and values.get("notes") not in (None, ""):
+        notes = str(values["notes"]).strip()
+        if len(notes) > 1000:
+            raise HTTPException(status_code=422, detail="serve notes are too long")
+        clean["notes"] = notes
+    return clean
+
+
+def _web_yolo_model_name() -> str:
+    """Label-crop detector override, then the pipeline-wide detector override."""
+    for env_name in ("RALLY_WEB_YOLO", "RALLY_YOLO_DETECTION_MODEL"):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    return DEFAULT_YOLO_DETECTION_MODEL
 
 
 def _yolo():
@@ -1762,15 +1903,18 @@ def _yolo():
             from ultralytics import YOLO
 
             from rally.signals.player import discover_yolo_weights
-            name = os.environ.get("RALLY_WEB_YOLO", "yolov8n.pt")
-            _YOLO_MODEL = YOLO(discover_yolo_weights(name))
+            _YOLO_MODEL = YOLO(discover_yolo_weights(_web_yolo_model_name()))
         return _YOLO_MODEL
 
 
 def _detect_boxes(frame_bgr, conf: float = 0.3) -> list[tuple[float, float, float, float]]:
     """Person boxes as pixel (x0, y0, x1, y1). Unlike the core's foot-point
     detector we keep the full box because we need it to crop a player."""
-    res = _yolo().predict(frame_bgr, conf=conf, classes=[0], verbose=False)
+    model = _yolo()
+    # Ultralytics keeps mutable predictor state on the model. Label jobs may run in
+    # parallel, so calls sharing this singleton must be serialized as well as loading.
+    with _YOLO_LOCK:
+        res = model.predict(frame_bgr, conf=conf, classes=[0], verbose=False)
     boxes: list[tuple[float, float, float, float]] = []
     for r in res:
         xyxy = getattr(r.boxes, "xyxy", None)
@@ -1962,19 +2106,38 @@ def _generate_player_tasks(job_id: str, src: Path, segments: list[dict], duratio
 
 
 def _generate_serve_tasks(job_id: str, src: Path, segments: list[dict], duration: float,
-                          max_items: int, regenerate: bool,
+                          max_items: int, regenerate: bool, match_state: Optional[dict] = None,
                           assets_dir: Optional[Path] = None) -> list[dict[str, Any]]:
     """Cut short clips around each serve moment (rally start) to classify."""
-    times = _serve_times(segments, duration, min(max_items, max(1, len(segments) or max_items)))
+    count = min(max_items, max(1, len(segments) or max_items))
+    if segments:
+        selected = _evenly_pick(list(enumerate(segments)), count)
+    else:
+        selected = [(None, {"start": value}) for value in _serve_times([], duration, count)]
+    groups = (match_state or {}).get("logical_groups") or []
     assets = assets_dir or _assets_dir(job_id)
     tasks: list[dict[str, Any]] = []
-    for i, start in enumerate(times[:max_items]):
+    for i, (source_index, segment) in enumerate(selected[:max_items]):
+        start = float(segment["start"])
         clip_start = max(0.0, start - 1.5)
         clip_end = min(duration, start + 3.5) if duration else start + 3.5
         rel = f"serve_{i:04d}.mp4"
         path = assets / rel
         if regenerate or not path.exists():
             _ffmpeg_clip(src, clip_start, clip_end, path)
+        stable_context: dict[str, Any] = {}
+        if source_index is not None:
+            stable_context["source_segment_index"] = int(
+                segment.get("index", source_index))
+            group = next((record for record in groups
+                          if record.get("output")
+                          and record.get("serve_member_index") is not None
+                          and abs(float(record["output"][0]) - start) <= 0.01), None)
+            if group is not None:
+                stable_context.update({
+                    "logical_group": int(group["group_index"]),
+                    "match_state_observation_index": int(group["serve_member_index"]),
+                })
         tasks.append({
             "id": f"serve_{i:04d}",
             "kind": "serve_motion",
@@ -1982,6 +2145,7 @@ def _generate_serve_tasks(job_id: str, src: Path, segments: list[dict], duration
             "time_s": round(float(start), 3),
             "media_type": "video",
             "asset_url": f"/api/jobs/{job_id}/assets/{rel}",
+            **stable_context,
         })
     return tasks
 
@@ -2032,6 +2196,7 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
             _set_labeling(job_id, detail="Cutting serve clips")
             tasks.extend(_generate_serve_tasks(
                 job_id, src, segments, duration, req.max_items, True,
+                match_state=((result.get("stages") or {}).get("match_state") or {}),
                 assets_dir=build_assets))
 
         # persist roster (preserve any user-renamed names) + tasks
@@ -2043,6 +2208,13 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
                     r["name"] = names[r["id"]]
         _atomic_write_json(build_labels / "roster.json", roster)
         _atomic_write_json(build_labels / "tasks.json", tasks)
+        stages = result.get("stages") or {}
+        _atomic_write_json(build_labels / "feature_context.json", {
+            "schema_version": "rally.serve_rule_context.v1",
+            "strike_times": result.get("strike_times", []),
+            "segments": result.get("segments", []),
+            "match_state": stages.get("match_state", {}),
+        })
         # New media invalidates old human answers even when stable task IDs happen to
         # repeat. Publish an explicitly empty label set with the new revision.
         _atomic_write_json(build_labels / "labels.json", {})
@@ -2114,31 +2286,51 @@ def create_label_tasks(job_id: str, req: LabelTaskRequest) -> JSONResponse:
 
 @app.get("/api/jobs/{job_id}/label-tasks")
 def get_label_tasks(job_id: str) -> JSONResponse:
-    _load_job(job_id)
-    tasks = _read_json(_labels_dir(job_id) / "tasks.json", [])
-    roster = _read_json(_labels_dir(job_id) / "roster.json", [])
-    labels = _read_json(_labels_dir(job_id) / "labels.json", {})
-    return JSONResponse({"tasks": tasks, "roster": roster, "labels": labels})
+    with _LOCK:
+        job, root = _label_root_locked(job_id, writable=False)
+        labels_dir = root / "labels"
+        tasks = _read_json(labels_dir / "tasks.json", [])
+        roster = _read_json(labels_dir / "roster.json", [])
+        labels = _read_json(labels_dir / "labels.json", {})
+        revision = str((job.get("labeling") or {}).get("revision") or "")
+        tasks = [
+            {**task, "asset_url": f"{task['asset_url']}?revision={revision}"}
+            if task.get("asset_url") else dict(task)
+            for task in tasks
+        ]
+    return JSONResponse({
+        "revision": revision, "tasks": tasks, "roster": roster, "labels": labels})
 
 
 @app.post("/api/jobs/{job_id}/roster")
 def update_roster(job_id: str, update: RosterUpdate) -> JSONResponse:
     for record in update.roster:
-        if len(str(record.get("id") or "")) > 50 or len(str(record.get("name") or "")) > 100:
+        roster_id = str(record.get("id") or "")
+        if not _ROSTER_ID.fullmatch(roster_id):
+            raise HTTPException(status_code=422, detail="invalid roster id")
+        if len(str(record.get("name") or "")) > 100:
             raise HTTPException(status_code=422, detail="roster id/name is too long")
-    clean = [{"id": str(r.get("id")), "name": str(r.get("name") or r.get("id")),
+        if record.get("side") not in {None, "near", "far"}:
+            raise HTTPException(status_code=422, detail="invalid roster side")
+        if record.get("col") not in {None, "left", "right"}:
+            raise HTTPException(status_code=422, detail="invalid roster column")
+    clean = [{"id": str(r["id"]), "name": str(r.get("name") or r["id"]).strip(),
               "side": r.get("side"), "col": r.get("col")}
-             for r in update.roster if r.get("id")]
+             for r in update.roster]
     with _LOCK:
-        _job, root = _live_label_root_locked(job_id)
+        job, root = _live_label_root_locked(job_id)
+        if update.revision != str((job.get("labeling") or {}).get("revision") or ""):
+            raise HTTPException(status_code=409, detail="label revision changed; reload samples")
         _atomic_write_json(root / "labels" / "roster.json", clean)
-    return JSONResponse({"roster": clean})
+    return JSONResponse({"revision": update.revision, "roster": clean})
 
 
 @app.get("/api/jobs/{job_id}/labels")
 def get_labels(job_id: str) -> JSONResponse:
-    _load_job(job_id)
-    return JSONResponse({"labels": _read_json(_labels_dir(job_id) / "labels.json", {})})
+    with _LOCK:
+        _job, root = _label_root_locked(job_id, writable=False)
+        labels = _read_json(root / "labels" / "labels.json", {})
+    return JSONResponse({"labels": labels})
 
 
 @app.post("/api/jobs/{job_id}/labels")
@@ -2148,39 +2340,69 @@ def save_label(job_id: str, payload: LabelPayload) -> JSONResponse:
     if len(json.dumps(payload.values)) > 64 * 1024:
         raise HTTPException(status_code=413, detail="label values are too large")
     with _LOCK:
-        _job, root = _live_label_root_locked(job_id)
+        job, root = _live_label_root_locked(job_id)
+        if payload.revision != str((job.get("labeling") or {}).get("revision") or ""):
+            raise HTTPException(status_code=409, detail="label revision changed; reload samples")
         tasks = _read_json(root / "labels" / "tasks.json", [])
         task = next((item for item in tasks if item.get("id") == payload.task_id), None)
         if task is None or task.get("kind") != payload.kind:
             raise HTTPException(status_code=404, detail="label task not found")
+        roster = _read_json(root / "labels" / "roster.json", [])
+        roster_ids = {str(record.get("id")) for record in roster if record.get("id")}
+        values = _clean_label_values(payload.kind, payload.values, roster_ids)
         path = root / "labels" / "labels.json"
         labels = _read_json(path, {})
         labels[payload.task_id] = {"task_id": payload.task_id, "kind": payload.kind,
-                                   "values": payload.values, "updated_at": _now()}
+                                   "values": values, "updated_at": _now()}
         _atomic_write_json(path, labels)
-    return JSONResponse({"labels": labels, "saved": payload.task_id})
+    return JSONResponse({
+        "revision": payload.revision, "labels": labels, "saved": payload.task_id})
 
 
 @app.get("/api/jobs/{job_id}/labels/download")
-def download_labels(job_id: str) -> FileResponse:
+def download_labels(job_id: str) -> Response:
     with _LOCK:
-        job, root = _live_label_root_locked(job_id)
+        job, root = _label_root_locked(job_id, writable=False)
         labels_dir = root / "labels"
         path = labels_dir / "labels.json"
-        export = {"job_id": job_id, "filename": job.get("filename"),
+        result = job.get("result") or {}
+        stages = result.get("stages") or {}
+        feature_context = _read_json(labels_dir / "feature_context.json", None)
+        if not isinstance(feature_context, dict):
+            # Legacy revisions predate context snapshots. They remain exportable for
+            # audit, while stable-ID training rejects heuristic/absent joins for gating.
+            feature_context = {
+                "schema_version": "rally.serve_rule_context.v1",
+                "strike_times": result.get("strike_times", []),
+                "segments": result.get("segments", []),
+                "match_state": stages.get("match_state", {}),
+                "legacy_revision_context": True,
+            }
+        export = {"schema_version": "rally.web_labels.v2",
+                  "job_id": job_id, "filename": job.get("filename"),
                   "roster": _read_json(labels_dir / "roster.json", []),
                   "tasks": _read_json(labels_dir / "tasks.json", []),
-                  "labels": _read_json(path, {})}
-        export_path = labels_dir / "labels_export.json"
-        _atomic_write_json(export_path, export)
-    return FileResponse(export_path, media_type="application/json",
-                        filename=f"{Path(job['filename']).stem}_labels.json",
-                        content_disposition_type="attachment")
+                  "labels": _read_json(path, {}),
+                  # Offline training joins answers to the rule inputs measured for this
+                  # match. A trained artifact still needs the held-out deployment gate.
+                  "feature_context": feature_context}
+        payload = json.dumps(export, indent=2).encode("utf-8")
+        filename = f"{Path(job['filename']).stem}_labels.json"
+    return Response(
+        payload,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/jobs/{job_id}/assets/{asset_path:path}")
-def get_asset(job_id: str, asset_path: str) -> FileResponse:
-    root = _assets_dir(job_id).resolve()
+def get_asset(job_id: str, asset_path: str, revision: str | None = None) -> FileResponse:
+    with _LOCK:
+        job, label_root = _label_root_locked(job_id, writable=False)
+        current_revision = str((job.get("labeling") or {}).get("revision") or "")
+        if revision is not None and revision != current_revision:
+            raise HTTPException(status_code=409, detail="label revision changed; reload samples")
+        root = (label_root / "label_assets").resolve()
     path = (root / asset_path).resolve()
     try:
         path.relative_to(root)               # confine to the job's asset dir

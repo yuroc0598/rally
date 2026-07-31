@@ -37,8 +37,8 @@ supporting motion/geometry cues are never rescaled into certainty when audio is 
 
 ## Setup
 
-One command installs every headless-compatible runtime dependency **and** fetches the
-ball-tracking weights, so ball-arbiter mode works out of the box:
+One command installs every headless-compatible runtime dependency and prepares the
+TrackNet, YOLO12, and RTMPose checkpoints used by the accuracy-first pipeline:
 
 ```bash
 ./setup.sh
@@ -51,19 +51,33 @@ Python. That's all a fresh clone needs — then launch `python -m rally.web.app`
 <summary>What setup.sh does / manual steps</summary>
 
 ```bash
-pip install -r requirements.txt        # core + ball-arbiter + web, using headless OpenCV
-python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl
+python -m pip install -e ".[server]"   # core + TrackNet + YOLO/pose + web
+./setup.sh                             # download, extract, checksum, load/inference checks
 ```
 
-The TrackNet weights are **not in the repo** (large, externally hosted, and unlicensed —
-`*.pt` is gitignored). They download to `models/tracknet.pt`, which the pipeline
-auto-discovers; the fetch verifies the checkpoint loads into `BallTrackerNet` first. The repo
-still runs without them — ball-arbiter auto-falls-back to the audio-primary detector.
+The model binaries are **not in the repo**. Setup downloads YOLO12 through Ultralytics,
+downloads the official RTMPose SDK zip, extracts its `end2end.onnx` under the stable filename
+the pipeline discovers, and verifies a COCO-17 inference. It also downloads TrackNet to
+`models/tracknet.pt` and verifies that checkpoint loads into `BallTrackerNet`. Downloads and
+extraction are atomic and the default artifacts are SHA-256 pinned. If OpenMMLab is
+temporarily unreachable, leave the official zip in `models/` and re-run `./setup.sh`; the
+existing archive is verified and extracted without another download.
+
+The repo still runs when an external model host is unavailable: TrackNet falls back to the
+audio-primary detector and optional RTMPose evidence abstains. Setup reports each missing
+capability explicitly.
 
 The weights come from `yastrebksv/TrackNet`, which has **no license** — fine for
 personal/research use, but don't redistribute them (that's why they aren't committed or in a
 release). For a durable/shippable setup, host a properly-licensed model at the same
 architecture and set `WEIGHTS_DRIVE_ID` (or `--url`) accordingly.
+
+Any checkpoint merely found in `models/` has **unknown provenance and unknown license**;
+a filename or SHA-256 is identity evidence, not a license grant. Player/pose features use
+Ultralytics, whose software/models are offered under **AGPL-3.0 or an Enterprise License**.
+Review AGPL network/distribution obligations or obtain an enterprise license before a
+deployment that cannot comply. See [MODEL_PROVENANCE.md](MODEL_PROVENANCE.md) for the model
+inventory, limitations, and deployment checklist.
 </details>
 
 ## Usage
@@ -95,7 +109,10 @@ python -m rally.cli match.mp4 -o out.mp4        # ball tracking + auto court on 
 #   --no-ball-arbiter    force the faster audio-primary path (skip ball tracking)
 #   --ball-weights PATH  use a specific checkpoint (else auto-discovered from models/)
 #   --court-corners / --calibration  give the homography manually (takes precedence over auto)
+#   --court-weights PATH  optional learned keypoint court detector, with classical fallback
 #   --no-court-auto      disable auto court detection (if it locks onto the wrong lines)
+#   --player-detection-model / --player-pose-model  explicit YOLO / RTMPose checkpoints
+#   --serve-model PATH   guarded human-label-trained classifier (gate rechecked at load)
 ```
 
 ### Ball-arbiter mode (Phase-2, default)
@@ -158,8 +175,9 @@ What it does:
   min-rally, …). Processing runs in a background worker with **live progress**.
 - **Review** — the processed cut is the primary player and the original is lazy-loaded in
   a secondary tab. Double-click the left/right sides to move between points. A top-right
-  overlay shows approximate calibrated ball speed when
-  reliable court/trajectory evidence exists (otherwise it says unavailable). The
+  overlay shows an explicitly uncertain ground-plane ball-speed estimate and heuristic
+  error scale when reliable court/trajectory evidence exists (otherwise it says
+  unavailable). A single camera cannot recover ball height or full 3-D velocity. The
   **timeline** shows every detected rally band and ball-strike with a click-to-seek playhead.
 - **Correct & re-export** — an editable segment table lets you nudge start/end
   times, add, or drop rallies, then **re-cut** the output from your edits.
@@ -185,7 +203,19 @@ Labels autosave to the server (`←/→` to move, `Enter` to save & advance) and
 **Export labels** downloads a self-describing JSON bundle (roster + tasks +
 labels). The server setup retains Ultralytics while pinning `cv2` to the headless OpenCV
 wheel, so player geometry, serve-setup validation, and crops work without GUI libraries.
-`RALLY_WEB_YOLO` may point at an existing weight file.
+Player detection defaults to `models/yolo12n.pt`; set `RALLY_YOLO_DETECTION_MODEL` to
+another Ultralytics model name or local weight file. Pose defaults to RTMLib: YOLO12 first
+selects target-court player boxes, then top-down RTMPose estimates COCO-17 joints inside
+each crop. This includes small far-side servers instead of limiting pose to the largest
+near-side player. RTMLib uses its balanced body model by default; place the extracted
+`rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.onnx` in `models/` for
+offline startup, or set `RALLY_PLAYER_POSE_MODEL` to another ONNX path/URL.
+`RALLY_PLAYER_POSE_BACKEND=yolo` retains the legacy Ultralytics-pose path, and the old
+`RALLY_YOLO_POSE_MODEL` variable automatically selects that compatibility backend.
+`RALLY_RTMPOSE_RUNTIME` selects `onnxruntime` (default) or `opencv`; RTMPose uses a CUDA
+execution provider when one is installed, otherwise its cropped inference runs on CPU.
+`RALLY_WEB_YOLO` remains a label-crop-only override and otherwise inherits the YOLO12
+detection model.
 
 Each job is a self-contained directory under the data dir (default `.rally_web/`,
 override with `--data-dir` or `RALLY_WEB_DATA`). The server automatically runs up to four
@@ -193,6 +223,11 @@ trims concurrently, sized from CPU capacity and currently free CUDA memory; set
 `RALLY_WEB_WORKERS` to override that choice. Video export needs `ffmpeg` on `PATH`; if a
 label/`drawtext` render isn't available it falls back to a plain cut, and the
 JSON analysis is always produced regardless.
+
+TrackNet inference selects a batch from currently free VRAM and runs up to two GPU streams
+per server process. Operators can override the measured defaults with
+`RALLY_BALL_BATCH_SIZE`, `RALLY_GPU_TRACK_SLOTS`, and
+`RALLY_HEATMAP_DECODE_WORKERS`; oversized values can exhaust VRAM or reduce throughput.
 
 The web regression checks can be run with `pytest tests/test_web.py`; they are not an
 accuracy benchmark.
@@ -223,6 +258,40 @@ one-second real-footage pre-roll around every detected point.
 All thresholds live in `rally/config.py` (`RallyConfig`). Notable knobs: analysis and
 player frame rates, audio strike band / sensitivity / SNR gate, channel weights,
 hysteresis thresholds, duration priors, padding, and re-encode vs stream-copy.
+
+## Offline serve-learning dataset
+
+The web label download now includes `serve_motion` answers plus the pose, stationary
+player/court, and TrackNet diagnostics that produced the corresponding rule decision.
+Build a dataset from **multiple independent matches** (a match id is a validation group):
+
+```bash
+python -m rally.tools.serve_dataset from-web \
+  --job match-a /video/a.mp4 /labels/a-labels.json \
+  --job match-b /video/b.mp4 /labels/b-labels.json \
+  --job match-c /video/c.mp4 /labels/c-labels.json \
+  --out serve-training.json
+
+pip install -e '.[training]'
+python -m rally.tools.serve_train serve-training.json --model-out serve-model.joblib
+```
+
+`LABELS_JSON` may be the downloaded labels export or a local revision's `labels.json`
+(with sibling `tasks.json`). Audio is decoded once per video; compatible exported
+diagnostics add pose coverage/overhead, baseline stability/court filtering, and ball
+coverage/flight features with explicit availability fields.
+
+Validation is leave-one-match-out—samples from one match are never randomly divided
+between train and validation. Duplicate video/export content is rejected across match IDs,
+and live deployment additionally requires stable observation/group IDs rather than legacy
+nearest-time joins. Every artifact records the model and current-rule metrics,
+dataset fingerprint, feature schema, fold groups, and a conservative gate requiring at
+least three matches/30 labels and a real held-out improvement over the rules. The live
+pipeline never discovers an artifact implicitly. To activate a passing artifact, use
+`--serve-model serve-model.joblib` or `RALLY_SERVE_MODEL`; runtime revalidates the exact
+schema, coverage, accuracy, rule-improvement, and precision gate before loading it.
+Joblib is executable pickle data, so only load an artifact produced by this workflow from
+a trusted local source; the statistical gate is not a malware sandbox.
 
 ## Regression checks and independent evaluation
 

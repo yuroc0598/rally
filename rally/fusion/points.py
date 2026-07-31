@@ -11,7 +11,7 @@ Pure numpy in, numbers out: unit-testable without a video.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -43,20 +43,24 @@ def serve_anchor(first_strike: float, onsets: np.ndarray, serve_window_s: float,
     return s
 
 
+def effective_strike_times(cluster: Sequence[float], echo_s: float) -> List[float]:
+    """Return distinct contact times; a gap exactly at ``echo_s`` is still one echo."""
+    ordered = sorted(float(value) for value in cluster)
+    if not ordered:
+        return []
+    kept = [ordered[0]]
+    for value in ordered[1:]:
+        if value - kept[-1] > echo_s:
+            kept.append(value)
+    return kept
+
+
 def effective_strikes(cluster: List[float], echo_s: float) -> int:
     """Strike count after folding echo/bounce transients (within echo_s of a counted hit)
     into one. ``last`` advances only when a new distinct hit is counted, so a chain of
     close transients (e.g. [0, 0.2, 0.4, 0.6] with echo_s=0.35) collapses relative to the
     last *counted* strike (-> 2), not merely the previous transient (which would give 1)."""
-    if not cluster:
-        return 0
-    cnt = 1
-    last = cluster[0]
-    for t in cluster[1:]:
-        if t - last > echo_s:
-            cnt += 1
-            last = t
-    return cnt
+    return len(effective_strike_times(cluster, echo_s))
 
 
 def is_coherent_rally(cluster: List[float], min_strikes: int, min_dur_s: float,

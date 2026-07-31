@@ -26,6 +26,8 @@ or tampered file fails loudly instead of silently producing garbage tracks.
 LICENSE NOTE: the ``yastrebksv/TrackNet`` repo has no LICENSE file ("unofficial
 implementation"), so the weights are not confirmed free-to-use — fine for personal/research
 experimentation, but get clearance before redistributing or shipping them in a product.
+The Drive ID and SHA-256 identify bytes only; they do not establish authorship, training-data
+provenance, or a licence grant. See ``MODEL_PROVENANCE.md``.
 """
 
 from __future__ import annotations

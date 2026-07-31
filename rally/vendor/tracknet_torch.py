@@ -6,6 +6,10 @@ connections are all fixed by the pretrained checkpoint (models/tracknet_yastrebk
 Changing any of them renames state-dict keys or invalidates the learned BN statistics, so
 load_state_dict fails or the outputs become garbage. The matching inference/decoder lives
 in rally/signals/ball.py (argmax + threshold 127 + HoughCircles) — also unmodified.
+
+Architecture compatibility is not provenance or a licence grant. The locally discovered
+checkpoint's authorship, training-data provenance, and licence are unknown unless an
+operator establishes them independently; see MODEL_PROVENANCE.md.
 """
 
 import torch.nn as nn

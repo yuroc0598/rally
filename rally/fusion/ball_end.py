@@ -12,6 +12,7 @@ from typing import Callable, List, Optional, Tuple
 
 from ..signals.ball import load_ball_model, track_tracknet
 from ..signals.ballrules import bounces_in_court, point_end_events, refine_end_from_events
+from .intervals import trim_previous_on_overlap
 
 Segment = Tuple[float, float]
 
@@ -29,6 +30,8 @@ def refine_ends_with_ball(
     double_bounce_window_s: float = 2.5,
     margin_m: float = 0.35,
     inference_batch_size: Optional[int] = None,
+    tracking_fps: Optional[float] = 30.0,
+    half_precision: bool = True,
     progress: Callable[[str], None] = lambda _m: None,
     cancel_check: Callable[[], None] = lambda: None,
 ) -> List[Segment]:
@@ -41,7 +44,10 @@ def refine_ends_with_ball(
         cancel_check()
         bt = track_tracknet(
             video, model=model, start_s=s, end_s=e + max_extend_s,
-            batch_size=inference_batch_size, cancel_check=cancel_check)
+            batch_size=inference_batch_size, tracking_fps=tracking_fps,
+            half_precision=half_precision,
+            court=court,
+            cancel_check=cancel_check)
         bounces = bounces_in_court(bt.t, bt.x, bt.y, court, prominence_px=bounce_prominence_px)
         events = point_end_events(bounces, double_bounce_window_s=double_bounce_window_s,
                                   margin_m=margin_m)
@@ -51,19 +57,4 @@ def refine_ends_with_ball(
             n_trimmed += 1
         out.append((s, max(new_e, s + min_rally_s)))
     progress(f"  ball point-end refined {n_trimmed}/{len(segments)} rally ends")
-    # keep sorted & non-overlapping. On overlap, preserve THIS segment's start (it may hold
-    # a serve toss captured upstream) by trimming the previous segment's extended end back,
-    # rather than shoving this start forward.
-    out.sort()
-    clean: List[Segment] = []
-    for s, e in out:
-        if clean:
-            ps, pe = clean[-1]
-            if s < pe:
-                if s > ps:
-                    clean[-1] = (ps, s)   # trim previous end to this start
-                else:
-                    clean.pop()           # this segment subsumes the previous one
-        if e > s:
-            clean.append((s, e))
-    return clean
+    return trim_previous_on_overlap(out)

@@ -1,9 +1,7 @@
-"""Web UI for the rally trimmer.
+"""Web UI and persistent job service for the rally trimmer.
 
-A thin, self-contained FastAPI layer over :func:`rally.pipeline.trim`. The core
-``rally`` package is used unchanged and treated as a black box — this subpackage
-adds upload/gallery/job management, live progress, side-by-side review, an
-editable segment list, and re-export.
+The subpackage composes the core pipeline with upload/gallery/job management, live
+progress, review, human labeling, editable segments, and re-export.
 
 Run it with::
 

@@ -58,6 +58,16 @@ def test_web_worker_count_honours_and_validates_override(monkeypatch):
     monkeypatch.setenv("RALLY_WEB_WORKERS", "0")
     with pytest.raises(RuntimeError, match="must be positive"):
         webapp._web_worker_count()
+
+
+def test_web_label_detector_defaults_to_yolo12_and_honours_overrides(monkeypatch):
+    monkeypatch.delenv("RALLY_WEB_YOLO", raising=False)
+    monkeypatch.delenv("RALLY_YOLO_DETECTION_MODEL", raising=False)
+    assert webapp._web_yolo_model_name() == "yolo12n.pt"
+    monkeypatch.setenv("RALLY_YOLO_DETECTION_MODEL", "shared.pt")
+    assert webapp._web_yolo_model_name() == "shared.pt"
+    monkeypatch.setenv("RALLY_WEB_YOLO", "labels.pt")
+    assert webapp._web_yolo_model_name() == "labels.pt"
     monkeypatch.setenv("RALLY_WEB_WORKERS", "many")
     with pytest.raises(RuntimeError, match="must be an integer"):
         webapp._web_worker_count()
@@ -74,6 +84,45 @@ def test_upload_ui_requires_selection_and_supports_concurrent_files():
     assert '$("#uploadButton").disabled = true' not in script
 
 
+def test_golden_ui_is_separate_from_uploaded_jobs():
+    html = (webapp.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    script = (webapp.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="goldenButton"' in html
+    assert 'id="goldenView"' in html
+    assert 'api("/api/golden")' in script
+    assert "These are pipeline evaluation runs, not uploaded jobs" in html
+
+
+def test_golden_api_lists_only_root_labeled_pairs(monkeypatch, tmp_path):
+    golden = tmp_path / "golden"
+    results = tmp_path / "results"
+    golden.mkdir()
+    (golden / "input_1.mp4").write_bytes(b"input")
+    (golden / "res_1.txt").write_text("Point 1: 1-2\n", encoding="utf-8")
+    (golden / "input_without_label.mp4").write_bytes(b"ignored")
+    nested = golden / "unlabeled"
+    nested.mkdir()
+    (nested / "input_2.mp4").write_bytes(b"ignored")
+    (nested / "res_2.txt").write_text("Point 1: 3-4\n", encoding="utf-8")
+    result = results / "input_1"
+    result.mkdir(parents=True)
+    (result / "rallies.json").write_text(
+        json.dumps({"n_rallies": 1, "total_seconds": 3.0}), encoding="utf-8")
+    (result / "rallies.mp4").write_bytes(b"output")
+    monkeypatch.setattr(webapp, "GOLDEN_DIR", golden)
+    monkeypatch.setattr(webapp, "GOLDEN_RESULTS_DIR", results)
+
+    client = TestClient(webapp.app)
+    body = client.get("/api/golden").json()
+    assert body["total"] == 1
+    assert body["datasets"][0]["id"] == "input_1"
+    assert body["datasets"][0]["expected_points"] == 1
+    assert body["datasets"][0]["predicted_points"] == 1
+    assert client.get("/api/golden/input_1/media/input").content == b"input"
+    assert client.get("/api/golden/input_1/media/output").content == b"output"
+    assert client.get("/api/golden/input_2/media/input").status_code == 404
+
+
 def test_marking_labels_stale_preserves_saved_revision():
     job = {
         "labeling": {
@@ -85,6 +134,29 @@ def test_marking_labels_stale_preserves_saved_revision():
     assert job["labeling"]["status"] == "stale"
     assert job["labeling"]["revision"] == "saved-revision"
     assert job["labeling"]["counts"] == {"serve_motion": 9}
+
+
+def test_stale_label_revision_is_exportable_but_read_only(monkeypatch, tmp_path):
+    job_id = str(uuid.uuid4())
+    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
+    root = webapp._job_dir(job_id) / "label_revisions" / "rev-1" / "labels"
+    root.mkdir(parents=True)
+    webapp._atomic_write_json(root / "tasks.json", [])
+    webapp._atomic_write_json(root / "roster.json", [{"id": "P1", "name": "Player"}])
+    webapp._atomic_write_json(root / "labels.json", {})
+    webapp._atomic_write_json(webapp._job_meta_path(job_id), {
+        "id": job_id, "filename": "match.mp4", "status": "complete",
+        "labeling": {"status": "stale", "revision": "rev-1"},
+        "result": {"segments": [], "strike_times": [], "stages": {}},
+    })
+    client = TestClient(webapp.app)
+
+    assert client.get(f"/api/jobs/{job_id}/labels/download").status_code == 200
+    assert client.get(f"/api/jobs/{job_id}/label-tasks").status_code == 200
+    assert client.post(f"/api/jobs/{job_id}/roster", json={
+        "revision": "rev-1",
+        "roster": [{"id": "P1", "name": "Changed"}],
+    }).status_code == 409
 
 
 def test_config_from_options_maps_flags_and_numbers():
@@ -159,7 +231,7 @@ def test_capabilities_reports_ball_arbiter_availability(monkeypatch):
     monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
     caps2 = client.get("/api/capabilities").json()
     assert caps2["ball_arbiter"]["available"] is True
-    assert caps2["ball_arbiter"]["weights_path"] == "models/tracknet.pt"
+    assert "weights_path" not in caps2["ball_arbiter"]
 
 
 def test_upload_route_rejects_fake_video_bytes(monkeypatch, tmp_path):
@@ -180,6 +252,11 @@ def test_stage_for_message_recognises_pipeline_lines():
     assert webapp._stage_for_message("rendering 12 points -> out.mp4")["stage"] == "rendering"
     assert webapp._stage_for_message("processing failed: boom")["percent"] == 100
     assert webapp._stage_for_message("  123 strikes detected")["stage"] == "audio"
+    assert webapp._stage_for_message(
+        "ball tracking progress 50% (100/200s, batch 16)")["percent"] == 64
+    assert webapp._stage_for_message("match pose progress 5/10")["percent"] == 79
+    assert webapp._stage_for_message(
+        "serve validation progress 10/10 (10 reused TrackNet window(s))")["percent"] == 88
     assert webapp._stage_for_message("something unknown")["stage"] == "running"
 
 
@@ -359,9 +436,33 @@ def test_overlapping_segment_edit_renders_union_once(monkeypatch, tmp_path):
     assert response.json()["processing"]["stage"] == "complete"
     assert response.json()["result"]["input"] == "match.mp4"
     assert response.json()["result"]["output"] == "match_rallies.mp4"
-    assert webapp._read_json(job_dir / "output" / "rallies.json", {})["output"] == \
+    published = webapp._load_job(job_id)
+    assert webapp._read_json(Path(published["json_path"]), {})["output"] == \
         "match_rallies.mp4"
-    assert (job_dir / "output" / "rallies.mp4").exists()
+    assert Path(published["output_path"]).exists()
+
+
+def test_failed_segment_edit_retains_previous_published_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
+    job_id, job_dir, job = _write_job(tmp_path)
+    output = job_dir / "output" / "rallies.mp4"
+    metadata = job_dir / "output" / "rallies.json"
+    output.parent.mkdir()
+    output.write_bytes(b"known-good")
+    webapp._atomic_write_json(metadata, job["result"])
+    job.update(output_path=str(output), json_path=str(metadata))
+    webapp._atomic_write_json(job_dir / "job.json", job)
+    monkeypatch.setattr(webapp, "probe", lambda _path: SimpleNamespace(height=720))
+    monkeypatch.setattr(webapp, "_render_output", lambda *_args, **_kwargs: False)
+
+    response = TestClient(webapp.app, raise_server_exceptions=False).post(
+        f"/api/jobs/{job_id}/segments", json={"segments": [[1.0, 2.0]]})
+
+    assert response.status_code == 500
+    retained = webapp._load_job(job_id)
+    assert retained["output_path"] == str(output)
+    assert retained["json_path"] == str(metadata)
+    assert output.read_bytes() == b"known-good"
 
 
 def test_web_sidecar_removes_absolute_host_paths():
@@ -394,6 +495,12 @@ def test_web_sidecar_exposes_point_aware_output_layout_and_speed():
             ],
             "stages": {"ball_arbiter": {"verification": {"candidates": [{
                 "output": [2.0, 4.0], "peak_ball_speed_kmh": 123.4,
+                "ball_speed_estimate": {
+                    "value_kmh": 123.4, "uncertainty_kmh": 42.0,
+                    "uncertain": True,
+                    "method": "single_camera_ground_plane_p95",
+                    "limitations": ["ball height is not recovered"],
+                },
             }]}}},
         },
         output_ready=True,
@@ -404,12 +511,19 @@ def test_web_sidecar_exposes_point_aware_output_layout_and_speed():
             "detected_start": 2.0, "detected_end": 4.0,
             "output_start": 0.0, "output_end": 4.0,
             "peak_ball_speed_kmh": 123.4,
+            "ball_speed_estimate": {
+                "value_kmh": 123.4, "uncertainty_kmh": 42.0,
+                "uncertain": True,
+                "method": "single_camera_ground_plane_p95",
+                "limitations": ["ball height is not recovered"],
+            },
         },
         {
             "index": 1, "source_start": 7.0, "source_end": 11.0,
             "detected_start": 8.0, "detected_end": 10.0,
             "output_start": 4.0, "output_end": 8.0,
             "peak_ball_speed_kmh": None,
+            "ball_speed_estimate": None,
         },
     ]
 
@@ -441,6 +555,7 @@ def test_legacy_api_and_metadata_download_are_sanitized(monkeypatch, tmp_path):
     assert downloaded["input"] == "match.mp4"
     assert downloaded["output"] == "match_rallies.mp4"
     assert downloaded["config"]["ball_weights"] == "tracknet.pt"
+    assert webapp._read_json(metadata, None) == legacy
 
 
 def test_rerun_with_no_segments_clears_previous_video(monkeypatch, tmp_path):
@@ -500,8 +615,19 @@ def test_startup_recovers_queue_and_marks_interrupted_retryable(monkeypatch, tmp
     monkeypatch.setattr(webapp, "_UPLOAD_RESERVED_BYTES", {})
     monkeypatch.setattr(webapp, "_RECOVERED_DATA_DIRS", set())
     queued_id, _queued_dir, _ = _write_job(tmp_path, status="queued")
-    running_id, _running_dir, _ = _write_job(tmp_path, status="running")
+    running_id, running_dir, running_job = _write_job(tmp_path, status="running")
+    retained_output = running_dir / "output" / "rallies.mp4"
+    retained_json = running_dir / "output" / "rallies.json"
+    retained_output.parent.mkdir()
+    retained_output.write_bytes(b"previous-video")
+    retained_json.write_text("{}")
+    running_job.update(
+        output_path=str(retained_output), json_path=str(retained_json), result={"segments": []})
+    webapp._atomic_write_json(running_dir / "job.json", running_job)
     live_id, _live_dir, _ = _write_job(tmp_path, status="running")
+    labeling_id, labeling_dir, labeling_job = _write_job(tmp_path, status="complete")
+    labeling_job["labeling"] = {"status": "generating", "detail": "Queued"}
+    webapp._atomic_write_json(labeling_dir / "job.json", labeling_job)
     webapp._ACTIVE.add(live_id)
 
     class RecordingExecutor:
@@ -528,7 +654,13 @@ def test_startup_recovers_queue_and_marks_interrupted_retryable(monkeypatch, tmp
     assert interrupted["status"] == "failed"
     assert interrupted["retryable"] is True
     assert interrupted["processing"]["stage"] == "failed"
+    assert interrupted["output_path"] == str(retained_output)
+    assert interrupted["json_path"] == str(retained_json)
+    assert "retained" in interrupted["processing"]["label"].lower()
     assert webapp._load_job(live_id)["status"] == "running"
+    labeling = webapp._load_job(labeling_id)["labeling"]
+    assert labeling["status"] == "failed"
+    assert "server restart" in labeling["error"]
 
 
 def test_duplicate_process_submissions_enqueue_only_once(monkeypatch, tmp_path):
@@ -585,6 +717,42 @@ def test_cancel_queued_job_removes_it_before_worker_start(monkeypatch, tmp_path)
     assert job_id not in webapp._SUBMITTED
 
 
+def test_cancelled_rerun_retains_last_successful_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(webapp, "_ACTIVE", set())
+    monkeypatch.setattr(webapp, "_SUBMITTED", set())
+    monkeypatch.setattr(webapp, "_CANCEL_EVENTS", {})
+    monkeypatch.setattr(webapp, "_JOB_FUTURES", {})
+    job_id, job_dir, job = _write_job(tmp_path, status="complete")
+    output = job_dir / "output" / "rallies.mp4"
+    metadata = job_dir / "output" / "rallies.json"
+    output.parent.mkdir()
+    output.write_bytes(b"last-good-video")
+    result = {"segments": [{"start": 1.0, "end": 2.0}], "n_rallies": 1}
+    webapp._atomic_write_json(metadata, result)
+    job.update(output_path=str(output), json_path=str(metadata), result=result)
+    webapp._atomic_write_json(job_dir / "job.json", job)
+
+    class PendingExecutor:
+        def __init__(self):
+            self.future = Future()
+
+        def submit(self, *_args):
+            return self.future
+
+    executor = PendingExecutor()
+    monkeypatch.setattr(webapp, "_EXECUTOR", executor)
+    client = TestClient(webapp.app)
+    assert client.post(f"/api/jobs/{job_id}/process").status_code == 200
+
+    response = client.post(f"/api/jobs/{job_id}/cancel")
+
+    saved = response.json()
+    assert saved["status"] == "complete"
+    assert saved["result"]["n_rallies"] == 1
+    assert output.read_bytes() == b"last-good-video"
+
+
 def test_cancel_running_job_stops_cooperatively_and_cleans_state(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
     monkeypatch.setattr(webapp, "_ACTIVE", set())
@@ -614,7 +782,7 @@ def test_cancel_running_job_stops_cooperatively_and_cleans_state(monkeypatch, tm
         deadline = time.time() + 2
         while time.time() < deadline:
             job = client.get(f"/api/jobs/{job_id}").json()
-            if job["status"] == "cancelled":
+            if job["status"] == "cancelled" and job_id not in webapp._ACTIVE:
                 break
             time.sleep(0.02)
         assert job["status"] == "cancelled"
@@ -866,6 +1034,7 @@ def test_labeling_generation_and_endpoints(scratch, monkeypatch):
 
     client = TestClient(webapp.app)
     data = client.get(f"/api/jobs/{job_id}/label-tasks").json()
+    revision = data["revision"]
     assert [r["id"] for r in data["roster"]] == ["P1", "P2"]     # auto -> singles
     players = [t for t in data["tasks"] if t["kind"] == "player_identity"]
     serves = [t for t in data["tasks"] if t["kind"] == "serve_motion"]
@@ -882,20 +1051,39 @@ def test_labeling_generation_and_endpoints(scratch, monkeypatch):
 
     # save a player label + rename roster
     assert client.post(f"/api/jobs/{job_id}/labels", json={
+        "revision": revision,
         "task_id": players[0]["id"], "kind": "player_identity",
         "values": {"player": "P1", "quality": "clear"}}).status_code == 200
     assert client.post(f"/api/jobs/{job_id}/labels", json={
+        "revision": revision,
         "task_id": serves[0]["id"], "kind": "serve_motion",
         "values": {"is_serve": "yes", "server": "P1", "side": "deuce", "end": "near"}}).status_code == 200
     ros = client.post(f"/api/jobs/{job_id}/roster",
-                      json={"roster": [{"id": "P1", "name": "Alice"}, {"id": "P2", "name": "Bob"}]}).json()
+                      json={"revision": revision, "roster": [{"id": "P1", "name": "Alice"}, {"id": "P2", "name": "Bob"}]}).json()
     assert ros["roster"][0]["name"] == "Alice"
+    assert client.post(f"/api/jobs/{job_id}/roster", json={
+        "revision": revision,
+        "roster": [{"id": "x\" onmouseover=alert(1)", "name": "bad"}],
+    }).status_code == 422
+    assert client.post(f"/api/jobs/{job_id}/labels", json={
+        "revision": revision,
+        "task_id": serves[0]["id"], "kind": "serve_motion",
+        "values": {"is_serve": "definitely"},
+    }).status_code == 422
 
     # export bundles roster + tasks + labels
     exp = json.loads(client.get(f"/api/jobs/{job_id}/labels/download").content)
+    assert exp["schema_version"] == "rally.web_labels.v2"
     assert exp["labels"][players[0]["id"]]["values"]["player"] == "P1"
     assert exp["labels"][serves[0]["id"]]["values"]["is_serve"] == "yes"
     assert any(r["name"] == "Alice" for r in exp["roster"])
+    assert exp["feature_context"] == {
+        "schema_version": "rally.serve_rule_context.v1",
+        "strike_times": [],
+        "segments": [{"index": 0, "start": 12.0, "end": 20.0},
+                     {"index": 1, "start": 32.0, "end": 38.0}],
+        "match_state": {},
+    }
 
 
 def test_label_kind_validation(scratch):
