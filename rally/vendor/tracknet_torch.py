@@ -9,7 +9,7 @@ in rally/signals/ball.py (argmax + threshold 127 + HoughCircles) — also unmodi
 
 Architecture compatibility is not provenance or a licence grant. The locally discovered
 checkpoint's authorship, training-data provenance, and licence are unknown unless an
-operator establishes them independently; see MODEL_PROVENANCE.md.
+operator establishes them independently.
 """
 
 import torch.nn as nn

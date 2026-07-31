@@ -30,9 +30,11 @@ samples/*
 !samples/README.md
 
 # internal AI review / audit notes (not part of the deliverable)
+feedback.codex
 feedback.claude
 feedback.muse
 feedback.performance
+MODEL_PROVENANCE.md
 
 # Local Claude Code session/agent state
 .claude/

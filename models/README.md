@@ -18,6 +18,8 @@ The default setup verifies and places these files here:
 - `rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.onnx` — `end2end.onnx` extracted from that archive.
 
 `setup.sh` checksum-verifies the default artifacts and runs model load/inference checks.
-See [`MODEL_PROVENANCE.md`](../MODEL_PROVENANCE.md) before redistributing or deploying any
-checkpoint. Custom paths can be supplied through the model-related environment variables
-documented at the top of `setup.sh`.
+Treat any checkpoint without independent records as **provenance unknown, training-data
+provenance unknown, and license unknown**. A matching filename or SHA-256 digest identifies
+bytes; it is not a license grant. Before redistribution or deployment, record the exact
+source and verify current upstream terms. Custom paths can be supplied through the
+model-related environment variables documented at the top of `setup.sh`.

@@ -76,8 +76,8 @@ Any checkpoint merely found in `models/` has **unknown provenance and unknown li
 a filename or SHA-256 is identity evidence, not a license grant. Player/pose features use
 Ultralytics, whose software/models are offered under **AGPL-3.0 or an Enterprise License**.
 Review AGPL network/distribution obligations or obtain an enterprise license before a
-deployment that cannot comply. See [MODEL_PROVENANCE.md](MODEL_PROVENANCE.md) for the model
-inventory, limitations, and deployment checklist.
+deployment that cannot comply. Keep a private deployment inventory recording each model's
+exact source, digest, authorship, training-data provenance, and applicable license.
 </details>
 
 ## Usage
