@@ -17,7 +17,10 @@ The output is a :class:`BallTrack` (time, x, y image px, visibility). Feed it to
 from __future__ import annotations
 
 import os
+import queue
 import threading
+import time
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -48,6 +51,8 @@ _HEATMAP_DECODE_WORKERS = _positive_env_int(
     "RALLY_HEATMAP_DECODE_WORKERS", min(4, max(1, os.cpu_count() or 1)))
 _HEATMAP_EXECUTOR = ThreadPoolExecutor(
     max_workers=_HEATMAP_DECODE_WORKERS, thread_name_prefix="tracknet-heatmap")
+_BALL_MODEL_LOCK = threading.Lock()
+_BALL_MODEL_CACHE: dict[tuple, object] = {}
 
 
 def resolve_ball_batch_size(device, requested: Optional[int] = None, *, torch_module=None) -> int:
@@ -331,6 +336,28 @@ def load_ball_model(weights_path: str, device=None):
     return model
 
 
+def get_cached_ball_model(
+    weights_path: str, device=None, *, half_precision: bool = True,
+):
+    """Reuse one immutable eval-mode TrackNet per checkpoint/device/precision."""
+    import torch
+    from pathlib import Path
+
+    path = Path(weights_path).expanduser().resolve()
+    stat = path.stat()
+    dev = resolve_device(torch) if device is None else torch.device(device)
+    use_half = bool(half_precision and dev.type == "cuda")
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), str(dev), use_half)
+    with _BALL_MODEL_LOCK:
+        model = _BALL_MODEL_CACHE.get(key)
+        if model is None:
+            model = load_ball_model(str(path), device=dev)
+            if use_half:
+                model.half()
+            _BALL_MODEL_CACHE[key] = model
+        return model
+
+
 def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None,
                    start_s: float = 0.0, end_s: Optional[float] = None,
                    width: int = 640, height: int = 360, speed_limit_px: float = 200.0,
@@ -341,6 +368,7 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
                    court_sideline_margin_m: float = 1.0,
                    court_baseline_margin_m: float = 3.0,
                    progress_callback: Callable[[int, int, int], None] | None = None,
+                   metrics: Optional[dict] = None,
                    cancel_check: Callable[[], None] = lambda: None) -> BallTrack:
     """Ball positions per frame via the 3-frame PyTorch TrackNet (BallTrackerNet).
 
@@ -353,7 +381,10 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
     import torch
 
     if model is None:
-        model = load_ball_model(weights_path)
+        if not weights_path:
+            raise ValueError("TrackNet weights_path or model is required")
+        model = get_cached_ball_model(
+            weights_path, half_precision=half_precision)
     # Run inputs on whatever device the model lives on (GPU when available).  CNN outputs
     # are batched, while heatmap/data-association decoding remains strictly chronological.
     device = next(model.parameters()).device
@@ -361,6 +392,14 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
         model.half()
     model_dtype = next(model.parameters()).dtype
     batch_size = resolve_ball_batch_size(device, batch_size, torch_module=torch)
+
+    wall_started = time.perf_counter()
+    perf = Counter()
+    batch_histogram: Counter[int] = Counter()
+    pipeline_enabled = os.environ.get(
+        "RALLY_TRACKNET_PIPELINE", "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
 
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -379,9 +418,11 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
     )
     total_frames = max(0, (last_f - start_f) // sample_stride + 1)
     scale_x = scale_y = None
-    buf, ts, xs, ys = [], [], [], []
+    ts, xs, ys = [], [], []
     pending_inputs = []
     pending_indices: list[int] = []
+    pending_heatmaps = deque()
+    pinned_input = None
     prev = None
     misses = 0
     pending_reacq = None
@@ -440,66 +481,219 @@ def track_tracknet(video: str, weights_path: Optional[str] = None, *, model=None
         else:
             misses += 1
 
+    def decode_heatmap_batch() -> None:
+        if not pending_heatmaps:
+            return
+        frame_maps, output_indices, futures = pending_heatmaps.popleft()
+        wait_started = time.perf_counter()
+        timed_candidates = [future.result() for future in futures]
+        perf["heatmap_wait_seconds"] += time.perf_counter() - wait_started
+        perf["heatmap_seconds"] += sum(seconds for _candidates, seconds in timed_candidates)
+        association_started = time.perf_counter()
+        for output_index, fm, (candidates, _seconds) in zip(
+                output_indices, frame_maps, timed_candidates):
+            decode_map(fm, output_index, candidates)
+        perf["association_seconds"] += time.perf_counter() - association_started
+
+    def timed_heatmap_candidates(frame_map):
+        started = time.perf_counter()
+        result = _heatmap_candidates(frame_map)
+        return result, time.perf_counter() - started
+
     def flush_batch() -> None:
+        nonlocal pinned_input
         if not pending_inputs:
             return
         cancel_check()
-        inp = torch.stack(pending_inputs, dim=0)
+        stack_started = time.perf_counter()
         if device.type == "cuda":
-            inp = inp.pin_memory()
-        inp = inp.to(device=device, dtype=model_dtype, non_blocking=True)
+            shape = (batch_size, *pending_inputs[0].shape)
+            if pinned_input is None or tuple(pinned_input.shape) != shape:
+                pinned_input = torch.empty(
+                    shape, dtype=pending_inputs[0].dtype, pin_memory=True)
+            inp = pinned_input[:len(pending_inputs)]
+            torch.stack(pending_inputs, dim=0, out=inp)
+        else:
+            inp = torch.stack(pending_inputs, dim=0)
+        perf["stack_pin_seconds"] += time.perf_counter() - stack_started
+        h2d_started = time.perf_counter()
+        # Keep decoded frames as uint8 through the CPU queue and PCIe transfer.  The old
+        # path expanded every sample to float32 before pinning, which quadrupled queue and
+        # transfer traffic.  Normalize in float32 on the inference device so values round
+        # the same way before the optional float16 cast used by TrackNet.
+        inp = inp.to(device=device, non_blocking=True)
+        inp = inp.to(dtype=torch.float32).div_(255.0)
+        if model_dtype != torch.float32:
+            inp = inp.to(dtype=model_dtype)
+        perf["h2d_submit_seconds"] += time.perf_counter() - h2d_started
+        inference_started = time.perf_counter()
         maps = model(inp).argmax(dim=1).cpu().numpy()
+        perf["inference_d2h_seconds"] += time.perf_counter() - inference_started
+        perf["inferred_frames"] += len(pending_inputs)
+        batch_histogram[len(pending_inputs)] += 1
         cancel_check()
         frame_maps = [fm.reshape((height, width)) for fm in maps]
-        candidate_sets = list(_HEATMAP_EXECUTOR.map(_heatmap_candidates, frame_maps))
-        for output_index, fm, candidates in zip(
-                pending_indices, frame_maps, candidate_sets):
-            decode_map(fm, output_index, candidates)
+        futures = [
+            _HEATMAP_EXECUTOR.submit(timed_heatmap_candidates, frame_map)
+            for frame_map in frame_maps
+        ]
+        pending_heatmaps.append((frame_maps, list(pending_indices), futures))
         pending_inputs.clear()
         pending_indices.clear()
+        # Keep at most one completed/in-flight heatmap batch behind GPU inference. This
+        # overlaps CPU Hough extraction for N with inference for N+1 while preserving
+        # strictly chronological association when the oldest batch is drained.
+        if not pipeline_enabled or len(pending_heatmaps) >= 2:
+            decode_heatmap_batch()
         report_progress()
+
+    def accept_sample(sample_time: float, tensor, frame_width: int, frame_height: int) -> None:
+        nonlocal scale_x, scale_y, misses
+        if scale_x is None:
+            scale_x, scale_y = frame_width / width, frame_height / height
+        ts.append(sample_time)
+        xs.append(np.nan)
+        ys.append(np.nan)
+        perf["sampled_frames"] += 1
+        if tensor is None:
+            misses += 1
+            return
+        pending_inputs.append(tensor)
+        pending_indices.append(len(xs) - 1)
+        if len(pending_inputs) >= batch_size:
+            flush_batch()
+
+    def serial_decode() -> None:
+        nonlocal fi
+        buf = []
+        while True:
+            cancel_check()
+            if end_f is not None and fi > end_f:
+                break
+            decode_started = time.perf_counter()
+            ok = cap.grab()
+            perf["decode_seconds"] += time.perf_counter() - decode_started
+            if not ok:
+                break
+            frame_index = fi
+            fi += 1
+            perf["decoded_frames"] += 1
+            if (frame_index - start_f) % sample_stride:
+                continue
+            retrieve_started = time.perf_counter()
+            ok, fr = cap.retrieve()
+            perf["decode_seconds"] += time.perf_counter() - retrieve_started
+            if not ok:
+                break
+            preprocess_started = time.perf_counter()
+            buf.append(cv2.resize(fr, (width, height)))
+            if len(buf) > 3:
+                buf.pop(0)
+            tensor = None
+            if len(buf) == 3:
+                imgs = np.concatenate((buf[2], buf[1], buf[0]), axis=2)
+                tensor = torch.from_numpy(np.rollaxis(imgs, 2, 0))
+            perf["preprocess_seconds"] += time.perf_counter() - preprocess_started
+            accept_sample(frame_index / fps, tensor, fr.shape[1], fr.shape[0])
+
+    def pipelined_decode() -> None:
+        nonlocal fi
+        work_queue: queue.Queue = queue.Queue(maxsize=max(4, batch_size * 2))
+        sentinel = object()
+        stop = threading.Event()
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    work_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer() -> None:
+            local_fi = fi
+            buf = []
+            error = None
+            try:
+                while True:
+                    cancel_check()
+                    if end_f is not None and local_fi > end_f:
+                        break
+                    decode_started = time.perf_counter()
+                    ok = cap.grab()
+                    perf["decode_seconds"] += time.perf_counter() - decode_started
+                    if not ok:
+                        break
+                    frame_index = local_fi
+                    local_fi += 1
+                    perf["decoded_frames"] += 1
+                    if (frame_index - start_f) % sample_stride:
+                        continue
+                    retrieve_started = time.perf_counter()
+                    ok, fr = cap.retrieve()
+                    perf["decode_seconds"] += time.perf_counter() - retrieve_started
+                    if not ok:
+                        break
+                    preprocess_started = time.perf_counter()
+                    buf.append(cv2.resize(fr, (width, height)))
+                    if len(buf) > 3:
+                        buf.pop(0)
+                    tensor = None
+                    if len(buf) == 3:
+                        imgs = np.concatenate((buf[2], buf[1], buf[0]), axis=2)
+                        tensor = torch.from_numpy(np.rollaxis(imgs, 2, 0))
+                    perf["preprocess_seconds"] += time.perf_counter() - preprocess_started
+                    if not put((frame_index / fps, tensor, fr.shape[1], fr.shape[0])):
+                        return
+            except BaseException as exc:  # propagate to the inference owner
+                error = exc
+            finally:
+                put((sentinel, error, None, None))
+
+        producer_thread = threading.Thread(
+            target=producer, name="tracknet-decode", daemon=True)
+        producer_thread.start()
+        try:
+            while True:
+                queue_started = time.perf_counter()
+                item = work_queue.get()
+                perf["input_queue_wait_seconds"] += time.perf_counter() - queue_started
+                if item[0] is sentinel:
+                    if item[1] is not None:
+                        raise item[1]
+                    break
+                accept_sample(*item)
+        finally:
+            stop.set()
+            producer_thread.join(timeout=5.0)
+            if producer_thread.is_alive():
+                raise RuntimeError("TrackNet decode producer did not stop")
 
     slot = _GPU_TRACK_SEMAPHORE if device.type == "cuda" else nullcontext()
     try:
         with slot, torch.inference_mode():
             report_progress(force=True)
-            while True:
-                cancel_check()
-                if end_f is not None and fi > end_f:
-                    break
-                ok = cap.grab()
-                if not ok:
-                    break
-                frame_index = fi
-                fi += 1
-                if (frame_index - start_f) % sample_stride:
-                    continue
-                ok, fr = cap.retrieve()
-                if not ok:
-                    break
-                if scale_x is None:
-                    scale_x, scale_y = fr.shape[1] / width, fr.shape[0] / height
-                buf.append(cv2.resize(fr, (width, height)))
-                if len(buf) > 3:
-                    buf.pop(0)
-                ts.append(frame_index / fps)
-                xs.append(np.nan)
-                ys.append(np.nan)
-                if len(buf) == 3:
-                    imgs = np.concatenate(
-                        (buf[2], buf[1], buf[0]), axis=2,
-                    ).astype(np.float32) / 255.0
-                    pending_inputs.append(
-                        torch.from_numpy(np.rollaxis(imgs, 2, 0)).float())
-                    pending_indices.append(len(xs) - 1)
-                    if len(pending_inputs) >= batch_size:
-                        flush_batch()
-                else:
-                    misses += 1
+            if pipeline_enabled:
+                pipelined_decode()
+            else:
+                serial_decode()
             flush_batch()
+            while pending_heatmaps:
+                decode_heatmap_batch()
             report_progress(force=True)
     finally:
         cap.release()
+        perf["wall_seconds"] = time.perf_counter() - wall_started
+        perf["pipeline_enabled"] = int(pipeline_enabled)
+        if metrics is not None:
+            metrics.update({
+                key: (int(value) if key.endswith("_frames") else float(value))
+                for key, value in perf.items()
+            })
+            metrics["batch_histogram"] = {
+                str(size): int(count) for size, count in sorted(batch_histogram.items())
+            }
     return BallTrack(np.array(ts), np.array(xs), np.array(ys))
 
 

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -48,6 +50,18 @@ from .fusion.points import (
 Segment = Tuple[float, float]
 Progress = Callable[[str], None]
 CancelCheck = Callable[[], None]
+
+
+@contextmanager
+def _timed(ch: _Channels, name: str, progress: Progress):
+    """Record one wall-clock stage and emit a stable, machine-readable log line."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - started
+        ch.timings[name] = ch.timings.get(name, 0.0) + elapsed
+        progress(f"timing {name}: {elapsed:.3f}s")
 
 
 def _file_sha256(path: str) -> str:
@@ -1248,7 +1262,7 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
             observe_serve_setups,
             resolve_yolo_device,
         )
-        from .signals.pose import resolve_rtmpose_device
+        from .signals.pose import resolve_rtmpose_device, rtmpose_execution_providers
         from .signals.serve import observe_ball_serves
 
         progress("match-state validation: checking server pose near early impacts")
@@ -1256,21 +1270,24 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
         # Keep the typed streams separate so a visual twitch cannot increment an audio
         # contact count, self-corroborate its own alignment, or enter learned audio fields.
         probe_times = np.unique(np.r_[ch.onsets, usable_player_hints])
-        observations = observe_serve_setups(
-            input_path, segments, probe_times, cfg,
-            progress_callback=lambda done, total: progress(
-                f"match pose progress {done}/{total}"),
-            cancel_check=cancel_check,
-            court=ch.court)
+        with _timed(ch, "match_pose", progress):
+            observations = observe_serve_setups(
+                input_path, segments, probe_times, cfg,
+                progress_callback=lambda done, total: progress(
+                    f"match pose progress {done}/{total}"),
+                cancel_check=cancel_check,
+                court=ch.court,
+                detector=ch.detector)
         progress("match-state validation: checking stationary baseline player setup")
-        position_observations = observe_position_setups(
-            segments,
-            probe_times,
-            ch.player_samples,
-            cfg,
-            court=ch.court,
-            frame_size=ch.frame_size,
-        )
+        with _timed(ch, "match_position", progress):
+            position_observations = observe_position_setups(
+                segments,
+                probe_times,
+                ch.player_samples,
+                cfg,
+                court=ch.court,
+                frame_size=ch.frame_size,
+            )
         if len(position_observations) != len(observations):
             raise RuntimeError("position observations do not align with point candidates")
         enriched_observations = []
@@ -1310,12 +1327,13 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
                     f"serve validation progress {done}/{total} "
                     f"({cache_hits} reused TrackNet window(s))")
 
-            ball_observations = observe_ball_serves(
-                input_path, segments, probe_times, weights, cfg,
-                court=ch.court,
-                track_cache=ch.ball_track_cache,
-                progress_callback=serve_progress,
-                cancel_check=cancel_check)
+            with _timed(ch, "match_ball_serve", progress):
+                ball_observations = observe_ball_serves(
+                    input_path, segments, probe_times, weights, cfg,
+                    court=ch.court,
+                    track_cache=ch.ball_track_cache,
+                    progress_callback=serve_progress,
+                    cancel_check=cancel_check)
             if len(ball_observations) != len(observations):
                 raise RuntimeError("ball serve observations do not align with point candidates")
             observations = [
@@ -1335,20 +1353,21 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
         elif cfg.play_mode == "match" and not cfg.allow_degraded:
             raise RuntimeError(
                 "match mode requires TrackNet weights to confirm far-side serves")
-        protected = {
-            index for index, point in enumerate(segments)
-            if any(_point_fully_evaluated(point, region, ch.onsets)
-                   for region in ch.arbiter_accepted_regions)
-        }
-        from .fusion.serve_model import apply_eligible_serve_model
-        observations, learned_model_stage = apply_eligible_serve_model(
-            observations, ch.onsets, cfg)
-        before = len(segments)
-        segments, stage = validate_match_sequence(
-            segments, ch.onsets, observations, cfg,
-            protected_indices=protected,
-            contact_onsets=ch.onsets,
-        )
+        with _timed(ch, "match_sequence_decode", progress):
+            protected = {
+                index for index, point in enumerate(segments)
+                if any(_point_fully_evaluated(point, region, ch.onsets)
+                       for region in ch.arbiter_accepted_regions)
+            }
+            from .fusion.serve_model import apply_eligible_serve_model
+            observations, learned_model_stage = apply_eligible_serve_model(
+                observations, ch.onsets, cfg)
+            before = len(segments)
+            segments, stage = validate_match_sequence(
+                segments, ch.onsets, observations, cfg,
+                protected_indices=protected,
+                contact_onsets=ch.onsets,
+            )
         # A credible rally trajectory does not prove it started with a serve (warm-up and
         # cooperative feeds also rally). Keep this for diagnostics, never as a bypass.
         stage["trajectory_accepted_indices"] = sorted(protected)
@@ -1362,6 +1381,9 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
         )
         stage["pose_backend"] = cfg.player_pose_backend
         stage["pose_model"] = cfg.player_pose_model
+        stage["pose_execution_providers"] = (
+            rtmpose_execution_providers(cfg.rtmpose_runtime)
+            if cfg.player_pose_backend == "rtmlib" else [])
         stage["ball_inference_batch_size"] = cfg.ball_inference_batch_size
         stage["serve_track_cache_hits"] = (
             serve_cache_hits if weights else 0)
@@ -1431,13 +1453,16 @@ def trim(
     are fatal unless ``cfg.allow_degraded`` explicitly permits a partial result.
     """
     cfg = cfg or RallyConfig()
+    pipeline_started = time.perf_counter()
     if not os.path.isfile(input_path):
         raise FileNotFoundError(input_path)
     _validate_paths(input_path, output_path, json_path)
 
+    ch = _Channels()
     cancel_check()
     progress(f"probing {input_path}")
-    info = probe(input_path)
+    with _timed(ch, "probe", progress):
+        info = probe(input_path)
     duration = info.duration_s
     if duration <= 0:
         raise RuntimeError("could not determine video duration")
@@ -1447,13 +1472,14 @@ def trim(
              f"({cfg.analysis_fps} fps)")
 
     # ---- gather channels ----------------------------------------------------
-    ch = _Channels(frame_size=(int(info.width), int(info.height)))
+    ch.frame_size = (int(info.width), int(info.height))
     # Target-court geometry is a prerequisite for interpreting motion, people, and ball
     # trajectories in multi-court footage.  Resolve it before any visual analysis rather
     # than using whole-frame evidence to propose points and calibrating only afterward.
     if cfg.court_corners is not None or cfg.court_auto:
         progress("locating the target court")
-        ch.court = _resolve_court(input_path, cfg, progress)
+        with _timed(ch, "court_detection", progress):
+            ch.court = _resolve_court(input_path, cfg, progress)
         ch.stages["court"] = {
             "status": "used" if ch.court is not None else "unavailable",
             "source": "manual" if cfg.court_corners is not None else "automatic",
@@ -1463,17 +1489,21 @@ def trim(
                 "reason": "target court could not be detected",
             }),
         }
-    _audio_channel(input_path, info, timeline, cfg, ch, progress, cancel_check)
+    with _timed(ch, "audio", progress):
+        _audio_channel(input_path, info, timeline, cfg, ch, progress, cancel_check)
     cancel_check()
-    _visual_channels(input_path, cfg, timeline, detect_players, ch, progress, cancel_check)
+    with _timed(ch, "visual", progress):
+        _visual_channels(input_path, cfg, timeline, detect_players, ch, progress, cancel_check)
     cancel_check()
     if not ch.used:
         raise RuntimeError(
             "no usable channels (need at least an audio track or OpenCV) — cannot segment"
         )
-    _ball_channel(input_path, timeline, cfg, ch, progress, cancel_check)
+    with _timed(ch, "ball_channel", progress):
+        _ball_channel(input_path, timeline, cfg, ch, progress, cancel_check)
     cancel_check()
-    _pose_channel(input_path, timeline, cfg, ch, progress, cancel_check)
+    with _timed(ch, "pose_channel", progress):
+        _pose_channel(input_path, timeline, cfg, ch, progress, cancel_check)
     cancel_check()
     failures = {name: stage for name, stage in ch.stages.items()
                 if stage.get("status") == "failed"}
@@ -1491,8 +1521,9 @@ def trim(
         if not arbiter_weights:
             ch.stages["ball_arbiter"] = {"status": "unavailable", "reason": "no weights"}
     use_ball_arbiter = bool(arbiter_weights)
-    segments = _derive_points(
-        ch, duration, cfg, progress, for_ball_arbiter=use_ball_arbiter)
+    with _timed(ch, "candidate_generation", progress):
+        segments = _derive_points(
+            ch, duration, cfg, progress, for_ball_arbiter=use_ball_arbiter)
     if use_ball_arbiter:
         # Candidate pre-padding and serve_times let the detailed trajectory verifier find
         # the serve. Moving starts after proposal budgeting would invalidate its workload
@@ -1500,12 +1531,14 @@ def trim(
         ch.stages["serve_anchor"] = {
             "status": "skipped", "reason": "ball arbiter owns serve boundary recovery"}
     else:
-        segments = _anchor_serves(input_path, segments, ch, cfg, progress)
+        with _timed(ch, "serve_anchor", progress):
+            segments = _anchor_serves(input_path, segments, ch, cfg, progress)
     if cfg.ball_arbiter:
         # ball-primary: the trajectory validates each candidate and sets its bounds
-        segments = _ball_arbiter(
-            input_path, segments, ch, cfg, progress, weights=arbiter_weights,
-            cancel_check=cancel_check)
+        with _timed(ch, "ball_arbiter", progress):
+            segments = _ball_arbiter(
+                input_path, segments, ch, cfg, progress, weights=arbiter_weights,
+                cancel_check=cancel_check)
         indeterminate_fallback, suppressed_rejects, superseded_accepts = (
             _indeterminate_audio_fallback(ch))
         all_fallback = sorted([*ch.arbiter_audio_fallback, *indeterminate_fallback])
@@ -1535,21 +1568,25 @@ def trim(
             })
     else:
         # audio-primary (legacy): only trim rally ends by the ball, if configured
-        segments = _trim_ball_ends(
-            input_path, segments, ch, cfg, progress, cancel_check)
+        with _timed(ch, "ball_end", progress):
+            segments = _trim_ball_ends(
+                input_path, segments, ch, cfg, progress, cancel_check)
     cancel_check()
-    segments = _apply_ball_end_hints(segments, ch, cfg)
-    segments = _validate_match_state(
-        input_path, segments, ch, cfg, progress, weights=arbiter_weights,
-        cancel_check=cancel_check)
-    segments = _clamp_player_recovered_starts(segments, ch)
-    segments = _recover_fragmented_match_ends(
-        segments, ch, cfg, duration=duration)
+    with _timed(ch, "match_state_validation", progress):
+        segments = _apply_ball_end_hints(segments, ch, cfg)
+        segments = _validate_match_state(
+            input_path, segments, ch, cfg, progress, weights=arbiter_weights,
+            cancel_check=cancel_check)
+    with _timed(ch, "point_finalization", progress):
+        segments = _clamp_player_recovered_starts(segments, ch)
+        segments = _recover_fragmented_match_ends(
+            segments, ch, cfg, duration=duration)
+        segments = _filter_nonplay(segments, cfg, progress)
     cancel_check()
-    segments = _filter_nonplay(segments, cfg, progress)
 
     kept = total_kept_seconds(segments)
     progress(f"decoded {len(segments)} points, {kept:.1f}s kept of {duration:.1f}s")
+    ch.timings["analysis_total"] = time.perf_counter() - pipeline_started
 
     result = RallyResult(
         input_path=input_path,
@@ -1562,8 +1599,11 @@ def trim(
         n_strikes=ch.n_strikes,
         strike_times=[float(t) for t in ch.onsets],
         stages=ch.stages,
+        timings=ch.timings,
         config=asdict(cfg),
     )
 
-    _write_output(input_path, output_path, json_path, result, info, cfg, progress)
+    _write_output(
+        input_path, output_path, json_path, result, info, cfg, progress,
+        pipeline_started=pipeline_started)
     return result

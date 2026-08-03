@@ -817,8 +817,7 @@ def _render_output(src: Path, segments: list[tuple[float, float]], dst: Path,
 
     try:
         # Fast mode promises stream-copy; burned labels/gaps necessarily re-encode.
-        want_labels = cfg.reencode and (bool(cfg.label_points) or cfg.inter_point_gap_s > 0)
-        if want_labels:
+        if cfg.reencode:
             try:
                 font = find_font() if cfg.label_points else None
                 progress(f"rendering {len(segments)} points -> {dst.name}")
@@ -830,7 +829,7 @@ def _render_output(src: Path, segments: list[tuple[float, float]], dst: Path,
                 return publish_if_valid()
             except Exception as exc:
                 tmp.unlink(missing_ok=True)
-                progress(f"  labelled render failed ({exc}); falling back to a plain cut")
+                progress(f"  one-pass render failed ({exc}); falling back to a plain cut")
         try:
             progress(f"cutting {len(segments)} segments -> {dst.name}")
             cut_segments(
@@ -1489,6 +1488,7 @@ def _capabilities() -> dict[str, Any]:
 
     torch_ok = importlib.util.find_spec("torch") is not None
     players_ok = importlib.util.find_spec("ultralytics") is not None
+    rtmlib_ok = importlib.util.find_spec("rtmlib") is not None
     try:
         from rally.signals.ball import discover_ball_weights
         weights = discover_ball_weights()
@@ -1500,6 +1500,24 @@ def _capabilities() -> dict[str, Any]:
         hint = "no TrackNet weights found — run: python -m rally.tools.fetch_models --help"
     else:
         hint = ""
+    try:
+        from rally.config import RallyConfig
+        from rally.signals.pose import (
+            discover_rtmpose_weights,
+            resolve_rtmpose_device,
+            rtmpose_execution_providers,
+        )
+
+        pose_cfg = RallyConfig()
+        pose_model = discover_rtmpose_weights(pose_cfg.player_pose_model)
+        pose_model_present = Path(pose_model).is_file()
+        pose_providers = rtmpose_execution_providers(pose_cfg.rtmpose_runtime)
+        pose_device = resolve_rtmpose_device(
+            pose_cfg.rtmpose_device, pose_cfg.rtmpose_runtime)
+    except Exception:
+        pose_model_present = False
+        pose_providers = []
+        pose_device = "unavailable"
     return {
         "ball_arbiter": {
             "available": bool(weights) and torch_ok,
@@ -1513,6 +1531,16 @@ def _capabilities() -> dict[str, Any]:
             "available": players_ok,
             "hint": ("" if players_ok else
                      "Ultralytics is not installed; match-state pose validation is unavailable"),
+        },
+        "pose": {
+            "available": bool(players_ok and rtmlib_ok and pose_model_present),
+            "backend": "rtmlib",
+            "model_present": pose_model_present,
+            "device": pose_device,
+            "execution_providers": pose_providers,
+            "cuda": "CUDAExecutionProvider" in pose_providers,
+            "hint": ("" if pose_model_present else
+                     "RTMPose ONNX model is missing; re-run ./setup.sh"),
         },
         "processing": {
             "workers": _WEB_WORKERS,

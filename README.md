@@ -224,10 +224,13 @@ trims concurrently, sized from CPU capacity and currently free CUDA memory; set
 label/`drawtext` render isn't available it falls back to a plain cut, and the
 JSON analysis is always produced regardless.
 
-TrackNet inference selects a batch from currently free VRAM and runs up to two GPU streams
-per server process. Operators can override the measured defaults with
+TrackNet inference selects a batch from currently free VRAM and admits up to two concurrent
+callers per server process so CPU decode can overlap. This is a concurrency limit, not a
+claim that the implementation creates two explicit CUDA streams. Operators can override it with
 `RALLY_BALL_BATCH_SIZE`, `RALLY_GPU_TRACK_SLOTS`, and
 `RALLY_HEATMAP_DECODE_WORKERS`; oversized values can exhaust VRAM or reduce throughput.
+`RALLY_TRACKNET_PIPELINE=0` disables bounded decode/inference/heatmap overlap for regression
+comparison, and `RALLY_TRACKNET_WINDOW_PLAN=union` enables the opt-in connected-window plan.
 
 The web regression checks can be run with `pytest tests/test_web.py`; they are not an
 accuracy benchmark.

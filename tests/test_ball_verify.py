@@ -11,6 +11,7 @@ from rally.fusion.ball_verify import (
 from rally.signals.ball import (
     BallTrack,
     _target_court_heatmap_candidates,
+    get_cached_ball_model,
     resolve_ball_batch_size,
 )
 from rally.signals.ball import ball_in_play_channel
@@ -59,6 +60,17 @@ def test_tracking_window_grouping_caps_transitive_overlap():
     assert [member for _start, _end, members in groups for member in members] == candidates
 
 
+def test_union_tracking_plan_decodes_connected_padding_once(monkeypatch):
+    monkeypatch.setenv("RALLY_TRACKNET_WINDOW_PLAN", "union")
+    candidates = [(0.0, 10.0), (9.0, 20.0), (19.0, 30.0)]
+
+    groups = _group_tracking_windows(
+        candidates, pre_pad_s=2.0, post_pad_s=2.0,
+        max_extend_s=3.0, max_group_s=20.0)
+
+    assert groups == [(0.0, 33.0, candidates)]
+
+
 def test_cuda_batch_size_scales_with_free_memory(monkeypatch):
     monkeypatch.delenv("RALLY_BALL_BATCH_SIZE", raising=False)
 
@@ -72,6 +84,28 @@ def test_cuda_batch_size_scales_with_free_memory(monkeypatch):
 
     assert resolve_ball_batch_size(device, 0, torch_module=fake_torch) == 16
     assert resolve_ball_batch_size(device, 7, torch_module=fake_torch) == 7
+
+
+def test_ball_model_cache_keys_checkpoint_device_and_precision(monkeypatch, tmp_path):
+    from rally.signals import ball
+
+    checkpoint = tmp_path / "tracknet.pt"
+    checkpoint.write_bytes(b"weights")
+    loaded = []
+
+    def fake_load(path, device=None):
+        model = object()
+        loaded.append((path, str(device), model))
+        return model
+
+    ball._BALL_MODEL_CACHE.clear()
+    monkeypatch.setattr(ball, "load_ball_model", fake_load)
+
+    first = get_cached_ball_model(str(checkpoint), device="cpu", half_precision=False)
+    second = get_cached_ball_model(str(checkpoint), device="cpu", half_precision=False)
+
+    assert first is second
+    assert len(loaded) == 1
 
 
 def test_tracknet_candidates_are_filtered_before_neighbor_court_association():
@@ -386,3 +420,33 @@ def test_detailed_report_separates_accepts_from_indeterminate_fallback(monkeypat
     assert diagnostics[0]["reason_code"] in {
         "fragmented_live_track", "live_component_diluted_by_proposal",
     }
+
+
+def test_detailed_report_aggregates_tracker_performance(monkeypatch):
+    import rally.signals.ball as ball_mod
+
+    def measured_track(_video, start_s=0.0, end_s=None, metrics=None, **_kwargs):
+        if metrics is not None:
+            metrics.update({
+                "wall_seconds": 2.5,
+                "decoded_frames": 120,
+                "sampled_frames": 60,
+                "inferred_frames": 58,
+                "pipeline_enabled": 1,
+                "batch_histogram": {"8": 7, "2": 1},
+            })
+        t = np.arange(start_s, end_s, 1 / 30.0)
+        return BallTrack(t, np.full(t.size, np.nan), np.full(t.size, np.nan))
+
+    monkeypatch.setattr(ball_mod, "track_tracknet", measured_track)
+    report = verify_segments_detailed(
+        "dummy.mp4", [(10.0, 14.0)], court=FakeCourt(), model=object())
+    performance = report.as_dict()["performance"]
+
+    assert performance["execution_modes"] == ["pipelined"]
+    assert performance["wall_seconds"] == 2.5
+    assert performance["decoded_frames"] == 120
+    assert performance["sampled_frames"] == 60
+    assert performance["inferred_frames"] == 58
+    assert performance["batch_histogram"] == {"2": 1, "8": 7}
+    assert performance["physical_window_seconds"] >= performance["union_seconds"]

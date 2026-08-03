@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional, Tuple
 
-from ..signals.ball import load_ball_model, track_tracknet
+from ..signals.ball import get_cached_ball_model, track_tracknet
 from ..signals.ballrules import bounces_in_court, point_end_events, refine_end_from_events
 from .intervals import trim_previous_on_overlap
 
@@ -37,7 +37,8 @@ def refine_ends_with_ball(
 ) -> List[Segment]:
     """For each rally, track the ball over the segment, detect bounces, and move the end
     to the first point-ending event. Non-overlapping; keeps original end if none found."""
-    model = load_ball_model(weights_path)
+    model = get_cached_ball_model(
+        weights_path, half_precision=half_precision)
     out: List[Segment] = []
     n_trimmed = 0
     for s, e in segments:

@@ -91,6 +91,18 @@ def resolve_rtmpose_device(requested: str, runtime: str) -> str:
     return requested
 
 
+def rtmpose_execution_providers(runtime: str = "onnxruntime") -> list[str]:
+    """Return active provider names without making capability checks fatal."""
+    if runtime != "onnxruntime":
+        return [runtime]
+    try:
+        import onnxruntime as ort
+
+        return list(ort.get_available_providers())
+    except Exception:
+        return []
+
+
 class CroppedRTMPose:
     """Batched YOLO detection followed by top-down RTMPose on selected boxes."""
 

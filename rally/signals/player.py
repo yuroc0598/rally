@@ -910,6 +910,7 @@ def observe_serve_setups(
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], None] = lambda: None,
     court=None,
+    detector: Optional[PlayerDetector] = None,
 ) -> List[ServeSetupObservation]:  # pragma: no cover - exercised with optional YOLO
     """Observe player setup and service motion around each candidate's early impacts.
 
@@ -931,6 +932,10 @@ def observe_serve_setups(
                 pose_model=cfg.player_pose_model,
                 runtime=cfg.rtmpose_runtime,
                 pose_device=cfg.rtmpose_device,
+                detector=(detector.model if detector is not None and detector.available
+                          else None),
+                detection_device=(detector.device
+                                  if detector is not None and detector.available else None),
             )
             device = model.pose_device
         else:

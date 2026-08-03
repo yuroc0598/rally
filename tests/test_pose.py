@@ -12,6 +12,41 @@ from rally.signals.pose import (
 )
 
 
+def test_serve_pose_reuses_visual_detector(monkeypatch):
+    from rally.signals import player
+
+    captured = {}
+
+    class PoseBackend:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.pose_device = "cpu"
+
+    class Capture:
+        def isOpened(self):
+            return True
+
+        def get(self, _property):
+            return 30.0
+
+        def release(self):
+            pass
+
+    raw_detector = object()
+    detector = type("Detector", (), {
+        "model": raw_detector,
+        "device": "cuda",
+        "available": True,
+    })()
+    monkeypatch.setattr("rally.signals.pose.CroppedRTMPose", PoseBackend)
+    monkeypatch.setattr("cv2.VideoCapture", lambda _path: Capture())
+
+    assert player.observe_serve_setups(
+        "unused.mp4", [], np.zeros(0), RallyConfig(), detector=detector) == []
+    assert captured["detector"] is raw_detector
+    assert captured["detection_device"] == "cuda"
+
+
 def test_rtmpose_url_prefers_matching_local_onnx(tmp_path):
     local = tmp_path / "rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.onnx"
     local.write_bytes(b"onnx")

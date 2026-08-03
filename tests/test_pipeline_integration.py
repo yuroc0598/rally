@@ -7,6 +7,7 @@ and checks that it recovers those windows and writes a shorter output file.
 Skipped automatically if ffmpeg or the scientific stack is unavailable.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -119,3 +120,10 @@ def test_end_to_end(scratch_dir):
     assert os.path.isfile(out) and os.path.getsize(out) > 0
     assert os.path.isfile(js)
     assert os.path.getsize(out) < os.path.getsize(src)
+    assert result.timings["analysis_total"] > 0
+    assert result.timings["output_render"] > 0
+    assert result.timings["pipeline_total"] >= result.timings["analysis_total"]
+    sidecar = json.loads(open(js).read())
+    assert sidecar["timings_seconds"]["audio"] > 0
+    assert sidecar["timings_seconds"]["visual"] > 0
+    assert sidecar["timings_seconds"]["pipeline_total"] > 0

@@ -166,7 +166,8 @@ import os, subprocess, tempfile
 from rally.io.ffmpeg import _require, _video_encoder, probe
 ff = _require("ffmpeg")
 codec, cargs = _video_encoder()
-assert codec in ("libx264", "libopenh264"), f"no browser-H.264 encoder (got {codec})"
+assert codec in ("h264_nvenc", "libx264", "libopenh264"), \
+    f"no browser-H.264 encoder (got {codec})"
 d = tempfile.mkdtemp()
 clip = os.path.join(d, "t.mp4")
 subprocess.run([ff, "-v", "error", "-y", "-f", "lavfi",

@@ -214,8 +214,11 @@ def test_fault_and_retry_with_pose_identity_switch_remain_one_point():
         RallyConfig(play_mode="match", match_point_start_preroll_s=1.0),
     )
 
-    assert kept == [(0.0, 16.0)]
+    assert kept == [(14.0, 16.0)]
     assert stage["logical_groups"][0]["member_indices"] == [0, 1]
+    assert stage["logical_groups"][0]["serve_member_index"] == 1
+    assert stage["logical_groups"][0]["retry_serve_detected"] is True
+    assert stage["logical_groups"][0]["failed_first_serve_trimmed"] is True
 
 
 def test_new_overhead_after_ordered_exchange_starts_next_point():
@@ -475,9 +478,75 @@ def test_match_decoder_merges_fault_and_retry_into_one_logical_point():
         RallyConfig(play_mode="match", match_point_start_preroll_s=4.0),
     )
 
-    assert kept == [(40.9, 47.5)]
+    assert kept == [(43.9, 47.5)]
     assert stage["logical_groups"][0]["member_indices"] == [0, 1]
     assert stage["logical_groups"][0]["serve_member_index"] == 1
+    assert stage["logical_groups"][0]["retry_serve_contacts"] == [38.2, 44.9]
+    assert stage["logical_groups"][0]["failed_first_serve_trimmed"] is True
+
+
+def test_match_decoder_trims_first_serve_inside_one_broad_candidate():
+    point = (0.0, 15.0)
+    observation = replace(
+        _ob(point, "left"),
+        first_strike=2.0,
+        serve_motion=True,
+        overhead_frames=4,
+        overhead_strikes=(2.0, 8.0),
+        position_setup_strikes=(2.0, 8.0),
+        target_court_filtered=True,
+        ball_ordered_evidence=True,
+    )
+
+    kept, stage = validate_match_sequence(
+        [point], np.array([2.0, 8.0, 10.0, 12.0]), [observation],
+        RallyConfig(play_mode="match", match_point_start_preroll_s=4.0),
+    )
+
+    assert kept == [(4.0, 15.0)]
+    group = stage["logical_groups"][0]
+    assert group["serve_member_index"] == 0
+    assert group["retry_serve_contacts"] == [2.0, 8.0]
+    assert group["failed_first_serve_trimmed"] is True
+
+
+def test_match_decoder_trims_failed_serve_and_pickup_before_retry():
+    points = [(0.0, 4.0), (6.0, 8.0), (11.0, 17.0)]
+    first_serve = replace(
+        _ob(points[0], "left"),
+        first_strike=1.0,
+        serve_motion=True,
+        overhead_strikes=(1.0,),
+        position_setup_strikes=(1.0,),
+        target_court_filtered=True,
+        ball_ordered_evidence=True,
+    )
+    pickup = replace(
+        _ob(points[1], "left", serve=False, setup=False),
+        first_strike=7.0,
+        target_court_filtered=True,
+    )
+    second_serve = replace(
+        _ob(points[2], "left"),
+        first_strike=12.0,
+        serve_motion=True,
+        overhead_strikes=(12.0,),
+        position_setup_strikes=(12.0,),
+        target_court_filtered=True,
+        ball_ordered_evidence=True,
+    )
+
+    kept, stage = validate_match_sequence(
+        points, np.array([1.0, 2.0, 7.0, 12.0, 14.0, 16.0]),
+        [first_serve, pickup, second_serve],
+        RallyConfig(play_mode="match", match_point_start_preroll_s=4.0),
+    )
+
+    assert kept == [(8.0, 17.0)]
+    group = stage["logical_groups"][0]
+    assert group["member_indices"] == [0, 1, 2]
+    assert group["serve_member_index"] == 2
+    assert group["retry_serve_contacts"] == [1.0, 12.0]
 
 
 def test_match_decoder_anchors_compact_serve_before_long_exchange():

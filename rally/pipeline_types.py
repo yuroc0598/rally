@@ -26,6 +26,7 @@ class RallyResult:
     n_strikes: int = 0
     strike_times: list[float] = field(default_factory=list)
     stages: dict = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
     config: dict = field(default_factory=dict)
 
     def sidecar(self) -> dict:
@@ -40,6 +41,10 @@ class RallyResult:
             "strike_times": [round(float(t), 3) for t in self.strike_times],
             "channels_used": self.channels_used,
             "stages": self.stages,
+            "timings_seconds": {
+                name: round(float(seconds), 3)
+                for name, seconds in self.timings.items()
+            },
             "config": self.config,
             "segments": [
                 {"index": index, "start": round(start, 3), "end": round(end, 3),
@@ -66,6 +71,7 @@ class SignalEvidence:
     n_strikes: int = 0
     used: list[str] = field(default_factory=list)
     stages: dict = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
     detector: Optional[Any] = None
     player_samples: list = field(default_factory=list)
     court: Optional[Any] = None
@@ -94,4 +100,3 @@ class ArbiterEvidence:
 @dataclass
 class PipelineState(SignalEvidence, ArbiterEvidence):
     """Combined state object retained for the current sequential orchestrator."""
-

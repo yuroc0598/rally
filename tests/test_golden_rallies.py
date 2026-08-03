@@ -79,12 +79,12 @@ GOLDEN_DATASETS = (
             GoldenPoint((8.0,), 15.0),
             GoldenPoint((29.0,), 35.0),
             GoldenPoint((45.0,), 71.0),
-            GoldenPoint((91.0, 105.0), 112.0),
+            GoldenPoint((105.0,), 112.0),
             GoldenPoint((163.0,), 174.0),
             GoldenPoint((186.0,), 195.0),
             GoldenPoint((202.0,), 211.0),
-            GoldenPoint((224.0, 232.0), 238.0),
-            GoldenPoint((259.0, 275.0), 282.0),
+            GoldenPoint((232.0,), 238.0),
+            GoldenPoint((275.0,), 282.0),
         ),
     ),
     GoldenDataset(
@@ -96,7 +96,7 @@ GOLDEN_DATASETS = (
         ),
         expected=(
             GoldenPoint((14.0,), 22.0),
-            GoldenPoint((35.0, 42.0), 48.0),
+            GoldenPoint((42.0,), 48.0),
             GoldenPoint((64.0,), 70.0),
             GoldenPoint((85.0,), 90.0),
             GoldenPoint((155.0,), 172.0),
@@ -119,8 +119,8 @@ GOLDEN_DATASETS = (
             GoldenPoint((52.0,), 60.0),
             GoldenPoint((78.0,), 92.0),
             GoldenPoint((106.0,), 115.0),
-            GoldenPoint((184.0, 196.0), 217.0),
-            GoldenPoint((230.0, 239.0), 249.0),
+            GoldenPoint((196.0,), 217.0),
+            GoldenPoint((239.0,), 249.0),
             GoldenPoint((257.0,), 265.0),
             GoldenPoint((276.0,), 290.0),
         ),
@@ -200,11 +200,10 @@ def _sha256(path: Path) -> str:
 
 
 def load_annotated_points(path: Path) -> list[GoldenPoint]:
-    """Parse each point and any explicitly annotated retry-serve start.
+    """Parse each point, preferring an explicitly annotated retry-serve start.
 
-    When a point includes a fault/let followed by another serve, one prediction may start
-    at either the original serve or the retry, but it must remain one point and end at the
-    annotated point end.
+    When a point includes a fault/let followed by another serve, the failed attempt and reset
+    footage are not part of the expected output; the retry is the sole accepted start.
     """
     text = path.read_text(encoding="utf-8")
     structured = []
@@ -215,9 +214,7 @@ def load_annotated_points(path: Path) -> list[GoldenPoint]:
         if index is None or start is None or end is None:
             continue
         second = _object_field(block, "second_serve_start_time")
-        starts = [_seconds(start)]
-        if second is not None:
-            starts.append(_seconds(second))
+        starts = [_seconds(second if second is not None else start)]
         structured.append((int(index), GoldenPoint(tuple(starts), _seconds(end))))
     if structured:
         point_numbers = [index for index, _point in structured]
@@ -239,7 +236,7 @@ def load_annotated_points(path: Path) -> list[GoldenPoint]:
             raise ValueError(f"{path}:{line_number}: point needs start and end timestamps")
         values = [_seconds(timestamp) for timestamp in timestamps]
         end = values[-1]
-        starts = (values[0],) if len(values) == 2 else (values[0], values[-2])
+        starts = (values[0],) if len(values) == 2 else (values[-2],)
         starts = tuple(dict.fromkeys(starts))
         if not starts or any(not 0.0 <= start < end for start in starts):
             raise ValueError(f"{path}:{line_number}: invalid point bounds {starts}-{end}")
@@ -272,7 +269,7 @@ def assert_rallies_within_boundary_tolerance(
 ) -> None:
     """Require one prediction per point and independent start/end errors <= tolerance.
 
-    A gold point may allow multiple starts when a fault/let was followed by another serve.
+    Fault/let annotations use the retry serve as their sole accepted start.
     """
     predicted = sorted((float(start), float(end)) for start, end in predicted)
     expected = [
@@ -317,7 +314,7 @@ def _segments_from_sidecar(path: Path) -> list[tuple[float, float]]:
 @pytest.mark.parametrize(
     "dataset", GOLDEN_DATASETS, ids=lambda dataset: dataset.video.stem
 )
-def test_ground_truth_annotation_allows_original_or_retry_serve_start(dataset):
+def test_ground_truth_annotation_uses_retry_serve_start(dataset):
     assert load_annotated_points(dataset.annotation) == list(dataset.expected)
 
 
@@ -341,10 +338,11 @@ def test_boundary_gate_accepts_errors_up_to_two_seconds_independently():
     assert_rallies_within_boundary_tolerance([(8.0, 22.0), (32.0, 38.0)], gold)
 
 
-def test_boundary_gate_accepts_retry_serve_as_the_point_start():
-    gold = [GoldenPoint((91.0, 105.0), 112.0)]
+def test_boundary_gate_requires_retry_serve_as_the_point_start():
+    gold = [GoldenPoint((105.0,), 112.0)]
     assert_rallies_within_boundary_tolerance([(103.0, 114.0)], gold)
-    assert_rallies_within_boundary_tolerance([(89.0, 110.0)], gold)
+    with pytest.raises(AssertionError):
+        assert_rallies_within_boundary_tolerance([(89.0, 110.0)], gold)
     with pytest.raises(AssertionError):
         assert_rallies_within_boundary_tolerance([(98.0, 112.0)], gold)
 

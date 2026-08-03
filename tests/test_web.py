@@ -224,6 +224,9 @@ def test_capabilities_reports_ball_arbiter_availability(monkeypatch):
     assert caps["ball_arbiter"]["weights_present"] is False
     assert caps["ball_arbiter"]["hint"]                     # tells the user what to do
     assert caps["court_auto"]["available"] is True          # classical, always on
+    assert set(caps["pose"]) >= {
+        "available", "model_present", "device", "execution_providers", "cuda",
+    }
 
     # weights present + torch installed -> available
     monkeypatch.setattr("rally.signals.ball.discover_ball_weights",
@@ -387,6 +390,32 @@ def test_render_output_publishes_atomically_and_keeps_old_file_on_failure(monkey
     assert not webapp._render_output(src, [(2, 3)], dst, cfg, info, lambda _m: None)
     assert dst.read_bytes() == b"new-complete-video"
     assert not list(tmp_path.glob(".*.tmp.mp4"))
+
+
+def test_unlabelled_reencode_uses_one_pass_renderer(monkeypatch, tmp_path):
+    src = tmp_path / "source.mp4"
+    dst = tmp_path / "rallies.mp4"
+    src.write_bytes(b"source")
+    cfg = webapp.RallyConfig(label_points=False, inter_point_gap_s=0, reencode=True)
+    info = SimpleNamespace(height=720, has_audio=True, duration_s=10.0)
+    calls = []
+
+    def render(_src, segments, temporary, **kwargs):
+        calls.append((segments, kwargs))
+        Path(temporary).write_bytes(b"one-pass")
+
+    monkeypatch.setattr(webapp, "render_labeled", render)
+    monkeypatch.setattr(
+        webapp, "cut_segments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("multi-process cut path must not run")),
+    )
+
+    assert webapp._render_output(src, [(1, 2), (4, 5)], dst, cfg, info, lambda _m: None)
+    assert dst.read_bytes() == b"one-pass"
+    assert len(calls) == 1
+    assert calls[0][1]["draw_labels"] is False
+    assert calls[0][1]["gap_s"] == 0
 
 
 def test_zero_segment_edit_unpublishes_and_removes_stale_output(monkeypatch, tmp_path):

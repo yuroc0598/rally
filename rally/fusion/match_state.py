@@ -333,6 +333,138 @@ def _serve_contact(observation: ServeSetupObservation) -> float:
     return float(observation.first_strike)
 
 
+def _direct_pose_service(observation: ServeSetupObservation) -> bool:
+    """Whether target-court body motion directly identifies a service action."""
+    return bool(
+        _aligned_pose_strikes(observation)
+        or _robust_target_court_overhead(observation)
+    )
+
+
+def _service_attempt_contacts(
+    index: int,
+    observation: ServeSetupObservation,
+    effective_strikes: int,
+    cfg,
+) -> list[tuple[float, int, str]]:
+    """Return directly supported service contacts for retry detection.
+
+    Multiple aligned overhead/setup contacts inside one candidate are retained separately.
+    Strong overhead/ball evidence is direct; formation/reaction and marginal overhead cues
+    are supporting and require the longer retry interval before they can form a pair.
+    """
+    aligned = _aligned_pose_strikes(observation)
+    if aligned:
+        return [(float(contact), index, "direct") for contact in aligned]
+    if _robust_target_court_overhead(observation):
+        contacts = observation.overhead_strikes or (_serve_contact(observation),)
+        return [(float(contact), index, "direct") for contact in contacts]
+    if (observation.ball_serve_evidence
+            and _independently_confirmed_serve(
+                observation, effective_strikes, cfg)):
+        return [(_serve_contact(observation), index, "direct")]
+    if _stable_baseline_formation(observation, cfg):
+        if (_corroborated_receiver_reaction(observation)
+                or observation.ball_ordered_evidence):
+            return [(_serve_contact(observation), index, "supporting")]
+    if (observation.target_court_filtered
+            and observation.serve_motion
+            and observation.overhead_strikes):
+        return [(_serve_contact(observation), index, "supporting")]
+    return []
+
+
+def _detected_retry_serve(
+    indices: Sequence[int], observations: Sequence[ServeSetupObservation],
+    strike_counts: Sequence[int], cfg,
+) -> Optional[tuple[int, float, float, tuple[float, ...], int]]:
+    """Identify a later service attempt without claiming to classify the fault itself.
+
+    The observable fact is a second direct service action before a completed point. Reliable
+    opposite service-side labels reject the retry interpretation. The returned tuple is
+    ``(member_index, retry_contact, prior_contact, all_attempt_contacts,
+    prior_member_index)``.
+    """
+    attempts = sorted(
+        (
+            attempt
+            for index in indices
+            for attempt in _service_attempt_contacts(
+                index, observations[index], strike_counts[index], cfg)
+        ),
+        key=lambda attempt: (attempt[0], attempt[1]),
+    )
+    distinct: list[tuple[float, int, str]] = []
+    for contact, index, strength in attempts:
+        if distinct and contact - distinct[-1][0] <= cfg.echo_collapse_s:
+            # Duplicate acoustic/pose assignments around one racket contact are one attempt.
+            prior_strength = distinct[-1][2]
+            if strength == "direct" or prior_strength != "direct":
+                distinct[-1] = (contact, index, strength)
+            continue
+        distinct.append((contact, index, strength))
+    if len(distinct) < 2:
+        return None
+
+    min_gap = max(float(cfg.merge_gap_s), float(cfg.echo_collapse_s))
+    max_gap = float(
+        cfg.match_attempt_merge_gap_s + cfg.match_point_start_preroll_s)
+    for current_position in range(len(distinct) - 1, 0, -1):
+        contact, index, strength = distinct[current_position]
+        for prior_contact, prior_index, prior_strength in reversed(
+                distinct[:current_position]):
+            gap = contact - prior_contact
+            required_gap = (
+                min_gap
+                if strength == "direct" and prior_strength == "direct"
+                else float(cfg.match_attempt_merge_min_gap_s)
+            )
+            if gap < required_gap:
+                continue
+            if gap > max_gap:
+                break
+            prior = observations[prior_index]
+            current = observations[index]
+            reliable_opposite = bool(
+                prior.side is not None
+                and current.side is not None
+                and prior.side != current.side
+                and prior.side_confidence >= 0.55
+                and current.side_confidence >= 0.55
+            )
+            if reliable_opposite:
+                continue
+            if (prior_index != index
+                    and strike_counts[prior_index] > cfg.min_rally_strikes + 1):
+                # A sustained exchange followed by another serve is the next point, not a
+                # fault/retry. Multiple service contacts inside one candidate are exempt.
+                continue
+            short_fragment_gap = float(
+                current.point[0] - prior.point[1])
+            current_is_long_exchange = bool(
+                current.point[1] - current.point[0] >= 5.0
+                and strike_counts[index] >= cfg.min_rally_strikes
+                and 0.0 <= short_fragment_gap <= cfg.match_fragment_merge_gap_s
+            )
+            if (current_is_long_exchange
+                    and not (
+                        _direct_pose_service(prior)
+                        and _direct_pose_service(current)
+                    )):
+                # A compact serve fragment followed immediately by a long return/exchange
+                # is one ordinary point, not two service attempts. Require direct pose on
+                # both sides before interpreting this shape as a fault and retry.
+                continue
+            return (
+                index,
+                float(contact),
+                float(prior_contact),
+                tuple(float(value) for value, _member, _strength in distinct),
+                prior_index,
+            )
+    return None
+
+
 def _fragment_groups(
     points: Sequence[Segment], observations: Sequence[ServeSetupObservation],
     strike_counts: Sequence[int], cfg, *, protected_indices: Iterable[int] = (),
@@ -467,6 +599,16 @@ def _fragment_groups(
             and cfg.match_attempt_merge_min_gap_s <= gap
             <= cfg.match_attempt_merge_gap_s
         )
+        pose_confirmed_same_side_retry = bool(
+            same_known_side
+            and not reliable_opposite_sides
+            and 0.0 <= gap <= cfg.match_attempt_merge_gap_s
+            and any(_direct_pose_service(observations[member])
+                    for member in prior_group)
+            and any(_direct_pose_service(observations[member]) for member in group)
+            and sum(strike_counts[member] for member in prior_group)
+            <= cfg.min_rally_strikes + 1
+        )
         protected_reaction_tail = bool(
             0.0 <= gap <= 3.0
             and sum(strike_counts[member] for member in group) <= 1
@@ -479,7 +621,11 @@ def _fragment_groups(
             )
         )
         if (any(member in protected for member in (*prior_group, *group))
-                and not (protected_same_side_retry or protected_reaction_tail)):
+                and not (
+                    protected_same_side_retry
+                    or pose_confirmed_same_side_retry
+                    or protected_reaction_tail
+                )):
             # A court-validated rally is normally a hard logical boundary. The one
             # exception is a short same-service-side retry: tennis service side cannot
             # repeat for the next point, while a fault/let may already have a valid ball
@@ -597,6 +743,7 @@ def _fragment_groups(
             <= cfg.match_attempt_merge_gap_s
         )
         if (same_side_retry_or_feed
+                or pose_confirmed_same_side_retry
                 or retry_without_completed_rally
                 or trailing_fragment
                 or serve_then_exchange
@@ -1242,6 +1389,12 @@ def validate_match_sequence(
             continue
         serve_member = _select_serve_member(
             indices, observations, points, strike_counts, cfg)
+        retry_serve = _detected_retry_serve(
+            indices, observations, strike_counts, cfg)
+        if retry_serve is not None:
+            # A confidently observed second service action owns the point. Never let the
+            # failed first serve win a generic evidence-strength tie.
+            serve_member = retry_serve[0]
         reaction_members = [
             index for index in indices
             if _target_court_receiver_reaction(observations[index])
@@ -1284,9 +1437,12 @@ def validate_match_sequence(
             )
         )
         contact = (
-            float(observations[serve_member].receiver_reaction_time)
-            if selected_reaction_is_group_corroborated
-            else _serve_contact(observations[serve_member])
+            retry_serve[1]
+            if retry_serve is not None else (
+                float(observations[serve_member].receiver_reaction_time)
+                if selected_reaction_is_group_corroborated
+                else _serve_contact(observations[serve_member])
+            )
         )
         dynamic_members = [
             index for index in indices
@@ -1450,11 +1606,43 @@ def validate_match_sequence(
             and float(selected.receiver_reaction_time)
             < selected.point[0] - cfg.match_point_start_preroll_s
         )
-        start = (
-            group_start
-            if position_contact_with_distant_reaction else
-            (recovered_start if (confirmed or inside_phase) else group_start)
-        )
+        if retry_serve is not None:
+            (_retry_member, _retry_contact, prior_attempt_contact,
+             _attempts, prior_attempt_member) = retry_serve
+            if serve_member != prior_attempt_member:
+                prior_attempt_end = float(points[prior_attempt_member][1])
+                retry_candidate_start = float(points[serve_member][0])
+                # When segmentation leaves only a tiny gap, its contents are reset/pickup
+                # footage rather than useful service preparation. For a longer reset, keep
+                # only the configured retry-serve preroll nearest the second contact.
+                if (0.0 <= retry_candidate_start - prior_attempt_end
+                        <= cfg.merge_gap_s):
+                    retry_attempt_floor = retry_candidate_start
+                else:
+                    retry_attempt_floor = prior_attempt_end
+            else:
+                # Two service contacts may live inside one broad audio candidate. Start
+                # after the failed attempt's normal tail rather than at the candidate edge.
+                retry_attempt_floor = float(
+                    prior_attempt_contact + cfg.landing_tail_s)
+            desired_retry_start = max(
+                retry_attempt_floor,
+                float(contact - cfg.match_point_start_preroll_s),
+            )
+            # Preserve the minimum one-hit point duration when the retry ends immediately
+            # (for example a double fault), but never move back across the failed attempt.
+            latest_valid_start = max(
+                retry_attempt_floor, float(group_end - cfg.min_rally_s))
+            start = max(
+                retry_attempt_floor,
+                min(desired_retry_start, latest_valid_start),
+            )
+        else:
+            start = (
+                group_start
+                if position_contact_with_distant_reaction else
+                (recovered_start if (confirmed or inside_phase) else group_start)
+            )
         start = max(start, prior_end)
         if group_end <= start:
             start = min(group_start, max(0.0, group_end - 1e-3))
@@ -1494,6 +1682,13 @@ def validate_match_sequence(
             "serve_contact": round(contact, 3),
             "output": [round(segment[0], 3), round(segment[1], 3)],
             "sparse_tail_trimmed": sparse_tail_trimmed,
+            **({
+                "retry_serve_detected": True,
+                "retry_serve_contacts": [
+                    round(value, 3) for value in retry_serve[3]
+                ],
+                "failed_first_serve_trimmed": True,
+            } if retry_serve is not None else {}),
             **({"serve_inferred_from_side_alternation": True}
                if sequence_inferred_serve else {}),
         })

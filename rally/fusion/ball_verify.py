@@ -26,6 +26,7 @@ model, or weights. :func:`verify_segments` is the orchestrator that does the tra
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Literal, Optional, Tuple
 
@@ -169,6 +170,7 @@ class VerificationReport:
     # serve validation in the same pipeline run, avoiding a second TrackNet decode.
     track_cache: List[Tuple[Segment, Any]] = field(default_factory=list, repr=False)
     inference_batch_size: Optional[int] = None
+    performance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         counts = {state: sum(c.verdict.state == state for c in self.candidates)
@@ -178,21 +180,33 @@ class VerificationReport:
                          for s, e in self.segments],
             "counts": counts,
             "inference_batch_size": self.inference_batch_size,
+            "performance": self.performance,
             "candidates": [candidate.as_dict() for candidate in self.candidates],
         }
 
 
 def _group_tracking_windows(
     segments: List[Segment], pre_pad_s: float, post_pad_s: float,
-    max_extend_s: float, max_group_s: float,
+    max_extend_s: float, max_group_s: float, plan: Optional[str] = None,
 ) -> List[Tuple[float, float, List[Segment]]]:
-    """Merge padding overlap without allowing one transitive near-full-video group."""
+    """Plan physical windows while preserving logical candidate membership.
+
+    ``legacy`` retains bounded groups and can duplicate padding at a group boundary.
+    ``union`` merges every connected padded component exactly once. The latter is opt-in
+    until golden equivalence confirms that preserving association across old boundaries is
+    acceptable for a deployment.
+    """
+    plan = (plan or os.environ.get(
+        "RALLY_TRACKNET_WINDOW_PLAN", "legacy")).strip().lower()
+    if plan not in {"legacy", "union"}:
+        raise ValueError("RALLY_TRACKNET_WINDOW_PLAN must be 'legacy' or 'union'")
     grouped: List[Tuple[float, float, List[Segment]]] = []
     tail = max(post_pad_s, max_extend_s)
     for s, e in sorted(segments):
         ts, te = max(0.0, s - pre_pad_s), e + tail
         if (grouped and ts <= grouped[-1][1]
-                and max(grouped[-1][1], te) - grouped[-1][0] <= max_group_s):
+                and (plan == "union"
+                     or max(grouped[-1][1], te) - grouped[-1][0] <= max_group_s)):
             gs, ge, members = grouped[-1]
             grouped[-1] = (gs, max(ge, te), [*members, (s, e)])
         else:
@@ -791,12 +805,13 @@ def verify_segments_detailed(
     segments only; callers recover their own coherent fallback for indeterminate candidate
     intervals from ``report.candidates``.
     """
-    from ..signals.ball import load_ball_model, track_tracknet
+    from ..signals.ball import get_cached_ball_model, track_tracknet
 
     if model is None:
         if not weights_path:
             raise ValueError("verify_segments needs a TrackNet weights_path or model")
-        model = load_ball_model(weights_path)
+        model = get_cached_ball_model(
+            weights_path, half_precision=half_precision)
 
     verdict_kwargs = dict(verdict_kwargs or {})
     verdict_kwargs.setdefault("max_extend_s", max_extend_s)
@@ -809,6 +824,21 @@ def verify_segments_detailed(
     diagnostics: List[CandidateVerification] = []
     track_cache: List[Tuple[Segment, Any]] = []
     total_tracking_s = sum(end - start for start, end, _members in grouped)
+    union_intervals: List[List[float]] = []
+    for start, end, _members in sorted(grouped):
+        if union_intervals and start <= union_intervals[-1][1]:
+            union_intervals[-1][1] = max(union_intervals[-1][1], end)
+        else:
+            union_intervals.append([float(start), float(end)])
+    union_tracking_s = sum(end - start for start, end in union_intervals)
+    performance: dict[str, Any] = {
+        "tracking_groups": len(grouped),
+        "physical_window_seconds": round(float(total_tracking_s), 6),
+        "union_seconds": round(float(union_tracking_s), 6),
+        "duplicate_seconds": round(float(total_tracking_s - union_tracking_s), 6),
+        "batch_histogram": {},
+    }
+    pipeline_modes: set[str] = set()
     completed_tracking_s = 0.0
     last_reported_percent = -1
     actual_batch_size: Optional[int] = None
@@ -829,6 +859,7 @@ def verify_segments_detailed(
                 f"ball tracking progress {percent}% "
                 f"({done_s:.1f}/{total_tracking_s:.1f}s, batch {batch})")
 
+        group_metrics: dict[str, Any] = {}
         track = track_tracknet(
             video, model=model, start_s=track_start, end_s=track_end,
             batch_size=inference_batch_size,
@@ -836,8 +867,18 @@ def verify_segments_detailed(
             half_precision=half_precision,
             court=court,
             progress_callback=tracking_progress,
+            metrics=group_metrics,
             cancel_check=cancel_check,
         )
+        for name, value in group_metrics.items():
+            if name == "batch_histogram":
+                for size, count in value.items():
+                    histogram = performance["batch_histogram"]
+                    histogram[size] = int(histogram.get(size, 0)) + int(count)
+            elif name == "pipeline_enabled":
+                pipeline_modes.add("pipelined" if value else "serial")
+            elif isinstance(value, (int, float)):
+                performance[name] = performance.get(name, 0) + value
         track_cache.append(((track_start, track_end), track))
         completed_tracking_s += group_s
         st = smooth_track(track, max_gap_s=smooth_max_gap_s)
@@ -890,9 +931,13 @@ def verify_segments_detailed(
                 ball_speed_estimate=speed_estimate))
             progress(f"    candidate {s:.2f}-{e:.2f}s: {v.state} "
                      f"[{v.reason_code}] {v.reason}")
+    performance["execution_modes"] = sorted(pipeline_modes)
+    for name, value in list(performance.items()):
+        if isinstance(value, float):
+            performance[name] = round(value, 6)
     result = VerificationReport(
         _dedupe_non_overlapping(kept), diagnostics, track_cache=track_cache,
-        inference_batch_size=actual_batch_size)
+        inference_batch_size=actual_batch_size, performance=performance)
     counts = result.as_dict()["counts"]
     progress("  ball arbiter: "
              f"{counts['accept']} accepted, {counts['reject']} rejected, "

@@ -175,7 +175,7 @@ def observe_ball_serves(
     """Classify serve windows, reusing arbiter tracks before running TrackNet again."""
     import cv2
 
-    from .ball import load_ball_model, track_tracknet
+    from .ball import get_cached_ball_model, track_tracknet
 
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -209,7 +209,8 @@ def observe_ball_serves(
             cache_hits += 1
         else:
             if model is None:
-                model = load_ball_model(weights_path)
+                model = get_cached_ball_model(
+                    weights_path, half_precision=cfg.ball_half_precision)
             track = track_tracknet(
                 video, model=model, start_s=start, end_s=end,
                 batch_size=cfg.ball_inference_batch_size,

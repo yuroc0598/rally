@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
 from .ffmpeg import add_real_context, cut_segments, find_font, render_labeled
 
 
-def write_output(input_path, output_path, json_path, result, info, cfg, progress) -> None:
+def write_output(
+    input_path, output_path, json_path, result, info, cfg, progress, *,
+    pipeline_started: float | None = None,
+) -> None:
     """Publish video first and metadata last so sidecars never describe partial media."""
     def write_sidecar() -> None:
         if not json_path:
@@ -27,7 +31,11 @@ def write_output(input_path, output_path, json_path, result, info, cfg, progress
             temporary.unlink(missing_ok=True)
         progress(f"wrote {json_path}")
 
+    output_started = time.perf_counter()
     if not output_path:
+        result.timings["output_render"] = 0.0
+        if pipeline_started is not None:
+            result.timings["pipeline_total"] = time.perf_counter() - pipeline_started
         write_sidecar()
         return
     segments = result.segments
@@ -43,7 +51,7 @@ def write_output(input_path, output_path, json_path, result, info, cfg, progress
         temporary = destination.with_name(
             f".{destination.stem}.{uuid.uuid4().hex}.tmp{destination.suffix or '.mp4'}")
         try:
-            if cfg.reencode and (cfg.label_points or cfg.inter_point_gap_s > 0):
+            if cfg.reencode:
                 font = find_font() if cfg.label_points else None
                 if cfg.label_points and font is None:
                     progress("  no font found -> labels drawn with ffmpeg's default font")
@@ -61,11 +69,16 @@ def write_output(input_path, output_path, json_path, result, info, cfg, progress
             else:
                 progress(f"cutting {len(segments)} segments -> {output_path}")
                 cut_segments(
-                    input_path, render_segments, str(temporary), reencode=cfg.reencode)
+                    input_path, render_segments, str(temporary), reencode=False)
             if not temporary.exists() or temporary.stat().st_size <= 0:
                 raise RuntimeError("video renderer produced no output")
             os.replace(temporary, destination)
             progress(f"wrote {output_path}")
         finally:
             temporary.unlink(missing_ok=True)
+    output_elapsed = time.perf_counter() - output_started
+    result.timings["output_render"] = output_elapsed
+    if pipeline_started is not None:
+        result.timings["pipeline_total"] = time.perf_counter() - pipeline_started
+    progress(f"timing output_render: {output_elapsed:.3f}s")
     write_sidecar()
