@@ -27,5 +27,5 @@ Run the full local evaluation with:
 RALLY_RUN_GOLDEN=1 pytest -q tests/test_golden_rallies.py
 ```
 
-Set `RALLY_GOLDEN_ARTIFACTS=.rally_golden` to retain processed videos and analysis sidecars
-for the web UI's Golden tab. Those generated artifacts are also excluded from Git.
+Set `RALLY_GOLDEN_ARTIFACTS=sessions/golden` to retain processed videos and analysis
+sidecars for the web UI's Golden tab. Those generated artifacts are also excluded from Git.

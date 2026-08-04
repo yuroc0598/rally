@@ -72,13 +72,17 @@ from rally.web.schemas import (
 # module state                                                                #
 # --------------------------------------------------------------------------- #
 PACKAGE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = PACKAGE_DIR / "static"
-DATA_DIR = Path(os.environ.get("RALLY_WEB_DATA", ".rally_web")).resolve()
 PROJECT_DIR = PACKAGE_DIR.parents[1]
+STATIC_DIR = PACKAGE_DIR / "static"
+SESSIONS_DIR = PROJECT_DIR / "sessions"
+DEFAULT_UPLOADS_DIR = SESSIONS_DIR / "uploads"
+DEFAULT_GOLDEN_RESULTS_DIR = SESSIONS_DIR / "golden"
+DATA_DIR = Path(os.environ.get(
+    "RALLY_WEB_DATA", DEFAULT_UPLOADS_DIR)).resolve()
 GOLDEN_DIR = Path(os.environ.get(
     "RALLY_GOLDEN_DATA", PROJECT_DIR / "samples" / "golden")).resolve()
 GOLDEN_RESULTS_DIR = Path(os.environ.get(
-    "RALLY_GOLDEN_RESULTS", PROJECT_DIR / ".rally_golden")).resolve()
+    "RALLY_GOLDEN_RESULTS", DEFAULT_GOLDEN_RESULTS_DIR)).resolve()
 
 
 def _recommended_web_workers(cpu_count: int | None, cuda_free_bytes: int | None) -> int:
@@ -2449,7 +2453,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rally-web", description="Run the rally trimmer web UI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--data-dir", default=None, help="runtime upload/output directory")
+    parser.add_argument(
+        "--data-dir", default=None,
+        help="uploaded-session directory (default: sessions/uploads)")
     parser.add_argument("--reload", action="store_true", help="enable uvicorn auto-reload")
     args = parser.parse_args(argv)
 

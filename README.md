@@ -217,8 +217,10 @@ execution provider when one is installed, otherwise its cropped inference runs o
 `RALLY_WEB_YOLO` remains a label-crop-only override and otherwise inherits the YOLO12
 detection model.
 
-Each job is a self-contained directory under the data dir (default `.rally_web/`,
-override with `--data-dir` or `RALLY_WEB_DATA`). The server automatically runs up to four
+Each job is a self-contained directory under `sessions/uploads/` by default; retained
+golden-evaluation results live under `sessions/golden/`. Override the uploaded-job path
+with `--data-dir` or `RALLY_WEB_DATA`, and the golden-result path with
+`RALLY_GOLDEN_RESULTS`. The server automatically runs up to four
 trims concurrently, sized from CPU capacity and currently free CUDA memory; set
 `RALLY_WEB_WORKERS` to override that choice. Video export needs `ffmpeg` on `PATH`; if a
 label/`drawtext` render isn't available it falls back to a plain cut, and the

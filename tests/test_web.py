@@ -44,6 +44,12 @@ def _ffmpeg_or_skip():
 # --------------------------------------------------------------------------- #
 # unit tests (no ffmpeg / no video)                                           #
 # --------------------------------------------------------------------------- #
+def test_default_session_directories_share_visible_root():
+    assert webapp.SESSIONS_DIR == webapp.PROJECT_DIR / "sessions"
+    assert webapp.DEFAULT_UPLOADS_DIR == webapp.SESSIONS_DIR / "uploads"
+    assert webapp.DEFAULT_GOLDEN_RESULTS_DIR == webapp.SESSIONS_DIR / "golden"
+
+
 def test_recommended_web_workers_use_cpu_and_cuda_headroom():
     gib = 1024 ** 3
     assert webapp._recommended_web_workers(22, 80 * gib) == 4

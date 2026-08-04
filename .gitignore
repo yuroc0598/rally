@@ -6,9 +6,11 @@ __pycache__/
 tests/_scratch/
 tests/_scratch_web/
 
-# web UI runtime data (uploads, outputs, job metadata)
+# Visible runtime session data (uploads, outputs, job metadata, golden results)
+sessions/
+
+# Legacy runtime locations retained in ignore rules for older installations
 .rally_web/
-.rally_golden/
 .rally_golden*/
 _demo/
 *.mp4

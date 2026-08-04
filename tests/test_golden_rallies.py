@@ -16,7 +16,7 @@ To evaluate an already-produced pipeline sidecar without repeating inference, us
 
 To retain the analysis sidecar and processed video for the web golden-data view, set::
 
-    RALLY_RUN_GOLDEN=1 RALLY_GOLDEN_ARTIFACTS=.rally_golden \
+    RALLY_RUN_GOLDEN=1 RALLY_GOLDEN_ARTIFACTS=sessions/golden \
         pytest -q tests/test_golden_rallies.py
 """
 
