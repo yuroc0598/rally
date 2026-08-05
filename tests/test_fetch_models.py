@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from rally.tools.fetch_models import _drive_id_from_url, main
+from rally.tools.fetch_models import _drive_id_from_url, _gdown_command, main
 
 FILE_ID = "1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl"
 
@@ -20,6 +20,12 @@ def test_drive_id_from_url(url, expected):
 
 def test_main_no_args_returns_usage_code():
     assert main([]) == 2      # nothing to do -> usage exit code
+
+
+def test_gdown_uses_current_positional_file_id_interface():
+    command = _gdown_command(FILE_ID, "/tmp/tracknet.pt")
+    assert command[2:4] == ["gdown", FILE_ID]
+    assert "--id" not in command
 
 
 def test_main_drive_download_routes_through_gdown(monkeypatch, tmp_path):

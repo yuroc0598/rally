@@ -94,6 +94,11 @@ def _drive_id_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _gdown_command(file_id: str, dest: str) -> list[str]:
+    """Build the gdown 5/6-compatible command (the file ID is positional)."""
+    return [sys.executable, "-m", "gdown", file_id, "-O", dest]
+
+
 def _download_drive(file_id: str, dest: str) -> None:
     """Download with gdown in a monitored child so size/time limits are enforced live."""
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
@@ -112,7 +117,7 @@ def _download_drive(file_id: str, dest: str) -> None:
     dest_path = os.path.abspath(dest)
     part_dir = os.path.dirname(dest_path) or "."
     existing_parts = set(Path(part_dir).glob("*.part"))
-    proc = subprocess.Popen([sys.executable, "-m", "gdown", "--id", file_id, "-O", dest])
+    proc = subprocess.Popen(_gdown_command(file_id, dest))
     started = time.monotonic()
     try:
         while proc.poll() is None:

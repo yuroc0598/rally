@@ -64,6 +64,7 @@ from rally.web.schemas import (
     MAX_LABEL_ITEMS as _MAX_LABEL_ITEMS,
     LabelPayload,
     LabelTaskRequest,
+    MatchRosterUpdate,
     RosterUpdate,
     SegmentEdit,
 )
@@ -121,7 +122,8 @@ def _web_worker_count() -> int:
         if torch.cuda.is_available():
             cuda_free_bytes = int(torch.cuda.mem_get_info()[0])
     except Exception:
-        # Web startup must remain available on CPU-only or partially configured systems.
+        # CPU is a supported execution target; required-package/model validation happens
+        # in the strict server preflight before any queued work is recovered.
         cuda_free_bytes = None
     return _recommended_web_workers(os.cpu_count(), cuda_free_bytes)
 
@@ -146,7 +148,7 @@ _YOLO_MODEL: Any = None
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 _LABEL_KINDS = {"player_identity", "serve_motion"}
 _ROSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$")
-_DEFAULT_MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
+_DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024
 _MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 
 
@@ -155,6 +157,9 @@ class _JobCancelled(RuntimeError):
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    from rally.preflight import require_server_install
+
+    require_server_install()
     _recover_jobs_on_startup()
     yield
 
@@ -317,6 +322,43 @@ def _archive_label_artifacts(job_id: str) -> None:
     _prune_label_revisions(job_id)
 
 
+def _discard_published_result(job_id: str, job: dict[str, Any]) -> None:
+    """Delete and unpublish every artifact from the previous full analysis.
+
+    A reprocess is a new analysis, not an edit of the last successful result.  Once the
+    request has been admitted to the queue, stale video, metadata, and waveform data must
+    no longer be reachable through either the API or an old media URL.  The thumbnail and
+    original upload deliberately remain available so the processing player has a preview.
+    """
+    job_root = _job_dir(job_id).resolve()
+    candidates = [
+        Path(job["output_path"]) if job.get("output_path") else None,
+        Path(job["json_path"]) if job.get("json_path") else None,
+        job_root / "output" / "rallies.mp4",
+        job_root / "output" / "rallies.json",
+        job_root / "waveform.json",
+    ]
+    paths: set[Path] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(job_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"refusing to delete result outside job directory: {candidate}"
+            ) from exc
+        paths.add(resolved)
+
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+    job["output_path"] = None
+    job["json_path"] = None
+    job["result"] = None
+
+
 # --------------------------------------------------------------------------- #
 # progress: map pipeline log lines to a coarse stage + monotonic percent      #
 # --------------------------------------------------------------------------- #
@@ -337,8 +379,10 @@ _STAGE_RULES = [
     ("match-state validation: checking server pose", "pose", "Checking serve poses", 76),
     ("match-state validation: checking stationary", "pose", "Checking player setup", 82),
     ("match-state validation: checking ball", "serve", "Validating serves", 83),
+    ("point outcomes:", "deciding", "Classifying point results", 87),
     ("decoded", "deciding", "Points found", 89),
-    ("court serve detection", "refining", "Refining serves", 89),
+    ("court serve detection", "refining", "Reusing player tracks", 68),
+    ("serve set-up moved", "refining", "Anchoring serve starts", 72),
     ("ball point-end", "refining", "Refining rally ends", 89),
     ("computing waveform", "waveform", "Building timeline", 90),
     ("rendering", "rendering", "Rendering video", 92),
@@ -475,6 +519,33 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _merge_match_profile(existing: Any, detected: Any) -> dict[str, Any]:
+    """Keep user names while refreshing detector-owned format, teams, and identities."""
+    detected = dict(detected) if isinstance(detected, dict) else {}
+    existing = dict(existing) if isinstance(existing, dict) else {}
+    if not (detected.get("roster") or []) and existing.get("roster"):
+        # A failed/no-point re-analysis must never erase user-entered names. There is no
+        # fresh identity structure to merge, so retain the last durable match profile.
+        return existing
+    prior_names = {
+        str(record.get("id")): str(record.get("name") or "").strip()
+        for record in (existing.get("roster") or [])
+        if isinstance(record, dict) and record.get("id")
+    }
+    roster = []
+    for record in detected.get("roster") or []:
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        item = dict(record)
+        player_id = str(item["id"])
+        if prior_names.get(player_id):
+            item["name"] = prior_names[player_id]
+        roster.append(item)
+    detected["roster"] = roster
+    detected["names_updated_at"] = existing.get("names_updated_at")
+    return detected
+
+
 def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
                            output_ready: bool) -> dict[str, Any]:
     """Return metadata that describes web-published files without host paths."""
@@ -492,6 +563,7 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
 
         speed_candidates = (((clean.get("stages") or {}).get("ball_arbiter") or {})
                             .get("verification") or {}).get("candidates") or []
+        point_events = clean.get("points") or []
 
         def speed_for(point: tuple[float, float]) -> tuple[Optional[float], Optional[dict]]:
             best_overlap = 0.0
@@ -517,7 +589,9 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
         for index, (point, clip) in enumerate(zip(points, clips)):
             clip_duration = max(0.0, clip[1] - clip[0])
             speed, speed_estimate = speed_for(point)
-            layout.append({
+            point_event = next((event for event in point_events
+                                if int(event.get("index", -1)) == index), None)
+            item = {
                 "index": index,
                 "source_start": round(clip[0], 3),
                 "source_end": round(clip[1], 3),
@@ -527,7 +601,11 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
                 "output_end": round(cursor + clip_duration, 3),
                 "peak_ball_speed_kmh": speed,
                 "ball_speed_estimate": speed_estimate,
-            })
+            }
+            if point_event is not None:
+                item["participants"] = point_event.get("participants") or {}
+                item["termination"] = point_event.get("termination") or {}
+            layout.append(item)
             cursor += clip_duration
             if index < len(points) - 1:
                 cursor += gap_s
@@ -552,8 +630,15 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
 # --------------------------------------------------------------------------- #
 # config from web options (mirrors the CLI flags)                             #
 # --------------------------------------------------------------------------- #
+def _required_web_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Full evidence is mandatory for web jobs, including legacy re-runs."""
+    required = dict(options or {})
+    required.update(ball_arbiter=True, court_auto=True, detect_players=True)
+    return required
+
+
 def _config_from_options(options: dict[str, Any]) -> RallyConfig:
-    overrides: dict[str, Any] = {}
+    overrides: dict[str, Any] = {"match_auto_fail_closed": True}
     if options.get("play_mode") is not None:
         overrides["play_mode"] = options["play_mode"]
     if options.get("static_camera"):
@@ -583,13 +668,10 @@ def _config_from_options(options: dict[str, Any]) -> RallyConfig:
         overrides["use_dp_decoder"] = False
     if options.get("fast"):
         overrides["reencode"] = False
-    # ball-arbiter and court auto-detection are on by default (full trajectory path,
-    # fallback); respect an explicitly unchecked box. Weights are auto-discovered in the
-    # pipeline, which falls back to audio-primary if none are present.
-    if "ball_arbiter" in options:
-        overrides["ball_arbiter"] = bool(options["ball_arbiter"])
-    if "court_auto" in options:
-        overrides["court_auto"] = bool(options["court_auto"])
+    # Web jobs never run the audio-only reduced path. Setup/startup preflight guarantees
+    # these dependencies exist; the CLI/library API still supports explicit experiments.
+    overrides["ball_arbiter"] = True
+    overrides["court_auto"] = True
     return RallyConfig(**overrides)
 
 
@@ -973,12 +1055,12 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
             _append_progress(job_id, message, attempt_id=attempt_id)
             check_cancel()
 
-        options = job.get("options", {})
+        options = _required_web_options(job.get("options", {}))
         cfg = _config_from_options(options)
 
         # Analysis only: always yields a segment list, even without ffmpeg encode.
         result = trim(job["original_path"], output_path=None, cfg=cfg, json_path=None,
-                      detect_players=bool(options.get("detect_players", True)),
+                      detect_players=True,
                       progress=progress, cancel_check=check_cancel)
 
         sidecar = result.sidecar()
@@ -1007,6 +1089,10 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
             current = _read_json(_job_meta_path(job_id), None)
             if not current or current.get("active_attempt_id") != attempt_id:
                 return
+            match_profile = _merge_match_profile(
+                current.get("match"), sidecar.get("match"))
+            sidecar["match"] = match_profile
+            current["match"] = match_profile
             if output_ready:
                 os.replace(attempt_output_path, output_path)
             else:
@@ -1121,6 +1207,12 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
             raise HTTPException(status_code=503, detail="processing queue is full")
         if reserved_upload and job_id not in _UPLOAD_RESERVED:
             raise RuntimeError("upload queue reservation was lost")
+        # Admission succeeded.  A full reprocess invalidates its prior publication
+        # immediately; failed or cancelled attempts must not resurrect stale analysis.
+        _discard_published_result(job_id, job)
+        # Old jobs may have been created when the UI exposed reduced audio-only switches.
+        # A re-run upgrades them before queueing so the failure cannot recur.
+        job["options"] = _required_web_options(job.get("options", {}))
         attempt_id = uuid.uuid4().hex
         cancel_event = threading.Event()
         _CANCEL_EVENTS[job_id] = (attempt_id, cancel_event)
@@ -1340,6 +1432,7 @@ async def create_job(
         "serve_preroll": _parse_optional_float(serve_preroll),
         "tail": _parse_optional_float(tail),
     }
+    options = _required_web_options(options)
     options = {k: v for k, v in options.items() if v is not None}
     _validate_options(options)
 
@@ -1444,6 +1537,7 @@ async def create_job(
         "processing": {"stage": "uploaded", "label": "Uploaded", "percent": 5,
                        "detail": "Upload complete", "updated_at": _now()},
         "labeling": {"status": "idle", "detail": "", "updated_at": _now()},
+        "match": {},
         "result": None,
         "error": None,
         "retryable": False,
@@ -1482,11 +1576,59 @@ def get_job(job_id: str) -> JSONResponse:
     return JSONResponse(_public_job(_load_job(job_id)))
 
 
-def _capabilities() -> dict[str, Any]:
-    """Which optional processing features are actually usable in this install.
+@app.post("/api/jobs/{job_id}/match")
+def update_match_roster(job_id: str, update: MatchRosterUpdate) -> JSONResponse:
+    """Rename automatically detected players without changing detector-owned format."""
+    supplied: dict[str, str] = {}
+    for record in update.roster:
+        player_id = str(record.get("id") or "")
+        name = str(record.get("name") or "").strip()
+        if not _ROSTER_ID.fullmatch(player_id):
+            raise HTTPException(status_code=422, detail="invalid player id")
+        if not name or len(name) > 100:
+            raise HTTPException(status_code=422, detail="player names must be 1..100 characters")
+        if player_id in supplied:
+            raise HTTPException(status_code=422, detail="duplicate player id")
+        supplied[player_id] = name
 
-    Lets the UI disable toggles it can't honour (e.g. ball-arbiter without TrackNet
-    weights) instead of silently falling back mid-job.
+    with _LOCK:
+        path = _job_meta_path(job_id)
+        job = _read_json(path, None)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        match = dict(job.get("match") or {})
+        roster = [dict(record) for record in (match.get("roster") or [])
+                  if isinstance(record, dict) and record.get("id")]
+        expected = {str(record["id"]) for record in roster}
+        if not expected:
+            raise HTTPException(status_code=409, detail="players have not been detected yet")
+        if set(supplied) != expected:
+            raise HTTPException(
+                status_code=422,
+                detail=f"roster must contain exactly: {', '.join(sorted(expected))}",
+            )
+        for record in roster:
+            record["name"] = supplied[str(record["id"])]
+        match["roster"] = roster
+        match["names_updated_at"] = _now()
+        job["match"] = match
+        if isinstance(job.get("result"), dict):
+            job["result"]["match"] = match
+        job["updated_at"] = _now()
+        if job.get("json_path") and Path(job["json_path"]).exists():
+            sidecar = _read_json(Path(job["json_path"]), {})
+            if isinstance(sidecar, dict):
+                sidecar["match"] = match
+                _atomic_write_json(Path(job["json_path"]), sidecar)
+        _atomic_write_json(path, job)
+    return JSONResponse({"match": match})
+
+
+def _capabilities() -> dict[str, Any]:
+    """Report the required processing features verified again at server startup.
+
+    The UI still exposes per-job controls, but a missing required feature is now a startup
+    error rather than a reason to launch a degraded audio-only service.
     """
     import importlib.util
 
@@ -1702,6 +1844,13 @@ def _rewrite_sidecar(job: dict[str, Any], segs: list[tuple[float, float]]) -> di
     sidecar["total_seconds"] = round(total, 3)
     sidecar["compression_ratio"] = round(kept / total, 4) if total else 0.0
     sidecar["edited"] = True
+    # Point actors/outcomes are derived from the exact automatic boundaries and evidence
+    # graph. Manual interval edits invalidate them; retain the durable match roster only.
+    sidecar["points"] = []
+    stages = sidecar.setdefault("stages", {})
+    stages["point_outcomes"] = {
+        "status": "stale", "reason": "manual segment boundaries changed",
+    }
     if job.get("json_path"):
         _atomic_write_json(Path(job["json_path"]), sidecar)
     return sidecar
@@ -2207,8 +2356,14 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
         except Exception:
             duration = float(result.get("total_seconds") or 0)
 
-        roster = _roster_for("singles")
-        match_type = "singles"
+        detected_match = job.get("match") or result.get("match") or {}
+        detected_format = str(detected_match.get("format") or "")
+        match_type = detected_format if detected_format in {"singles", "doubles"} else "singles"
+        durable_roster = [
+            dict(record) for record in (detected_match.get("roster") or [])
+            if isinstance(record, dict) and record.get("id")
+        ]
+        roster = durable_roster or _roster_for(match_type)
         tasks: list[dict[str, Any]] = []
 
         if "player_identity" in req.kinds:
@@ -2238,6 +2393,14 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
             for r in roster:
                 if names.get(r["id"]):
                     r["name"] = names[r["id"]]
+        durable_names = {
+            str(record.get("id")): str(record.get("name") or "").strip()
+            for record in ((job.get("match") or {}).get("roster") or [])
+            if isinstance(record, dict) and record.get("id")
+        }
+        for record in roster:
+            if durable_names.get(str(record["id"])):
+                record["name"] = durable_names[str(record["id"])]
         _atomic_write_json(build_labels / "roster.json", roster)
         _atomic_write_json(build_labels / "tasks.json", tasks)
         stages = result.get("stages") or {}
@@ -2463,6 +2626,16 @@ def main(argv: list[str] | None = None) -> int:
         global DATA_DIR
         DATA_DIR = Path(args.data_dir).resolve()
         os.environ["RALLY_WEB_DATA"] = str(DATA_DIR)
+
+    # Fail before uvicorn opens a listening socket. The lifespan repeats this guard so
+    # direct `uvicorn rally.web.app:app` launches receive the same protection.
+    from rally.preflight import InstallationError, require_server_install
+
+    try:
+        require_server_install()
+    except InstallationError as exc:
+        print(f"rally-web: {exc}", file=sys.stderr)
+        return 1
     _ensure_data_dir()
 
     import uvicorn

@@ -7,6 +7,7 @@ import numpy as np
 from rally.config import RallyConfig
 from rally.pipeline import (
     _Channels,
+    _arbiter_candidates,
     _bounded_arbiter_regions,
     _ball_arbiter,
     _apply_ball_end_hints,
@@ -19,8 +20,38 @@ from rally.pipeline import (
     _player_activity_proposal,
     _recover_player_hint_points,
     _recover_fragmented_match_ends,
+    _select_arbiter_candidates,
     trim,
 )
+
+
+def test_arbiter_candidates_exclude_quiet_interpoint_time():
+    candidates = _arbiter_candidates(
+        [(0.0, 60.0)],
+        np.array([10.0, 11.0, 30.0, 31.0, 50.0]),
+        5.0,
+        pre_context_s=1.0,
+        post_context_s=1.5,
+    )
+
+    assert candidates == [(9.0, 12.5), (29.0, 32.5), (49.0, 51.5)]
+    assert sum(end - start for start, end in candidates) == 9.5
+
+
+def test_arbiter_candidate_without_audio_preserves_player_proposal():
+    assert _arbiter_candidates([(8.0, 10.0)], np.array([]), 5.0) == [(8.0, 10.0)]
+
+
+def test_arbiter_selection_requires_coherence_or_independent_player_hint():
+    cfg = RallyConfig(point_gap_s=5.0, match_player_hint_audio_guard_s=1.5)
+    onsets = np.array([10.0, 11.0, 30.0, 50.0])
+    candidates, stage = _select_arbiter_candidates(
+        [(8.0, 52.0)], [(9.0, 12.0)], onsets, np.array([30.4]), cfg)
+
+    assert candidates == [(9.0, 12.0), (29.0, 31.0)]
+    assert stage["coherent_candidates"] == 1
+    assert stage["player_hint_recoveries"] == 1
+    assert stage["discarded_unconfirmed_transient_clusters"] == 1
 
 
 def test_stable_receiver_transition_opens_serve_hint():

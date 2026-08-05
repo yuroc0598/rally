@@ -1200,6 +1200,18 @@ def validate_match_sequence(
         phases = [(0, len(points) - 1)] if points else []
     else:
         phases = _auto_match_phases(observations, strike_counts, cfg)
+    fail_closed_auto = bool(
+        cfg.play_mode == "auto"
+        and not phases
+        and getattr(cfg, "match_auto_fail_closed", False)
+        and observations
+        and all(observation.ball_checked for observation in observations)
+    )
+    if fail_closed_auto:
+        # Every candidate has had a real ball check. With no repeated legal service phase,
+        # treating speech, pickup hits, or resting-player motion as points is a false-open
+        # failure. Decode the whole stream under strict serve rules instead.
+        phases = [(0, len(points) - 1)] if points else []
     if cfg.play_mode == "auto" and not phases:
         return list(points), {
             "status": "abstained",
@@ -1278,6 +1290,13 @@ def validate_match_sequence(
             )
             for index in indices
         )
+        if getattr(cfg, "match_auto_fail_closed", False):
+            # In the production web path every candidate has ball, pose, and player
+            # formation evidence available. A stationary formation plus receiver motion
+            # is still common during rest, changeovers, and ball collection; it may help
+            # locate a serve but cannot *be* the serve. Require a measured dynamic action
+            # before publishing the logical group as a point.
+            confirmed = bool(confirmed and strong_service_action)
         weak_dynamic_hypothesis = bool(confirmed and not strong_service_action)
         implausibly_fast_reset = bool(
             kept
@@ -1741,6 +1760,7 @@ def validate_match_sequence(
         "dropped": reasons,
         "trajectory_accepted_not_exempt": protected,
         "kept_points": len(kept),
+        "auto_fail_closed": fail_closed_auto,
     }
     if not phases:
         stage["reason"] = (

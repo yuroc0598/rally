@@ -32,3 +32,9 @@ class LabelPayload(BaseModel):
 class RosterUpdate(BaseModel):
     revision: str = Field(min_length=1, max_length=100)
     roster: list[dict[str, Any]] = Field(max_length=20)
+
+
+class MatchRosterUpdate(BaseModel):
+    """Human-editable names for automatically detected persistent player ids."""
+
+    roster: list[dict[str, Any]] = Field(min_length=1, max_length=4)

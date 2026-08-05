@@ -508,14 +508,26 @@ def _detect_in_stationary_gray(gray: np.ndarray, min_score: float = 0.55
                         hypotheses.append((court, score))
         return hypotheses
 
-    features = hough_features(0.08)
-    hypotheses = build_hypotheses(
-        features, far_band=(0.38, 0.65), near_band=(0.68, 0.90),
-        # Elevated/wide-angle baseline cameras can compress the full playing rectangle
-        # to roughly 15% of image height. Full-model reprojection, area, perspective, and
-        # centre-alignment checks below reject net/service-line aliases more reliably than
-        # a hard depth cutoff.
-        separation_band=(0.14, 0.43))
+    # Fit several baseline-camera profiles. A single vertical band is brittle: ordinary
+    # phone footage often puts the near baseline in the bottom 5--10% of the image, while
+    # elevated cameras compress the entire playing rectangle toward the centre. The full
+    # projected court template and ambiguity guard below remain the final judges.
+    profiles = (
+        # Elevated/wide-angle baseline cameras.
+        ((0.38, 0.65), (0.68, 0.90), (0.14, 0.43)),
+        # Low tripod/phone cameras with a deep, sometimes partially clipped near baseline.
+        ((0.38, 0.68), (0.82, 0.97), (0.20, 0.58)),
+    )
+    hypotheses: List[Tuple[Court, float]] = []
+    for max_gap_frac in (0.08, 0.035):
+        features = hough_features(max_gap_frac)
+        for far_band, near_band, separation_band in profiles:
+            hypotheses.extend(build_hypotheses(
+                features,
+                far_band=far_band,
+                near_band=near_band,
+                separation_band=separation_band,
+            ))
     if not hypotheses:
         return None
     # Net/service-line subsets can score better than the complete court because the same

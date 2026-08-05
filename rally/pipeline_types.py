@@ -28,6 +28,8 @@ class RallyResult:
     stages: dict = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
     config: dict = field(default_factory=dict)
+    match: dict = field(default_factory=dict)
+    points: list[dict] = field(default_factory=list)
 
     def sidecar(self) -> dict:
         return {
@@ -46,6 +48,9 @@ class RallyResult:
                 for name, seconds in self.timings.items()
             },
             "config": self.config,
+            "analysis_schema_version": "rally.point_events.v1",
+            "match": self.match,
+            "points": self.points,
             "segments": [
                 {"index": index, "start": round(start, 3), "end": round(end, 3),
                  "duration": round(end - start, 3)}

@@ -1,6 +1,12 @@
+from types import SimpleNamespace
+
 import numpy as np
 
+from rally import pipeline
+from rally.config import RallyConfig
+from rally.signals.court import Court
 from rally.signals.player import (
+    PlayerTracker,
     clean_track,
     estimate_court_region,
     geometry_score_from_court_persons,
@@ -8,7 +14,6 @@ from rally.signals.player import (
     persons_in_court,
     target_court_box_indices,
 )
-from rally.signals.court import Court
 
 
 def test_estimate_court_region_from_clustered_feet():
@@ -105,3 +110,69 @@ def test_clean_track_preserves_edges_and_long_detection_gaps_as_missing():
     assert np.isclose(clean_x[2], 0.2)
     assert np.isnan(clean_x[4:6]).all()
     assert np.array_equal(np.isnan(clean_x), np.isnan(clean_y))
+
+
+def test_player_tracker_reprojects_shared_visual_samples_without_video_decode():
+    class LinearCourt:
+        def to_court(self, points):
+            return np.asarray(points, dtype=float) * np.array([0.1, 0.2])
+
+    samples = [
+        (0.0, [(0.20, 0.40, 0.03), (0.70, 0.80, 0.20)]),
+        (0.5, [(0.21, 0.40, 0.03), (0.70, 0.80, 0.20)]),
+        (1.0, [(0.22, 0.40, 0.03), (0.70, 0.80, 0.20)]),
+    ]
+
+    track = PlayerTracker().court_track_from_samples(
+        samples, LinearCourt(), (100, 100), speed_limit_mps=20.0)
+
+    assert track.t.tolist() == [0.0, 0.5, 1.0]
+    assert track.cx.tolist() == [2.0, 2.1, 2.2]
+    assert track.cy.tolist() == [8.0, 8.0, 8.0]
+
+
+def test_serve_anchor_uses_shared_samples_instead_of_full_video_tracking(monkeypatch):
+    calls = []
+
+    class Tracker:
+        def __init__(self, detector):
+            calls.append(("init", detector))
+
+        def court_track_from_samples(self, samples, court, frame_size):
+            calls.append(("shared", samples, court, frame_size))
+            return SimpleNamespace(
+                t=np.array([0.0, 0.5, 1.0]),
+                cx=np.array([2.0, 2.0, 2.0]),
+                cy=np.array([1.0, 1.0, 1.0]),
+                speed=np.zeros(3),
+            )
+
+        def court_track(self, *_args, **_kwargs):
+            raise AssertionError("serve anchoring decoded the full video again")
+
+    monkeypatch.setattr("rally.signals.player.PlayerTracker", Tracker)
+    monkeypatch.setattr(
+        "rally.signals.player.refine_starts_with_serve",
+        lambda points, *_args, **_kwargs: points,
+    )
+    court = object()
+    detector = object()
+    samples = [(0.0, [(0.5, 0.8, 0.1)])]
+    channels = pipeline._Channels(
+        court=court,
+        detector=detector,
+        onsets=np.array([1.0]),
+        player_samples=samples,
+        frame_size=(1920, 1080),
+    )
+
+    result = pipeline._anchor_serves(
+        "must-not-be-opened.mp4", [(0.5, 2.0)], channels,
+        RallyConfig(), lambda _message: None)
+
+    assert result == [(0.5, 2.0)]
+    assert calls == [
+        ("init", detector),
+        ("shared", samples, court, (1920, 1080)),
+    ]
+    assert channels.stages["serve_anchor"]["source"] == "shared_visual_pass"

@@ -229,24 +229,92 @@ def _pose_channel(input_path, timeline, cfg, ch, progress,
 # decision + refinement stages: probability -> points -> refined points       #
 # --------------------------------------------------------------------------- #
 def _arbiter_candidates(regions: List[Segment], onsets: np.ndarray,
-                        split_gap_s: float) -> List[Segment]:
-    """Partition coarse regions without discarding any time or single-hit candidates.
+                        split_gap_s: float, *, pre_context_s: float = 1.0,
+                        post_context_s: float = 1.0) -> List[Segment]:
+    """Turn broad recall regions into strike-bounded TrackNet candidates.
 
-    Audio gaps provide useful workload boundaries, but proposal generation must remain
-    high-recall: every part of every coarse region is retained for the ball arbiter.
+    The proposal mask deliberately opens around every plausible transient and can bridge
+    most of a match. Passing every quiet interval between strike clusters to TrackNet made
+    a ten-minute upload require almost ten minutes of CNN input. Retain toss/landing
+    context around each cluster while leaving padding and endpoint extension to the ball
+    verifier. Regions with no audio still survive unchanged so player-derived, audio-missed
+    serves remain eligible.
     """
     onsets = np.sort(np.asarray(onsets, dtype=float))
     out: List[Segment] = []
     for rs, re in regions:
         w = onsets[(onsets >= rs) & (onsets <= re)]
-        if w.size < 2:
+        if w.size == 0:
             out.append((rs, re))
             continue
         cuts = np.where(np.diff(w) > split_gap_s)[0]
-        boundaries = [0.5 * (float(w[i]) + float(w[i + 1])) for i in cuts]
-        edges = [rs, *boundaries, re]
-        out.extend((float(a), float(b)) for a, b in zip(edges, edges[1:]) if b > a)
+        starts = np.r_[0, cuts + 1]
+        stops = np.r_[cuts + 1, w.size]
+        for first, stop in zip(starts, stops):
+            cluster = w[int(first):int(stop)]
+            start = max(float(rs), float(cluster[0]) - max(0.0, pre_context_s))
+            end = min(float(re), float(cluster[-1]) + max(0.0, post_context_s))
+            if end > start:
+                out.append((start, end))
     return out
+
+
+def _select_arbiter_candidates(
+    regions: List[Segment], coherent_points: List[Segment], onsets: np.ndarray,
+    player_hints: np.ndarray, cfg,
+) -> Tuple[List[Segment], dict]:
+    """Prefer point-level audio groups while retaining independent recovery evidence.
+
+    Every isolated transient used to launch TrackNet. In ordinary match recordings that
+    means score calls, footsteps, and ball hand-offs consume most of the source timeline.
+    Multi-contact coherent points remain high-recall primary candidates. A non-coherent
+    cluster survives only when target-player motion independently places a serve beside
+    one of its contacts; regions with no audio also survive for motion-only recovery.
+    """
+    raw = _arbiter_candidates(
+        regions, onsets, cfg.point_gap_s,
+        pre_context_s=cfg.toss_preroll_s,
+        post_context_s=cfg.landing_tail_s,
+    )
+    primary = []
+    for point in coherent_points:
+        local = effective_strike_times(
+            _point_strikes(point, np.asarray(onsets, dtype=float)),
+            cfg.echo_collapse_s,
+        )
+        if (len(local) >= cfg.min_rally_strikes
+                and _point_covered_by_regions(point, regions, onsets)):
+            primary.append(point)
+    selected = list(primary)
+    hint_recoveries = 0
+    audio_missed_recoveries = 0
+    hints = np.asarray(player_hints, dtype=float)
+    strikes = np.asarray(onsets, dtype=float)
+    for candidate in raw:
+        if any(_overlaps(candidate, point) for point in primary):
+            continue
+        local_strikes = strikes[
+            (strikes >= candidate[0]) & (strikes <= candidate[1])]
+        if local_strikes.size == 0:
+            selected.append(candidate)
+            audio_missed_recoveries += 1
+            continue
+        aligned = bool(hints.size and np.any(
+            np.abs(hints[:, None] - local_strikes[None, :])
+            <= cfg.match_player_hint_audio_guard_s
+        ))
+        if aligned:
+            selected.append(candidate)
+            hint_recoveries += 1
+    selected.sort()
+    return selected, {
+        "raw_candidates": len(raw),
+        "coherent_candidates": len(primary),
+        "player_hint_recoveries": hint_recoveries,
+        "audio_missed_recoveries": audio_missed_recoveries,
+        "discarded_unconfirmed_transient_clusters": (
+            len(raw) - len(primary) - hint_recoveries - audio_missed_recoveries),
+    }
 
 
 def _bounded_arbiter_regions(regions: List[Segment], evidence: np.ndarray,
@@ -778,10 +846,26 @@ def _derive_points(ch, duration, cfg, progress, *, for_ball_arbiter: bool = Fals
             point for point in coherent_points
             if not _point_covered_by_regions(point, selected, ch.onsets)
         ]
-        candidates = _arbiter_candidates(selected, onsets, cfg.point_gap_s)
+        candidates, candidate_selection = _select_arbiter_candidates(
+            selected, coherent_points, onsets, ch.player_proposal_hints, cfg,
+        )
         proposal_stage = ch.stages["arbiter_proposal"]
+        padded = sorted(
+            (max(0.0, start - cfg.arbiter_pre_pad_s),
+             min(duration, end + max(cfg.arbiter_post_pad_s, cfg.ball_max_extend_s)))
+            for start, end in candidates
+        )
+        candidate_union: List[List[float]] = []
+        for start, end in padded:
+            if candidate_union and start <= candidate_union[-1][1]:
+                candidate_union[-1][1] = max(candidate_union[-1][1], end)
+            else:
+                candidate_union.append([start, end])
+        candidate_tracking_s = sum(end - start for start, end in candidate_union)
         proposal_stage.update({
             "selected_candidates": len(candidates),
+            "candidate_selection": candidate_selection,
+            "candidate_tracking_seconds": round(candidate_tracking_s, 3),
             "audio_fallback_points": len(ch.arbiter_audio_fallback),
             "audio_fallback_seconds": round(
                 total_kept_seconds(ch.arbiter_audio_fallback), 3),
@@ -793,7 +877,7 @@ def _derive_points(ch, duration, cfg, progress, *, for_ball_arbiter: bool = Fals
             progress(
                 "  player serve proposal: "
                 f"{len(ch.player_serve_hints)} stable-to-active hint(s); "
-                f"TrackNet workload {proposal_stage.get('tracked_seconds', 0):.1f}s"
+                f"TrackNet workload {proposal_stage.get('candidate_tracking_seconds', 0):.1f}s"
             )
         ch.stages["arbiter_audio_fallback"] = {
             "status": ("ready" if (ch.arbiter_audio_fallback
@@ -831,16 +915,41 @@ def _derive_points(ch, duration, cfg, progress, *, for_ball_arbiter: bool = Fals
     return regions
 
 
-def _anchor_serves(input_path, segments, ch, cfg, progress) -> List[Segment]:
-    """Opt-in (calibration + YOLO): move each point start back to the serve set-up."""
+def _anchor_serves(_input_path, segments, ch, cfg, progress) -> List[Segment]:
+    """Move point starts using detections retained from the single visual pass."""
     if not (ch.court is not None and ch.onsets.size and segments):
+        return segments
+    if not ch.player_samples or ch.frame_size is None:
+        ch.stages["serve_anchor"] = {
+            "status": "skipped",
+            "source": "shared_visual_pass",
+            "reason": "shared target-court player samples unavailable",
+        }
+        progress(
+            "court serve detection: shared player samples unavailable -> starts unchanged")
         return segments
     try:
         from .signals.player import PlayerTracker, refine_starts_with_serve
-        progress("court serve detection: tracking near player in court metres")
-        pt = PlayerTracker(ch.detector).court_track(
-            input_path, ch.court, fps_a=cfg.serve_track_fps,
-            detection_model=cfg.player_detection_model)
+
+        progress(
+            f"court serve detection: reusing {len(ch.player_samples)} "
+            "visual-pass player samples")
+        pt = PlayerTracker(ch.detector).court_track_from_samples(
+            ch.player_samples,
+            ch.court,
+            ch.frame_size,
+        )
+        measured = int(np.sum(np.isfinite(pt.cx) & np.isfinite(pt.cy)))
+        if measured == 0:
+            ch.stages["serve_anchor"] = {
+                "status": "skipped",
+                "source": "shared_visual_pass",
+                "samples": len(pt.t),
+                "measured_samples": 0,
+                "reason": "no near-player observations in shared samples",
+            }
+            progress("  no shared near-player track -> starts unchanged")
+            return segments
         before = list(segments)
         segments = refine_starts_with_serve(
             segments, ch.onsets, pt.t, pt.cy, pt.speed,
@@ -848,8 +957,14 @@ def _anchor_serves(input_path, segments, ch, cfg, progress) -> List[Segment]:
             still_speed=cfg.serve_still_speed_mps, preroll_s=cfg.serve_setup_preroll_s,
             max_lead_s=cfg.serve_max_lead_s)
         moved = sum(1 for (a, _), (b, _) in zip(before, segments) if b < a - 0.3)
-        ch.stages["serve_anchor"] = {"status": "used", "moved": moved,
-                                     "candidates": len(segments)}
+        ch.stages["serve_anchor"] = {
+            "status": "used",
+            "source": "shared_visual_pass",
+            "moved": moved,
+            "candidates": len(segments),
+            "samples": len(pt.t),
+            "measured_samples": measured,
+        }
         progress(f"  serve set-up moved {moved}/{len(segments)} point starts to the serve")
     except Exception as exc:  # pragma: no cover
         ch.stages["serve_anchor"] = {"status": "failed", "reason": str(exc)}
@@ -1263,7 +1378,7 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
             resolve_yolo_device,
         )
         from .signals.pose import resolve_rtmpose_device, rtmpose_execution_providers
-        from .signals.serve import observe_ball_serves
+        from .signals.serve import BallServeObservation, observe_ball_serves
 
         progress("match-state validation: checking server pose near early impacts")
         # Player reactions may open expensive video probes, but they are not ball strikes.
@@ -1320,6 +1435,19 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
             progress("match-state validation: checking ball toss/serve motion")
             serve_cache_hits = 0
 
+            # Ball inference is meaningful only when the independently measured player
+            # channel found a stationary formation, serve pose, or receiver reaction.
+            # This combines the evidence as one serve decision and prevents score calls
+            # and between-game walking from launching TrackNet merely because they made a
+            # sound. Mark prefiltered entries as checked-negative so auto mode fails
+            # closed rather than preserving them as unevaluated fallbacks.
+            ball_probe_indices = [
+                index for index, observation in enumerate(observations)
+                if observation.setup_evidence
+                or observation.receiver_reaction_evidence
+            ]
+            ball_probe_segments = [segments[index] for index in ball_probe_indices]
+
             def serve_progress(done: int, total: int, cache_hits: int) -> None:
                 nonlocal serve_cache_hits
                 serve_cache_hits = cache_hits
@@ -1328,14 +1456,24 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
                     f"({cache_hits} reused TrackNet window(s))")
 
             with _timed(ch, "match_ball_serve", progress):
-                ball_observations = observe_ball_serves(
-                    input_path, segments, probe_times, weights, cfg,
+                probed_ball_observations = observe_ball_serves(
+                    input_path, ball_probe_segments, probe_times, weights, cfg,
                     court=ch.court,
                     track_cache=ch.ball_track_cache,
                     progress_callback=serve_progress,
                     cancel_check=cancel_check)
-            if len(ball_observations) != len(observations):
+            if len(probed_ball_observations) != len(ball_probe_indices):
                 raise RuntimeError("ball serve observations do not align with point candidates")
+            ball_observations = [
+                BallServeObservation(
+                    point=tuple(map(float, point)), checked=True, confirmed=False,
+                    best_strike=None, coverage=0.0, vertical_span=0.0,
+                    outgoing_span=0.0, ordered=False, measured_samples=0,
+                )
+                for point in segments
+            ]
+            for index, ball in zip(ball_probe_indices, probed_ball_observations):
+                ball_observations[index] = ball
             observations = [
                 replace(
                     pose,
@@ -1388,7 +1526,9 @@ def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=No
         stage["serve_track_cache_hits"] = (
             serve_cache_hits if weights else 0)
         stage["serve_track_cache_candidates"] = (
-            len(observations) if weights else 0)
+            len(ball_probe_indices) if weights else 0)
+        stage["serve_ball_prefilter_skipped"] = (
+            len(observations) - len(ball_probe_indices) if weights else 0)
         stage["learned_serve_model"] = learned_model_stage
         ch.stages["match_state"] = stage
         removed = before - len(segments)
@@ -1584,6 +1724,43 @@ def trim(
         segments = _filter_nonplay(segments, cfg, progress)
     cancel_check()
 
+    match: dict = {}
+    points: list[dict] = []
+    if segments:
+        progress("point outcomes: associating players and decoding tennis rule events")
+        with _timed(ch, "point_outcomes", progress):
+            from .fusion.point_outcomes import analyse_point_outcomes
+
+            match, points = analyse_point_outcomes(
+                segments,
+                track_cache=ch.ball_track_cache,
+                court=ch.court,
+                player_samples=ch.player_samples,
+                frame_size=ch.frame_size,
+                onsets=ch.onsets,
+                match_state=ch.stages.get("match_state") or {},
+            )
+        ch.stages["point_outcomes"] = {
+            "status": "used",
+            "schema_version": "rally.point_events.v1",
+            "match_format": match.get("format", "unknown"),
+            "match_format_confidence": match.get("format_confidence", 0.0),
+            "players": len(match.get("roster") or []),
+            "classified": sum(
+                (point.get("termination") or {}).get("rule_event") != "unknown"
+                for point in points
+            ),
+            "unknown": sum(
+                (point.get("termination") or {}).get("rule_event") == "unknown"
+                for point in points
+            ),
+            "ball_track_cache_reused": bool(ch.ball_track_cache),
+        }
+    else:
+        ch.stages["point_outcomes"] = {
+            "status": "skipped", "reason": "no accepted points",
+        }
+
     kept = total_kept_seconds(segments)
     progress(f"decoded {len(segments)} points, {kept:.1f}s kept of {duration:.1f}s")
     ch.timings["analysis_total"] = time.perf_counter() - pipeline_started
@@ -1601,6 +1778,8 @@ def trim(
         stages=ch.stages,
         timings=ch.timings,
         config=asdict(cfg),
+        match=match,
+        points=points,
     )
 
     _write_output(

@@ -149,6 +149,86 @@ class CroppedRTMPose:
         self.detection_device = detection_device or "cpu"
         self.runtime = runtime
 
+    def _predict_dynamic_onnx_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        boxes_by_frame: Sequence[np.ndarray],
+        batch_size: int,
+    ) -> Optional[list[PoseFrameResult]]:
+        """Run all person crops in true ONNX batches when the model permits it.
+
+        RTMLib's public ``RTMPose.__call__`` loops over boxes and invokes ONNX Runtime
+        once per person. The bundled model has a dynamic batch dimension, so grouping
+        preprocessed crops removes hundreds of tiny session calls on a typical match.
+        Return ``None`` for fixed-batch or non-ONNX backends so the portable path below
+        remains available.
+        """
+        estimator = self.estimator
+        if getattr(estimator, "backend", None) != "onnxruntime":
+            return None
+        session = getattr(estimator, "session", None)
+        if session is None:
+            return None
+        inputs = session.get_inputs()
+        if not inputs:
+            return None
+        input_shape = getattr(inputs[0], "shape", ())
+        if not input_shape:
+            return None
+        batch_dimension = input_shape[0]
+        if isinstance(batch_dimension, int):
+            return None
+
+        keypoints_by_frame = [
+            np.empty((len(boxes), 17, 2), dtype=float) for boxes in boxes_by_frame
+        ]
+        confidence_by_frame = [
+            np.empty((len(boxes), 17), dtype=float) for boxes in boxes_by_frame
+        ]
+        crops: list[np.ndarray] = []
+        metadata: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+        for frame_index, (frame, boxes) in enumerate(zip(frames, boxes_by_frame)):
+            for person_index, box in enumerate(boxes):
+                crop, center, scale = estimator.preprocess(frame, box.tolist())
+                crops.append(np.ascontiguousarray(
+                    crop.transpose(2, 0, 1), dtype=np.float32))
+                metadata.append((
+                    frame_index,
+                    person_index,
+                    np.asarray(center, dtype=float),
+                    np.asarray(scale, dtype=float),
+                ))
+
+        size = max(1, int(batch_size))
+        output_names = [output.name for output in session.get_outputs()]
+        input_name = inputs[0].name
+        for start in range(0, len(crops), size):
+            stop = min(len(crops), start + size)
+            values = np.stack(crops[start:stop], axis=0)
+            outputs = session.run(output_names, {input_name: values})
+            for offset, (frame_index, person_index, center, scale) in enumerate(
+                metadata[start:stop]
+            ):
+                per_person = [value[offset:offset + 1] for value in outputs]
+                keypoints, confidence = estimator.postprocess(
+                    per_person, center, scale)
+                keypoints = np.asarray(keypoints, dtype=float).reshape(-1, 2)
+                confidence = np.asarray(confidence, dtype=float).reshape(-1)
+                if keypoints.shape[0] < 17 or confidence.shape[0] < 17:
+                    raise RuntimeError(
+                        "RTMPose result does not contain COCO-17 body joints")
+                keypoints_by_frame[frame_index][person_index] = keypoints[:17]
+                confidence_by_frame[frame_index][person_index] = confidence[:17]
+
+        return [
+            PoseFrameResult(
+                boxes=boxes,
+                keypoints=keypoints_by_frame[index],
+                confidence=confidence_by_frame[index],
+            )
+            for index, boxes in enumerate(boxes_by_frame)
+        ]
+
     def predict(
         self,
         frames: Sequence[np.ndarray],
@@ -169,11 +249,11 @@ class CroppedRTMPose:
         if len(detections) != len(frames):
             raise RuntimeError(
                 "YOLO detector returned a different number of results than pose frames")
-        output: list[PoseFrameResult] = []
+        boxes_by_frame: list[np.ndarray] = []
         for frame, detection in zip(frames, detections):
             raw_boxes = getattr(detection, "boxes", None)
             if raw_boxes is None or len(raw_boxes) == 0:
-                output.append(PoseFrameResult.empty())
+                boxes_by_frame.append(np.empty((0, 4), dtype=float))
                 continue
             values = raw_boxes.xyxy
             boxes = np.asarray(
@@ -188,13 +268,24 @@ class CroppedRTMPose:
             elif target_required:
                 boxes = np.empty((0, 4), dtype=float)
             if boxes.size == 0:
-                output.append(PoseFrameResult.empty())
+                boxes_by_frame.append(np.empty((0, 4), dtype=float))
                 continue
             height, width = frame.shape[:2]
             boxes[:, (0, 2)] = np.clip(boxes[:, (0, 2)], 0, max(0, width - 1))
             boxes[:, (1, 3)] = np.clip(boxes[:, (1, 3)], 0, max(0, height - 1))
             valid = (boxes[:, 2] - boxes[:, 0] >= 4) & (boxes[:, 3] - boxes[:, 1] >= 8)
             boxes = boxes[valid]
+            if boxes.size == 0:
+                boxes = np.empty((0, 4), dtype=float)
+            boxes_by_frame.append(boxes)
+
+        batched = self._predict_dynamic_onnx_batch(
+            frames, boxes_by_frame, batch_size)
+        if batched is not None:
+            return batched
+
+        output: list[PoseFrameResult] = []
+        for frame, boxes in zip(frames, boxes_by_frame):
             if boxes.size == 0:
                 output.append(PoseFrameResult.empty())
                 continue

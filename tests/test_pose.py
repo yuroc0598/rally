@@ -103,6 +103,75 @@ def test_cropped_rtmpose_filters_neighbor_court_before_pose():
     assert estimator.boxes == [[10.0, 10.0, 30.0, 80.0]]
 
 
+def test_cropped_rtmpose_batches_dynamic_onnx_person_crops():
+    class Boxes:
+        def __init__(self):
+            self.xyxy = np.array([[10.0, 10.0, 40.0, 80.0]])
+
+        def __len__(self):
+            return 1
+
+    class Detector:
+        def predict(self, frames, **_kwargs):
+            return [SimpleNamespace(boxes=Boxes()) for _frame in frames]
+
+    class Io:
+        def __init__(self, name, shape=None):
+            self.name = name
+            self.shape = shape
+
+    class Session:
+        def __init__(self):
+            self.batch_calls = []
+
+        def get_inputs(self):
+            return [Io("image", ["batch", 3, 2, 2])]
+
+        def get_outputs(self):
+            return [Io("simcc_x"), Io("simcc_y")]
+
+        def run(self, _output_names, inputs):
+            batch = inputs["image"].shape[0]
+            self.batch_calls.append(batch)
+            return [
+                np.zeros((batch, 17, 4), dtype=np.float32),
+                np.zeros((batch, 17, 4), dtype=np.float32),
+            ]
+
+    class Estimator:
+        backend = "onnxruntime"
+
+        def __init__(self):
+            self.session = Session()
+
+        def preprocess(self, _frame, box):
+            return np.full((2, 2, 3), box[0]), np.array([1.0, 2.0]), np.ones(2)
+
+        def postprocess(self, _outputs, center, _scale):
+            keypoints = np.tile(center, (1, 17, 1))
+            confidence = np.ones((1, 17), dtype=float)
+            return keypoints, confidence
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("dynamic ONNX model fell back to per-person inference")
+
+    estimator = Estimator()
+    backend = CroppedRTMPose(
+        detector=Detector(), estimator=estimator,
+        detection_device="cpu", pose_device="cpu")
+
+    results = backend.predict(
+        [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(5)],
+        target_required=False,
+        batch_size=3,
+    )
+
+    assert estimator.session.batch_calls == [3, 2]
+    assert len(results) == 5
+    assert all(result.keypoints.shape == (1, 17, 2) for result in results)
+    assert all(result.confidence.shape == (1, 17) for result in results)
+
+
 def test_pose_features_recognize_overhead_wrist_and_ready_stance():
     pose = np.zeros((17, 2), dtype=float)
     confidence = np.ones(17, dtype=float)

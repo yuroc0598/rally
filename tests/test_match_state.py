@@ -76,6 +76,60 @@ def test_auto_mode_leaves_unstructured_warmup_without_three_serve_anchors():
     assert stage["status"] == "abstained"
 
 
+def test_web_accuracy_auto_mode_fails_closed_on_rest_without_serve_phase():
+    points = [(0, 5), (10, 15), (20, 25)]
+    observations = [
+        _ob(point, None, serve=False, setup=False, ball_checked=True)
+        for point in points
+    ]
+    onsets = np.array([1.0, 2.0, 11.0, 12.0, 21.0, 22.0])
+
+    kept, stage = validate_match_sequence(
+        points, onsets, observations,
+        RallyConfig(
+            play_mode="auto", match_auto_fail_closed=True,
+            match_point_start_preroll_s=1.0,
+        ),
+    )
+
+    assert kept == []
+    assert stage["auto_fail_closed"] is True
+    assert {record["reason_code"] for record in stage["dropped"]} == {
+        "missing_confirmed_serve"}
+
+
+def test_web_fail_closed_rejects_stationary_reaction_without_dynamic_serve():
+    points = [(0, 5), (10, 15), (40, 45), (70, 75)]
+    resting_reaction = replace(
+        _ob(points[1], "left", serve=False, setup=True, ball_checked=True),
+        target_court_filtered=True,
+        position_checked=True,
+        position_setup_evidence=True,
+        position_best_strike=11.0,
+        position_server_end="near",
+        position_server_span=0.01,
+        position_stable_fraction=1.0,
+        position_score=0.8,
+        receiver_reaction_evidence=True,
+        receiver_reaction_time=11.2,
+    )
+    observations = [
+        _ob(points[0], "right"), resting_reaction,
+        _ob(points[2], "left"), _ob(points[3], "right"),
+    ]
+
+    kept, stage = validate_match_sequence(
+        points, np.array([1, 2, 11, 12, 41, 42, 71, 72]), observations,
+        RallyConfig(
+            play_mode="auto", match_auto_fail_closed=True,
+            match_point_start_preroll_s=1.0,
+        ),
+    )
+
+    assert kept == [points[0], points[2], points[3]]
+    assert stage["logical_groups"][1]["decision"] == "drop"
+
+
 def test_auto_match_drops_single_background_hit_before_target_match_but_keeps_warmup_rally():
     points = [(0, 3), (25, 28), (35, 38), (45, 48)]
     leading_noise = replace(

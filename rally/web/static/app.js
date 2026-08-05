@@ -213,13 +213,13 @@ function uploadJob(file, openWhenBatchFinishes = false) {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("play_mode", $("#playMode").value);
-  fd.append("detect_players", $("#detectPlayers").checked);
+  fd.append("detect_players", "true");
   fd.append("static_camera", $("#staticCamera").checked);
   fd.append("fast", $("#fast").checked);
   fd.append("hysteresis", $("#hysteresis").checked);
   fd.append("no_labels", $("#noLabels").checked);
-  fd.append("ball_arbiter", $("#ballArbiter").checked);
-  fd.append("court_auto", $("#courtAuto").checked);
+  fd.append("ball_arbiter", "true");
+  fd.append("court_auto", "true");
   fd.append("run_now", "true");
   const opt = {
     analysis_fps: "#analysisFps", min_rally: "#minRally", skip_intro: "#skipIntro",
@@ -467,6 +467,9 @@ function renderDetail(job) {
   stopButton.disabled = Boolean(job.cancel_requested || p.stage === "cancelling");
   stopButton.textContent = stopButton.disabled ? "Stopping…" : "Stop processing";
   $("#reprocessButton").disabled = processing;
+  $("#addSegment").disabled = processing;
+  $("#revertSegments").disabled = processing;
+  if (processing) $("#applySegments").disabled = true;
 
   // metrics
   $("#mPoints").textContent = r.n_rallies ?? 0;
@@ -496,8 +499,13 @@ function renderDetail(job) {
     outState.classList.add("hidden");
     $("#playerHitLayer").classList.remove("hidden");
     $("#ballSpeed").classList.remove("hidden");
+    $("#pointOutcome").classList.remove("hidden");
   } else {
-    out.removeAttribute("src");
+    if (out.dataset.src || out.hasAttribute("src")) {
+      out.pause();
+      out.removeAttribute("src");
+      out.load();
+    }
     out.dataset.src = "";
     outState.classList.remove("hidden");
     const preview = $("#processingPreview");
@@ -524,6 +532,7 @@ function renderDetail(job) {
     $("#processingBar").value = pct;
     $("#playerHitLayer").classList.add("hidden");
     $("#ballSpeed").classList.add("hidden");
+    $("#pointOutcome").classList.add("hidden");
   }
   updateProcessingClock(job);
   if (state.videoTab === null || gainedOutput) selectVideoTab("processed");
@@ -535,6 +544,7 @@ function renderDetail(job) {
   setLink($("#dlJson"), m.metadata_download);
 
   // labeling section reflects the job's labeling status
+  renderMatchSetup(job);
   renderLabelingSection(job);
 }
 
@@ -610,6 +620,112 @@ function updateOutputOverlay() {
   } else {
     readout.textContent = "Ball speed unavailable";
     readout.title = "Requires reliable ball trajectory and court calibration.";
+  }
+  const outcome = $("#pointOutcome");
+  const participants = current?.point?.participants || {};
+  const termination = current?.point?.termination || {};
+  const server = matchPlayerName(participants.server_id);
+  const bits = [];
+  if (server) bits.push(`Server: ${server}`);
+  const winner = matchPlayerName(termination.winner_player_id)
+    || matchTeamName(termination.winner_team_id);
+  if (winner) bits.push(`Winner: ${winner}`);
+  const eventNames = {
+    double_fault: "Double fault", out: "Ball out", net_failure: "Hit into net",
+    second_bounce: "Second bounce", body_or_net_touch: "Player/net touch",
+  };
+  const creditNames = {
+    ace: "Ace", service_winner: "Service winner", clean_winner: "Winner",
+    forced_error: "Forced error", unforced_error: "Unforced error",
+    error_unknown: "Error",
+  };
+  const finish = creditNames[termination.credit] || eventNames[termination.rule_event];
+  if (finish) bits.push(`Finish: ${finish}`);
+  const errorPlayer = matchPlayerName(termination.error_player_id);
+  if (errorPlayer) bits.push(`Error: ${errorPlayer}`);
+  if (!bits.length) bits.push("Point result: insufficient evidence");
+  outcome.textContent = bits.join(" · ");
+  outcome.classList.toggle("unknown", !termination.rule_event || termination.rule_event === "unknown");
+}
+
+function matchPlayerName(playerId) {
+  if (!playerId) return null;
+  const roster = state.current?.match?.roster || state.current?.result?.match?.roster || [];
+  const player = roster.find((record) => record.id === playerId);
+  return player?.name || playerId;
+}
+
+function matchTeamName(teamId) {
+  if (!teamId) return null;
+  const match = state.current?.match || state.current?.result?.match || {};
+  const team = (match.teams || []).find((record) => record.id === teamId);
+  const names = (team?.player_ids || []).map(matchPlayerName).filter(Boolean);
+  return names.length ? names.join(" / ") : teamId;
+}
+
+function renderMatchSetup(job) {
+  const match = job.match || job.result?.match || {};
+  const roster = Array.isArray(match.roster) ? match.roster : [];
+  const format = match.format;
+  const confidence = Number(match.format_confidence);
+  const detection = $("#matchDetection");
+  if (format === "singles" || format === "doubles") {
+    const pct = Number.isFinite(confidence) ? ` — ${Math.round(confidence * 100)}% confidence` : "";
+    detection.textContent = `Detected automatically: ${format[0].toUpperCase()}${format.slice(1)}${pct}`;
+  } else {
+    detection.textContent = ["queued", "running"].includes(job.status)
+      ? "Player detection is running…" : "Match format could not be determined";
+  }
+  const box = $("#matchRoster");
+  box.replaceChildren();
+  roster.forEach((player) => {
+    const wrap = document.createElement("div");
+    wrap.className = "match-player";
+    const badge = document.createElement("span");
+    badge.className = "match-player-id";
+    badge.textContent = player.id;
+    const label = document.createElement("label");
+    const team = player.team_id ? ` · ${player.team_id}` : "";
+    label.append(document.createTextNode(`Player name${team}`));
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 100;
+    input.value = player.name || player.id;
+    input.dataset.playerId = player.id;
+    input.addEventListener("input", () => { $("#saveMatchRoster").disabled = false; });
+    label.appendChild(input);
+    wrap.append(badge, label);
+    box.appendChild(wrap);
+  });
+  $("#saveMatchRoster").disabled = !roster.length;
+}
+
+async function saveMatchRoster() {
+  const jobId = state.current?.id;
+  if (!jobId) return;
+  const roster = $$("#matchRoster input").map((input) => ({
+    id: input.dataset.playerId,
+    name: input.value.trim(),
+  }));
+  if (roster.some((player) => !player.name)) {
+    toast("Every player needs a name", "error");
+    return;
+  }
+  $("#saveMatchRoster").disabled = true;
+  try {
+    const response = await api(`/api/jobs/${jobId}/match`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roster }),
+    });
+    if (!state.current || state.current.id !== jobId) return;
+    state.current.match = response.match;
+    if (state.current.result) state.current.result.match = response.match;
+    renderMatchSetup(state.current);
+    updateOutputOverlay();
+    toast("Player names saved");
+  } catch (e) {
+    $("#saveMatchRoster").disabled = false;
+    toast(`Could not save player names: ${e.message}`, "error");
   }
 }
 
@@ -810,6 +926,42 @@ function renderSegments() {
     }));
 }
 
+function clearPublishedAnalysis() {
+  state.waveform = null;
+  state.editSegments = null;
+  renderSegments();
+  $("#applySegments").disabled = true;
+  const canvas = $("#timeline");
+  const ctx = canvas?.getContext("2d");
+  if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("#timelineMeta").textContent = "Reprocessing — previous analysis removed";
+}
+
+function showReprocessingState(job) {
+  const media = { ...(job.media || {}) };
+  media.output = null;
+  media.output_download = null;
+  media.metadata_download = null;
+  const queued = {
+    ...job,
+    status: "queued",
+    result: null,
+    error: null,
+    cancel_requested: false,
+    media,
+    processing: {
+      stage: "queued",
+      label: "Starting re-processing",
+      percent: 0,
+      detail: "Removing the previous result and submitting a new analysis",
+    },
+  };
+  state.current = queued;
+  clearPublishedAnalysis();
+  renderDetail(queued);
+  selectVideoTab("processed");
+}
+
 function markDirty() {
   $("#applySegments").disabled = false;
 }
@@ -876,6 +1028,7 @@ function setupDetailActions() {
     if (!state.current) return;
     const id = state.current.id;
     const generation = beginDetailGeneration(id);
+    showReprocessingState(state.current);
     try {
       const job = await api(`/api/jobs/${id}/process`, { method: "POST" });
       if (!detailRequestIsCurrent(id, generation)) return;
@@ -1052,6 +1205,13 @@ async function pollLabeling(id) {
 async function generateSamples() {
   if (!state.current) return;
   const id = state.current.id;
+  const kinds = [];
+  if ($("#labKindPlayers").checked) kinds.push("player_identity");
+  if ($("#labKindServe").checked) kinds.push("serve_motion");
+  if (!kinds.length) {
+    toast("Choose player classification, serve motion, or both", "error");
+    return;
+  }
   $("#labGenerate").disabled = true;
   lab.tasks = [];               // force a fresh load when generation completes
   $("#labWorkspace").classList.add("hidden");
@@ -1060,9 +1220,9 @@ async function generateSamples() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        kinds: ["player_identity", "serve_motion"],
+        kinds,
         max_items: Math.max(2, parseInt($("#labCount").value, 10) || 10),
-        match_type: $("#labMatchType").value,
+        match_type: "auto",
         regenerate: true,
       }),
     });
@@ -1096,6 +1256,9 @@ async function loadLabelTasks(id) {
   $("#labWorkspace").classList.remove("hidden");
   $("#labPlayerCount").textContent = lab.tasks.filter((t) => t.kind === "player_identity").length;
   $("#labServeCount").textContent = lab.tasks.filter((t) => t.kind === "serve_motion").length;
+  if (!labModeTasks().length) {
+    lab.mode = lab.tasks[0]?.kind || "player_identity";
+  }
   renderRoster();
   setLabMode(lab.mode, true);
 }
@@ -1316,6 +1479,7 @@ function init() {
   setupSegmentEditor();
   setupTimelineInteractions();
   setupVideoPlayer();
+  $("#saveMatchRoster").addEventListener("click", saveMatchRoster);
   setupLabeling();
   loadCapabilities();
   refreshGallery();

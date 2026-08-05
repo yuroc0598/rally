@@ -6,13 +6,14 @@ retrieval, chatting, and other dead time. Same end result as SwingVision's
 rally-only export, built from open components.
 
 This is **Phase-1** of the design in [`DESIGN.md`](DESIGN.md): a rule-based fusion of
-cheap, training-data-free signals, decoded by a duration-aware segment model. It runs
-today with no model downloads or labelled data.
+signals decoded by a duration-aware segment model. It needs no labelled training data;
+the accuracy-first server does require the TrackNet, YOLO12, and RTMPose models installed
+by `setup.sh`.
 
 ```
 video ──▶ audio ball-strike detection ┐
      └──▶ motion + camera-motion       ├─▶ per-frame rally probability
-     └──▶ player geometry (optional)   ┘        │
+     └──▶ player geometry              ┘        │
                                                 ▼
                        duration-aware segment-model decode  (part (a) of the design)
                                                 │
@@ -29,10 +30,10 @@ so we fuse them:
 |---|---|---|
 | **Audio** | quasi-periodic racket-ball "pock" transients, 0.3–3 s apart | band-pass + envelope peak-picking (`audio.py`) |
 | **Motion** | dynamic player movement, camera static | frame-diff energy + phase-correlation (`motion.py`) |
-| **Geometry** | exactly two players, on court, opposed across the net | YOLO person detection + court-region filter (`signals/player.py`, optional) |
+| **Geometry** | exactly two players, on court, opposed across the net | YOLO person detection + court-region filter (`signals/player.py`) |
 
-Audio is first-class here: the racket impact train is cheap, camera-angle invariant,
-and highly discriminative. Without TrackNet, the fallback is intentionally conservative:
+Audio is a useful proposal signal, but the web server will not run without TrackNet and
+the player/pose models. Library and CLI callers may deliberately select reduced modes;
 supporting motion/geometry cues are never rescaled into certainty when audio is absent.
 
 ## Setup
@@ -63,9 +64,10 @@ extraction are atomic and the default artifacts are SHA-256 pinned. If OpenMMLab
 temporarily unreachable, leave the official zip in `models/` and re-run `./setup.sh`; the
 existing archive is verified and extracted without another download.
 
-The repo still runs when an external model host is unavailable: TrackNet falls back to the
-audio-primary detector and optional RTMPose evidence abstains. Setup reports each missing
-capability explicitly.
+All three models are required for the accuracy-first web server. If a package, ffmpeg,
+model download, checksum, model load, or RTMPose inference check fails, setup exits nonzero.
+The web server repeats the strict preflight at startup and refuses to launch from a partial
+installation; it will not silently expose an audio-only service.
 
 The weights come from `yastrebksv/TrackNet`, which has **no license** — fine for
 personal/research use, but don't redistribute them (that's why they aren't committed or in a
@@ -119,8 +121,8 @@ python -m rally.cli match.mp4 -o out.mp4        # ball tracking + auto court on 
 
 Ball-primary detection is **on by default** and inverts the pipeline the way SwingVision
 does it: the cheap audio/motion channels only **propose** candidate windows (high recall),
-then the **ball trajectory decides**. If TrackNet weights / PyTorch aren't installed it
-falls back automatically to the audio-primary path, so nothing to configure. Inside each
+then the **ball trajectory decides**. The web server requires verified TrackNet weights and
+PyTorch at startup. Inside each
 candidate the ball is tracked (TrackNet), the track is reconstructed
 with a Kalman+RTS smoother (`signals/trajectory.py` — gap-fill, outlier-reject, per-sample
 confidence), bounce candidates require a measured 2-D velocity-vector turn, and a verdict
@@ -324,11 +326,12 @@ holdout. No accuracy claim should be inferred from the repository test result.
 - **Warm-up can look like a rally** to both the audio and trajectory paths. Optional serve
   evidence improves precision, but reliable separation still needs independently validated
   serve/match-state or scoreboard information.
-- **Ball tracking** is the default *arbiter* (Phase-2; `--no-ball-arbiter` to disable) but
+- **Ball tracking** is the default *arbiter* (Phase-2; CLI/library callers can explicitly
+  disable it) but
   remains the least reliable single cue (motion blur / occlusion) — the Kalman+RTS
   reconstruction in `signals/trajectory.py` mitigates this, and on CPU it runs only
-  inside candidate windows. Needs TrackNet weights (`rally.tools.fetch_models`); without
-  them it falls back to the audio-primary path automatically.
+  inside candidate windows. The server requires TrackNet weights and refuses startup when
+  they are missing or unusable.
 - The DP decoder is pure-Python; for multi-hour videos at high `analysis_fps` it can
   take tens of seconds (use `--hysteresis` for O(T) decoding).
 

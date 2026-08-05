@@ -286,10 +286,12 @@ def discover_ball_weights(models_dir: Optional[str] = None) -> Optional[str]:
 
 
 def resolve_device(torch=None):
-    """Pick the torch device for ball tracking: GPU when available, else CPU.
+    """Pick the fastest available torch device for ball tracking.
 
-    Honours ``RALLY_DEVICE`` (e.g. ``cuda``, ``cuda:1``, ``cpu``) as an override; if it
-    asks for CUDA but none is present, we warn and fall back to CPU rather than crash.
+    Honours ``RALLY_DEVICE`` (e.g. ``cuda``, ``cuda:1``, ``mps``, ``cpu``) as an
+    override. Invalid accelerator requests fall back to CPU rather than failing halfway
+    through a long analysis. Apple Silicon uses Metal Performance Shaders when PyTorch
+    exposes it; previously those machines silently ran TrackNet on CPU.
     """
     import os
 
@@ -301,8 +303,23 @@ def resolve_device(torch=None):
         if want.startswith("cuda") and not torch.cuda.is_available():
             print(f"[ball] RALLY_DEVICE={want} requested but CUDA is unavailable — using CPU")
             return torch.device("cpu")
+        if want.startswith("mps") and not _mps_available(torch):
+            print(f"[ball] RALLY_DEVICE={want} requested but MPS is unavailable — using CPU")
+            return torch.device("cpu")
         return torch.device(want)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _mps_available(torch):
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _mps_available(torch) -> bool:
+    """Return whether this torch build can actually execute on Apple MPS."""
+    try:
+        return bool(torch.backends.mps.is_built() and torch.backends.mps.is_available())
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def load_ball_model(weights_path: str, device=None):

@@ -1214,11 +1214,57 @@ class PlayerCourtTrack:
 class PlayerTracker:
     """Track the near player in court metres (detection -> homography -> speed-limit).
 
-    ``court_track`` is what the serve set-up consumes; ``detector``/``geometry`` helpers
-    above feed the geometry channel (computed in the sampling pass for efficiency)."""
+    Serve setup consumes ``court_track_from_samples`` so the shared visual pass remains
+    the only full-video detection pass. ``court_track`` is retained for focused callers
+    that do not already have visual samples."""
 
     def __init__(self, detector: Optional[PlayerDetector] = None):
         self.detector = detector
+
+    def court_track_from_samples(
+        self,
+        player_samples,
+        court,
+        frame_size: Tuple[int, int],
+        speed_limit_mps: float = 8.0,
+    ) -> PlayerCourtTrack:
+        """Build the near-player court track from the shared visual-pass detections.
+
+        ``analyze_visual`` has already decoded the video, run YOLO, and filtered people
+        to the target court. Reprojecting those inexpensive foot observations avoids a
+        second full-video decode and person-inference pass during serve anchoring.
+        """
+        width, height = (int(frame_size[0]), int(frame_size[1]))
+        if width <= 0 or height <= 0:
+            raise ValueError("frame_size must contain positive width and height")
+
+        times: list[float] = []
+        court_x: list[float] = []
+        court_y: list[float] = []
+        for sample_time, persons in player_samples:
+            times.append(float(sample_time))
+            inside, coordinates = persons_in_court(
+                persons, court, (height, width))
+            candidates = [
+                index for index, coordinate in enumerate(coordinates)
+                if np.isfinite(coordinate).all() and coordinate[1] <= NET_Y
+            ]
+            if not candidates:
+                court_x.append(float("nan"))
+                court_y.append(float("nan"))
+                continue
+            selected = max(candidates, key=lambda index: inside[index][2])
+            court_x.append(float(coordinates[selected, 0]))
+            court_y.append(float(coordinates[selected, 1]))
+
+        t = np.asarray(times, dtype=float)
+        cx, cy = clean_track(
+            t,
+            np.asarray(court_x, dtype=float),
+            np.asarray(court_y, dtype=float),
+            speed_limit_mps,
+        )
+        return PlayerCourtTrack(t, cx, cy, court_speed(t, cx, cy))
 
     def court_track(self, video: str, court, fps_a: float = 5.0,
                     speed_limit_mps: float = 8.0,

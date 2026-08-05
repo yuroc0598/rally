@@ -107,6 +107,28 @@ def test_stationary_detector_keeps_cluttered_low_angle_full_court():
     assert np.allclose(detected.corners_img, np.asarray(corners), atol=25.0)
 
 
+def test_stationary_detector_accepts_deep_near_baseline_phone_view():
+    """A clear baseline below 90% image height must not be discarded by view priors."""
+    corners = (
+        (12, 989), (1968, 952), (1341, 543), (1055, 548),
+    )
+    court = Court.from_image_corners(*corners)
+    gray = np.full((1080, 1920), 55, np.uint8)
+    from rally.signals.court import court_model_polylines
+    for segment in court_model_polylines():
+        points = np.round(court.to_image(segment)).astype(int)
+        cv2.line(gray, tuple(points[0]), tuple(points[1]), 235, 4)
+    # Fence/net edges are common long alternatives above the real court.
+    for y in (390, 425, 475, 655):
+        cv2.line(gray, (0, y), (1919, y - 20), 125, 2)
+
+    found = _detect_in_stationary_gray(gray, min_score=0.55)
+    assert found is not None
+    detected, score = found
+    assert score > 0.85
+    assert np.allclose(detected.corners_img, np.asarray(corners), atol=25.0)
+
+
 def test_target_alignment_rejects_input5_clip_multicourt_alias():
     shape = (1080, 1920)
     full_video_target = (

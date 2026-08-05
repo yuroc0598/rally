@@ -131,10 +131,9 @@ fi
 # while retaining player/pose inference for match-state validation.
 echo "[setup] player geometry + serve-pose validation enabled with headless OpenCV."
 
-# RTMLib uses ONNX Runtime for RTMPose. The server extra deliberately installs the
-# universally compatible CPU wheel. On an NVIDIA host, replace it with the GPU wheel so
-# resolve_rtmpose_device("auto") can select CUDA. The GPU wheel retains a CPU provider,
-# and a failed installation is repaired by restoring the CPU package.
+# RTMLib uses ONNX Runtime for RTMPose. The server extra installs the universally
+# compatible CPU wheel. CUDA acceleration is optional; a failed GPU-wheel upgrade keeps
+# the required, working CPU runtime installed below.
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
   if "$PY" - <<'PYEOF' >/dev/null 2>&1
 import onnxruntime as ort
@@ -199,8 +198,9 @@ else
   if ffmpeg_ok; then
     echo "[setup] ffmpeg ready (encode+probe verified): $(_ffdesc)"
   else
-    echo "[setup] ⚠️  ffmpeg still not fully working. Point RALLY_FFMPEG (and RALLY_FFPROBE" >&2
-    echo "[setup]     if you have one) at working binaries, or install ffmpeg with libx264." >&2
+    echo "[setup] error: ffmpeg is required but still cannot encode/probe H.264." >&2
+    echo "[setup]        Point RALLY_FFMPEG (and RALLY_FFPROBE if needed) at working binaries." >&2
+    exit 1
   fi
 fi
 
@@ -209,7 +209,6 @@ fi
 #    A pinned default digest prevents a changed/corrupt asset from silently affecting the
 #    target-court and serve-setup signals. Custom names may set YOLO_SHA256="".
 echo "[setup] preparing YOLO12 player detector at $YOLO_PATH ..."
-YOLO_OK=1
 if ! YOLO_MODEL_NAME="$YOLO_MODEL_NAME" YOLO_PATH="$YOLO_PATH" YOLO_SHA256="$YOLO_SHA256" \
   "$PY" - <<'PYEOF'
 import hashlib
@@ -256,8 +255,8 @@ YOLO(str(target))  # parse the checkpoint now so an incompatible file fails setu
 print(f"[setup] YOLO ready: {target} (sha256={actual})")
 PYEOF
 then
-  YOLO_OK=0
-  echo "[setup] ⚠️  YOLO12 download/verification failed; Ultralytics will retry on first use." >&2
+  echo "[setup] error: required YOLO12 download/verification failed." >&2
+  exit 1
 fi
 
 # 4) RTMPose-M Body7. The official SDK archive calls the graph `end2end.onnx`; the
@@ -265,7 +264,6 @@ fi
 #    name. Python's zipfile keeps this independent of a system `unzip` command. Downloads
 #    and extraction publish atomically, and both the archive and ONNX are checksum-pinned.
 echo "[setup] preparing RTMPose at $RTMPOSE_PATH ..."
-RTMPOSE_OK=1
 if ! RTMPOSE_URL="$RTMPOSE_URL" RTMPOSE_ARCHIVE="$RTMPOSE_ARCHIVE" \
   RTMPOSE_PATH="$RTMPOSE_PATH" RTMPOSE_ZIP_SHA256="$RTMPOSE_ZIP_SHA256" \
   RTMPOSE_SHA256="$RTMPOSE_SHA256" "$PY" - <<'PYEOF'
@@ -391,62 +389,47 @@ if np.asarray(keypoints).shape != (1, 17, 2) or np.asarray(scores).shape != (1, 
 print(f"[setup] RTMPose ready: {target} (sha256={actual_target}, device={device})")
 PYEOF
 then
-  RTMPOSE_OK=0
-  echo "[setup] ⚠️  RTMPose download/verification failed; pose evidence will abstain." >&2
+  echo "[setup] error: required RTMPose download/verification failed." >&2
   echo "[setup]      Re-run ./setup.sh when the OpenMMLab host is reachable, or place" >&2
   echo "[setup]      the official zip at $RTMPOSE_ARCHIVE and re-run setup." >&2
+  exit 1
 fi
 
 # 5) ball-tracking weights (auto-discovered from models/). fetch_models verifies the
 #    checkpoint loads into BallTrackerNet before installing it.
-#
-#    These weights are OPTIONAL: they're externally hosted (Google Drive) and unlicensed,
-#    and the pipeline auto-falls-back to the audio-primary detector without them. A network
-#    that can't reach the host (proxy/allowlist, offline) must not fail the whole setup —
-#    the deps above are the part that matters. So we warn-and-continue on fetch failure.
+#    TrackNet is required by the accuracy-first web server. External-host or verification
+#    failures are fatal so setup can never report success for an audio-only installation.
 if [ -f "$WEIGHTS_PATH" ]; then
   echo "[setup] weights already present at $WEIGHTS_PATH — verifying ..."
-  WEIGHTS_OK=1
   if [ -n "$WEIGHTS_SHA256" ]; then
-    "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH" --sha256 "$WEIGHTS_SHA256" || WEIGHTS_OK=0
+    if ! "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH" --sha256 "$WEIGHTS_SHA256"; then
+      INVALID_PATH="${WEIGHTS_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
+      mv "$WEIGHTS_PATH" "$INVALID_PATH"
+      echo "[setup] invalid checkpoint quarantined at $INVALID_PATH" >&2
+    fi
   else
-    "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH" || WEIGHTS_OK=0
+    if ! "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH"; then
+      INVALID_PATH="${WEIGHTS_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
+      mv "$WEIGHTS_PATH" "$INVALID_PATH"
+      echo "[setup] invalid checkpoint quarantined at $INVALID_PATH" >&2
+    fi
   fi
-  if [ "$WEIGHTS_OK" = 0 ]; then
-    INVALID_PATH="${WEIGHTS_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
-    mv "$WEIGHTS_PATH" "$INVALID_PATH"
-    echo "[setup] invalid checkpoint quarantined at $INVALID_PATH" >&2
-  fi
-else
+fi
+if [ ! -f "$WEIGHTS_PATH" ]; then
   echo "[setup] fetching TrackNet ball-tracking weights ..."
-  WEIGHTS_OK=1
   if [ -n "$WEIGHTS_SHA256" ]; then
-    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID" --sha256 "$WEIGHTS_SHA256" || WEIGHTS_OK=0
+    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID" --sha256 "$WEIGHTS_SHA256"
   else
-    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID" || WEIGHTS_OK=0
+    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID"
   fi
 fi
 
 echo
-if [ "$WEIGHTS_OK" = 1 ]; then
-  echo "[setup] ✅ TrackNet ready — ball-arbiter tracking is enabled by default."
-else
-  echo "[setup] ⚠️  TrackNet weights are missing (fetch failed above)."
-  echo "  The pipeline still works — ball-arbiter auto-falls back to the audio-primary detector."
-  echo "  To enable full ball-arbiter mode later, once the host is reachable:"
-  echo "    $PY -m rally.tools.fetch_models --drive-id $WEIGHTS_DRIVE_ID"
-  echo "  or download the .pt in a browser and install it with:"
-  echo "    $PY -m rally.tools.fetch_models --verify /path/to/tracknet.pt"
-fi
-if [ "$YOLO_OK" = 1 ]; then
-  echo "[setup] ✅ YOLO player detection ready: $YOLO_PATH"
-else
-  echo "[setup] ⚠️  YOLO player detection weights are not ready. Re-run ./setup.sh online."
-fi
-if [ "$RTMPOSE_OK" = 1 ]; then
-  echo "[setup] ✅ RTMPose serve-pose validation ready: $RTMPOSE_PATH"
-else
-  echo "[setup] ⚠️  RTMPose is not ready. Put the official archive at $RTMPOSE_ARCHIVE and re-run ./setup.sh."
-fi
+echo "[setup] running strict server preflight ..."
+"$PY" -m rally.preflight \
+  --tracknet "$WEIGHTS_PATH" --yolo "$YOLO_PATH" --rtmpose "$RTMPOSE_PATH"
+echo "[setup] ✅ TrackNet ready: $WEIGHTS_PATH"
+echo "[setup] ✅ YOLO player detection ready: $YOLO_PATH"
+echo "[setup] ✅ RTMPose serve-pose validation ready: $RTMPOSE_PATH"
 echo "  Web UI:  $PY -m rally.web.app        # then open http://127.0.0.1:8000"
 echo "  CLI:     $PY -m rally.cli match.mp4 -o rallies.mp4 --json rallies.json"

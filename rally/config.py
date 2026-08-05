@@ -209,6 +209,10 @@ class RallyConfig:
     match_ball_court_x: tuple[float, float] = (0.12, 0.88)
     match_ball_court_y: tuple[float, float] = (0.25, 0.85)
     match_auto_min_serve_anchors: int = 3
+    # Product/web accuracy mode can require auto-match inference to fail closed when the
+    # ball tracker checked every candidate but could not establish a legal serve phase.
+    # Library callers retain the historical warm-up-preserving behaviour unless enabled.
+    match_auto_fail_closed: bool = False
     match_phase_max_gap_s: float = 100.0
     # Candidate fragments on the same service side can be a fault/retry or a rally whose
     # contacts were missed.  Merge them before applying match validity and recover the

@@ -211,6 +211,13 @@ progress::-moz-progress-bar { background: var(--accent); }
   backdrop-filter: blur(5px); font: 650 12px/1.2 ui-monospace, Menlo, monospace;
   pointer-events: none;
 }
+.point-outcome {
+  position: absolute; z-index: 5; top: 14px; left: 14px; max-width: min(62%, 520px);
+  padding: 7px 10px; border-radius: 8px; color: #fff; background: rgba(10, 12, 12, 0.76);
+  backdrop-filter: blur(5px); font: 650 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  pointer-events: none;
+}
+.point-outcome.unknown { color: #ddd8cc; }
 .player-hit-layer {
   position: absolute; z-index: 4; inset: 0 0 48px; display: block;
   border-radius: 8px 8px 0 0; overflow: hidden; pointer-events: none;
@@ -240,6 +247,21 @@ progress::-moz-progress-bar { background: var(--accent); }
 .sw.head { background: #1c1c1c; }
 #timeline { width: 100%; height: 80px; display: block; border-radius: 8px; cursor: pointer; }
 
+/* ---- detected match roster ---- */
+.match-detection { margin: 2px 0 0; }
+.match-roster { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.match-player {
+  display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 8px;
+  padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: #f7f5ef;
+}
+.match-player-id {
+  min-width: 30px; padding: 4px 6px; border-radius: 6px; text-align: center;
+  color: var(--accent-ink); background: #e5f0e9; font: 700 11px/1 ui-monospace, Menlo, monospace;
+}
+.match-player label { min-width: 0; color: var(--muted); font-size: 11px; }
+.match-player input { margin-top: 3px; }
+.match-help { margin: 9px 0 0; }
+
 /* ---- segment table ---- */
 .seg-actions { display: flex; gap: 8px; }
 .seg-table-wrap { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
@@ -263,6 +285,11 @@ progress::-moz-progress-bar { background: var(--accent); }
 
 /* ---- labeling ---- */
 .lab-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lab-kind {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px;
+  border: 1px solid var(--line); border-radius: 999px; background: #f7f5ef;
+  color: var(--ink); font-size: 12px; cursor: pointer;
+}
 .inline { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
 .inline select, .inline input { padding: 4px 7px; border: 1px solid var(--line); border-radius: 6px; }
 .inline input { width: 56px; }

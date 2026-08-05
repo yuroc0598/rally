@@ -7,6 +7,7 @@ a synthesised video, and auto-skips in sandboxes that can't run ffmpeg on
 absolute paths (same guard the core integration test uses).
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -50,6 +51,37 @@ def test_default_session_directories_share_visible_root():
     assert webapp.DEFAULT_GOLDEN_RESULTS_DIR == webapp.SESSIONS_DIR / "golden"
 
 
+def test_default_upload_limit_is_ten_gib(monkeypatch):
+    monkeypatch.delenv("RALLY_WEB_MAX_UPLOAD_BYTES", raising=False)
+    assert webapp._max_upload_bytes() == 10 * 1024 ** 3
+
+
+def test_server_lifespan_requires_preflight_before_recovery(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "rally.preflight.require_server_install", lambda: calls.append("preflight"))
+    monkeypatch.setattr(
+        webapp, "_recover_jobs_on_startup", lambda: calls.append("recovery"))
+
+    async def enter_lifespan():
+        async with webapp._lifespan(webapp.app):
+            calls.append("running")
+
+    asyncio.run(enter_lifespan())
+    assert calls == ["preflight", "recovery", "running"]
+
+
+def test_server_entrypoint_refuses_incomplete_setup(monkeypatch, capsys):
+    from rally.preflight import InstallationError
+
+    def incomplete():
+        raise InstallationError("missing TrackNet")
+
+    monkeypatch.setattr("rally.preflight.require_server_install", incomplete)
+    assert webapp.main([]) == 1
+    assert "missing TrackNet" in capsys.readouterr().err
+
+
 def test_recommended_web_workers_use_cpu_and_cuda_headroom():
     gib = 1024 ** 3
     assert webapp._recommended_web_workers(22, 80 * gib) == 4
@@ -88,6 +120,25 @@ def test_upload_ui_requires_selection_and_supports_concurrent_files():
     assert "for (const file of files) uploadJob(file" in script
     assert "activeUploads: new Map()" in script
     assert '$("#uploadButton").disabled = true' not in script
+
+
+def test_label_generation_ui_offers_independent_player_and_serve_options():
+    html = (webapp.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    script = (webapp.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'id="labKindPlayers"' in html and "Classify players" in html
+    assert 'id="labKindServe"' in html and "Generate serve motion" in html
+    assert 'kinds.push("player_identity")' in script
+    assert 'kinds.push("serve_motion")' in script
+    assert "if (!kinds.length)" in script
+
+
+def test_reprocess_ui_immediately_replaces_stale_output_with_progress_preview():
+    script = (webapp.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "showReprocessingState(state.current);" in script
+    assert "media.output = null;" in script
+    assert "result: null," in script
+    assert 'selectVideoTab("processed");' in script
+    assert '$("#timelineMeta").textContent = "Reprocessing — previous analysis removed"' in script
 
 
 def test_golden_ui_is_separate_from_uploaded_jobs():
@@ -212,12 +263,19 @@ def test_real_context_includes_setup_and_splits_short_between_point_gap():
 
 
 def test_config_from_options_ball_arbiter_defaults_on():
-    # both ball-arbiter and court auto-detection are ON by default (best accuracy)
+    # Required evidence cannot be disabled by stale/forged web options.
     default = webapp._config_from_options({})
     assert default.ball_arbiter is True and default.court_auto is True
-    # explicitly unchecked boxes are respected
     off = webapp._config_from_options({"ball_arbiter": False, "court_auto": False})
-    assert off.ball_arbiter is False and off.court_auto is False
+    assert off.ball_arbiter is True and off.court_auto is True
+    assert off.match_auto_fail_closed is True
+
+    upgraded = webapp._required_web_options({
+        "ball_arbiter": False, "court_auto": False, "detect_players": False,
+    })
+    assert upgraded["ball_arbiter"] is True
+    assert upgraded["court_auto"] is True
+    assert upgraded["detect_players"] is True
 
 
 def test_capabilities_reports_ball_arbiter_availability(monkeypatch):
@@ -264,6 +322,9 @@ def test_stage_for_message_recognises_pipeline_lines():
     assert webapp._stage_for_message(
         "ball tracking progress 50% (100/200s, batch 16)")["percent"] == 64
     assert webapp._stage_for_message("match pose progress 5/10")["percent"] == 79
+    anchor = webapp._stage_for_message(
+        "court serve detection: reusing 1200 visual-pass player samples")
+    assert anchor["percent"] == 68
     assert webapp._stage_for_message(
         "serve validation progress 10/10 (10 reused TrackNet window(s))")["percent"] == 88
     assert webapp._stage_for_message("something unknown")["stage"] == "running"
@@ -721,6 +782,59 @@ def test_duplicate_process_submissions_enqueue_only_once(monkeypatch, tmp_path):
     assert len(executor.calls) == 1
 
 
+def test_reprocess_immediately_deletes_and_unpublishes_previous_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(webapp, "_ACTIVE", set())
+    monkeypatch.setattr(webapp, "_SUBMITTED", set())
+    monkeypatch.setattr(webapp, "_CANCEL_EVENTS", {})
+    monkeypatch.setattr(webapp, "_JOB_FUTURES", {})
+    job_id, job_dir, job = _write_job(tmp_path, status="complete")
+    output = job_dir / "output" / "rallies.mp4"
+    metadata = job_dir / "output" / "rallies.json"
+    waveform = job_dir / "waveform.json"
+    thumbnail = job_dir / "thumbnail.jpg"
+    output.parent.mkdir()
+    output.write_bytes(b"last-good-video")
+    webapp._atomic_write_json(metadata, {"segments": [{"start": 1, "end": 2}]})
+    webapp._atomic_write_json(waveform, {"duration": 60, "strikes": [1.5]})
+    thumbnail.write_bytes(b"preview")
+    job.update(
+        output_path=str(output),
+        json_path=str(metadata),
+        thumbnail_path=str(thumbnail),
+        result={"segments": [{"start": 1, "end": 2}], "n_rallies": 1},
+    )
+    webapp._atomic_write_json(job_dir / "job.json", job)
+
+    class PendingExecutor:
+        def __init__(self):
+            self.future = Future()
+
+        def submit(self, *_args):
+            return self.future
+
+    monkeypatch.setattr(webapp, "_EXECUTOR", PendingExecutor())
+    client = TestClient(webapp.app)
+    before = client.get(f"/api/jobs/{job_id}").json()
+    old_output_url = before["media"]["output"]
+    old_metadata_url = before["media"]["metadata_download"]
+
+    response = client.post(f"/api/jobs/{job_id}/process")
+
+    assert response.status_code == 200
+    queued = response.json()
+    assert queued["status"] == "queued"
+    assert queued["result"] is None
+    assert queued["media"]["output"] is None
+    assert queued["media"]["metadata_download"] is None
+    assert queued["media"]["thumbnail"] is not None
+    assert not output.exists()
+    assert not metadata.exists()
+    assert not waveform.exists()
+    assert client.get(old_output_url).status_code == 404
+    assert client.get(old_metadata_url).status_code == 404
+
+
 def test_cancel_queued_job_removes_it_before_worker_start(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
     monkeypatch.setattr(webapp, "_ACTIVE", set())
@@ -752,7 +866,7 @@ def test_cancel_queued_job_removes_it_before_worker_start(monkeypatch, tmp_path)
     assert job_id not in webapp._SUBMITTED
 
 
-def test_cancelled_rerun_retains_last_successful_result(monkeypatch, tmp_path):
+def test_cancelled_rerun_does_not_restore_previous_result(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
     monkeypatch.setattr(webapp, "_ACTIVE", set())
     monkeypatch.setattr(webapp, "_SUBMITTED", set())
@@ -783,9 +897,12 @@ def test_cancelled_rerun_retains_last_successful_result(monkeypatch, tmp_path):
     response = client.post(f"/api/jobs/{job_id}/cancel")
 
     saved = response.json()
-    assert saved["status"] == "complete"
-    assert saved["result"]["n_rallies"] == 1
-    assert output.read_bytes() == b"last-good-video"
+    assert saved["status"] == "cancelled"
+    assert saved["result"] is None
+    assert saved["media"]["output"] is None
+    assert saved["media"]["metadata_download"] is None
+    assert not output.exists()
+    assert not metadata.exists()
 
 
 def test_cancel_running_job_stops_cooperatively_and_cleans_state(monkeypatch, tmp_path):
@@ -976,16 +1093,31 @@ def _wait_done(client, job_id, timeout=120):
     raise AssertionError("job did not finish in time")
 
 
-def test_end_to_end_upload_process_edit(scratch):
+def test_end_to_end_upload_process_edit(scratch, monkeypatch):
     src = _make_video(scratch)
     client = TestClient(webapp.app)
+
+    # The production web path mandates every model. This HTTP/render lifecycle test uses
+    # a synthetic black video with no tennis geometry, so replace only its trim call with
+    # the deliberately reduced library configuration.
+    real_trim = webapp.trim
+
+    def reduced_trim(input_path, output_path=None, cfg=None, **kwargs):
+        kwargs["detect_players"] = False
+        return real_trim(
+            input_path, output_path=output_path,
+            cfg=webapp.RallyConfig(
+                analysis_fps=5.0, min_rally_s=1.0, ball_arbiter=False,
+                court_auto=False, play_mode="casual"),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(webapp, "trim", reduced_trim)
 
     with open(src, "rb") as fh:
         resp = client.post(
             "/api/jobs",
             files={"file": ("match.mp4", fh, "video/mp4")},
-            # ball_arbiter is on by default but is CPU-slow + needs weights; this test
-            # covers the audio/motion path + HTTP surface, so opt out for speed.
             data={"detect_players": "false", "analysis_fps": "5", "min_rally": "1",
                   "ball_arbiter": "false"},
         )
@@ -1119,6 +1251,45 @@ def test_labeling_generation_and_endpoints(scratch, monkeypatch):
                      {"index": 1, "start": 32.0, "end": 38.0}],
         "match_state": {},
     }
+
+
+def test_serve_only_generation_uses_automatically_detected_durable_roster(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
+    job_id = str(uuid.uuid4())
+    root = webapp._job_dir(job_id)
+    root.mkdir(parents=True)
+    original = root / "original.mp4"
+    original.write_bytes(b"placeholder")
+    roster = [
+        {"id": f"P{index}", "name": name,
+         "team_id": "T1" if index <= 2 else "T2"}
+        for index, name in enumerate(("Alice", "Bob", "Carol", "Dana"), 1)
+    ]
+    webapp._atomic_write_json(webapp._job_meta_path(job_id), {
+        "id": job_id, "status": "complete", "filename": "match.mp4",
+        "original_path": str(original), "progress": [],
+        "labeling": {"status": "idle"},
+        "match": {"format": "doubles", "roster": roster},
+        "result": {"total_seconds": 20.0, "segments": [
+            {"index": 0, "start": 3.0, "end": 8.0}], "stages": {}},
+    })
+    monkeypatch.setattr(webapp, "_generate_serve_tasks", lambda *args, **kwargs: [{
+        "id": "serve_0000", "kind": "serve_motion", "title": "Serve clip 1",
+        "time_s": 3.0, "media_type": "video", "asset_url": "/clip.mp4",
+    }])
+
+    webapp._run_label_gen(job_id, webapp.LabelTaskRequest(
+        kinds=["serve_motion"], max_items=4, regenerate=True))
+
+    job = webapp._load_job(job_id)
+    revision = job["labeling"]["revision"]
+    labels_root = root / "label_revisions" / revision / "labels"
+    assert job["labeling"]["match_type"] == "doubles"
+    assert [record["name"] for record in webapp._read_json(
+        labels_root / "roster.json", [])] == ["Alice", "Bob", "Carol", "Dana"]
+    assert [task["kind"] for task in webapp._read_json(
+        labels_root / "tasks.json", [])] == ["serve_motion"]
 
 
 def test_label_kind_validation(scratch):

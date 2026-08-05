@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rally — tennis rally trimmer</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260730-cleanup1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260804-point-events2" />
   </head>
   <body>
     <header class="topbar">
@@ -37,15 +37,12 @@
               <span class="drop-sub">mp4 · mov · mkv · webm</span>
             </label>
 
-            <!-- The defaults select the fullest available path (ball-arbiter + auto court).
-                 Everything here is optional and tucked away. -->
+            <!-- Ball, court, player, and pose evidence are mandatory server capabilities.
+                 Only output/presentation tuning remains optional here. -->
             <details class="advanced">
               <summary>Advanced options</summary>
               <p class="advanced-note">Defaults use the fullest available analysis path; verify results in the review screen.</p>
               <fieldset class="checks">
-                <label><input id="ballArbiter" type="checkbox" checked /> Ball tracking</label>
-                <label><input id="courtAuto" type="checkbox" checked /> Auto court</label>
-                <label><input id="detectPlayers" type="checkbox" checked /> YOLO players</label>
                 <label><input id="staticCamera" type="checkbox" checked /> Static camera</label>
                 <label><input id="fast" type="checkbox" /> Fast cut</label>
                 <label><input id="hysteresis" type="checkbox" /> Hysteresis</label>
@@ -143,6 +140,7 @@
                 <div class="video-shell interactive-player">
                   <video id="outputVideo" controls playsinline preload="metadata"></video>
                   <div id="ballSpeed" class="ball-speed" title="Uncertain single-camera ground-plane estimate; not full 3-D ball speed">Ball speed —</div>
+                  <div id="pointOutcome" class="point-outcome">Point result unavailable</div>
                   <div id="playerHitLayer" class="player-hit-layer" aria-label="Video gestures">
                     <button id="previousPointZone" type="button" aria-label="Double-click for previous point" title="Double-click: previous point"></button>
                     <button id="nextPointZone" type="button" aria-label="Double-click for next point" title="Double-click: next point"></button>
@@ -166,6 +164,18 @@
                 <div class="video-head"><h3>Original recording</h3><span id="origTime" class="mono muted">00:00</span></div>
                 <video id="originalVideo" controls playsinline preload="metadata"></video>
               </div>
+            </div>
+
+            <div id="matchSetupCard" class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Players</h3>
+                  <p id="matchDetection" class="muted small match-detection">Detecting match format…</p>
+                </div>
+                <button id="saveMatchRoster" type="button" class="primary small" disabled>Save names</button>
+              </div>
+              <div id="matchRoster" class="match-roster"></div>
+              <p class="muted small match-help">Singles or doubles is detected automatically from persistent on-court tracks. Names survive reprocessing.</p>
             </div>
 
             <div class="card">
@@ -200,18 +210,13 @@
               <div class="card-head">
                 <h3>Labeling</h3>
                 <div class="lab-controls">
-                  <label class="inline">Match
-                    <select id="labMatchType">
-                      <option value="auto">Auto</option>
-                      <option value="singles">Singles</option>
-                      <option value="doubles">Doubles</option>
-                    </select>
-                  </label>
+                  <label class="lab-kind"><input id="labKindPlayers" type="checkbox" checked /> Classify players</label>
+                  <label class="lab-kind"><input id="labKindServe" type="checkbox" checked /> Generate serve motion</label>
                   <label class="inline">Count <input id="labCount" type="number" min="2" max="40" value="10" /></label>
                   <button id="labGenerate" type="button" class="primary small">Generate samples</button>
                 </div>
               </div>
-              <p id="labStatus" class="muted small">Generate cropped player pictures and short serve clips from this video, then label them below.</p>
+              <p id="labStatus" class="muted small">Choose player crops, serve-motion clips, or both, then generate the samples to label below.</p>
               <p class="muted small">Answers are saved automatically with this job and can be exported. They are training data; the current analyzer does not retrain itself automatically.</p>
 
               <div id="labWorkspace" class="hidden">
@@ -306,6 +311,6 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=20260730-cleanup1"></script>
+    <script src="/static/app.js?v=20260804-point-events2"></script>
   </body>
 </html>
