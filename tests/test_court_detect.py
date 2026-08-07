@@ -40,9 +40,9 @@ def test_classify_lines_splits_h_and_v():
     horiz, vert = classify_lines([
         (0, 0, 100, 3),      # ~horizontal
         (0, 0, 3, 100),      # ~vertical
-        (0, 0, 100, 100),    # 45 deg -> neither
+        (0, 0, 100, 100),    # perspective sideline
     ])
-    assert len(horiz) == 1 and len(vert) == 1
+    assert len(horiz) == 1 and len(vert) == 2
 
 
 def test_corners_from_lines_picks_extremes():
@@ -83,6 +83,36 @@ def test_from_image_corners_roundtrip():
     img = court.to_image([[0, 0], [DOUBLES_W, 0], [DOUBLES_W, COURT_L], [0, COURT_L]])
     assert img[0] == pytest.approx((250, 850), abs=1.0)
     assert img[2] == pytest.approx((900, 320), abs=1.0)
+    metric = np.array([[2.1, 3.4], [5.485, 11.885], [8.7, 19.2]])
+    assert np.allclose(court.to_court(court.to_image(metric)), metric, atol=1e-4)
+
+
+def test_manual_calibration_stores_true_outer_corners_and_maps_metres():
+    near_left, near_right = (200, 900), (1080, 900)
+    net_right, net_left = (850, 520), (430, 520)
+    court = Court.calibrate(near_left, near_right, net_right, net_left)
+    from rally.signals.court import COURT_L, DOUBLES_W, NET_Y
+
+    mapped = court.to_court([near_left, near_right, net_right, net_left])
+    assert np.allclose(
+        mapped,
+        [[0, 0], [DOUBLES_W, 0], [DOUBLES_W, NET_Y], [0, NET_Y]],
+        atol=1e-3,
+    )
+    assert court.corners_img[0] == pytest.approx(near_left, abs=1.0)
+    assert court.corners_img[1] == pytest.approx(near_right, abs=1.0)
+    far = court.to_court(court.corners_img[2:])
+    assert np.allclose(far, [[DOUBLES_W, COURT_L], [0, COURT_L]], atol=1e-3)
+
+
+def test_score_court_ignores_non_finite_reprojections():
+    class NonFiniteCourt:
+        def to_image(self, points):
+            result = np.zeros((len(points), 2), dtype=float)
+            result[:] = np.nan
+            return result
+
+    assert score_court(np.zeros((20, 20), dtype=np.uint8), NonFiniteCourt()) == 0.0
 
 
 def test_stationary_detector_keeps_cluttered_low_angle_full_court():
@@ -127,6 +157,29 @@ def test_stationary_detector_accepts_deep_near_baseline_phone_view():
     detected, score = found
     assert score > 0.85
     assert np.allclose(detected.corners_img, np.asarray(corners), atol=25.0)
+
+
+def test_stationary_detector_accepts_sky_heavy_phone_framing():
+    """The target near baseline can sit near 65% height when sky fills the upper frame."""
+    corners = (
+        (5, 710), (1840, 682), (1230, 475), (655, 479),
+    )
+    court = Court.from_image_corners(*corners)
+    gray = np.full((1080, 1920), 60, np.uint8)
+    from rally.signals.court import court_model_polylines
+    for segment in court_model_polylines():
+        points = np.round(court.to_image(segment)).astype(int)
+        cv2.line(gray, tuple(points[0]), tuple(points[1]), 235, 4)
+    # Fence rails above the court reproduce the bad shallow-court alias seen in real
+    # phone footage; full-template scoring must still select the deeper playing surface.
+    for y in (248, 310, 405):
+        cv2.line(gray, (250, y), (1550, y - 5), 145, 2)
+
+    found = _detect_in_stationary_gray(gray, min_score=0.55)
+    assert found is not None
+    detected, score = found
+    assert score > 0.85
+    assert np.allclose(detected.corners_img, np.asarray(corners), atol=30.0)
 
 
 def test_target_alignment_rejects_input5_clip_multicourt_alias():

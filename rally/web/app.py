@@ -49,19 +49,15 @@ from rally.config import DEFAULT_YOLO_DETECTION_MODEL, RallyConfig
 from rally.io.ffmpeg import (
     _require,
     add_real_context,
-    add_real_postroll,
     cut_segments,
     find_font,
-    iter_audio_mono,
     probe,
     render_labeled,
 )
-from rally.pipeline import timeline_array, trim
-from rally.signals.audio import detect_strikes_stream
+from rally.pipeline import trim
 from rally.signals.player import estimate_court_region
 from rally.web.golden import discover_datasets, resolve_media_path
 from rally.web.schemas import (
-    MAX_LABEL_ITEMS as _MAX_LABEL_ITEMS,
     LabelPayload,
     LabelTaskRequest,
     MatchRosterUpdate,
@@ -298,30 +294,6 @@ def _prune_label_revisions(job_id: str, keep: int = 2) -> None:
         shutil.rmtree(old)
 
 
-def _archive_label_artifacts(job_id: str) -> None:
-    """Preserve, but unpublish, labels/assets tied to a previous segment revision."""
-    archive_root = _job_dir(job_id) / "label_archive"
-    revision = archive_root / uuid.uuid4().hex
-    moved = False
-    for name in ("labels", "label_assets"):
-        source = _job_dir(job_id) / name
-        if not source.exists():
-            continue
-        revision.mkdir(parents=True, exist_ok=True)
-        os.replace(source, revision / name)
-        moved = True
-    if not moved:
-        _prune_label_revisions(job_id)
-        return
-    # Keep only the two most recent recoverable revisions; clips can be large and repeated
-    # edits must not consume disk forever.
-    revisions = sorted((p for p in archive_root.iterdir() if p.is_dir()),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in revisions[2:]:
-        shutil.rmtree(old)
-    _prune_label_revisions(job_id)
-
-
 def _discard_published_result(job_id: str, job: dict[str, Any]) -> None:
     """Delete and unpublish every artifact from the previous full analysis.
 
@@ -353,10 +325,17 @@ def _discard_published_result(job_id: str, job: dict[str, Any]) -> None:
 
     for path in paths:
         path.unlink(missing_ok=True)
+    shutil.rmtree(job_root / "output" / "player_thumbnails", ignore_errors=True)
+    shutil.rmtree(job_root / "output" / "signal_evidence", ignore_errors=True)
+    for pattern in (".player-thumbnails.*", ".signal-evidence.*"):
+        for directory in (job_root / "output").glob(pattern):
+            if directory.is_dir():
+                shutil.rmtree(directory, ignore_errors=True)
 
     job["output_path"] = None
     job["json_path"] = None
     job["result"] = None
+    job.pop("signal_snapshot", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -371,20 +350,11 @@ _STAGE_RULES = [
     ("processing started", "starting", "Starting", 12),
     ("probing", "probing", "Reading video", 18),
     ("duration=", "probing", "Reading video", 22),
-    ("decoding audio", "audio", "Detecting ball strikes", 32),
-    ("strikes detected", "audio", "Detecting ball strikes", 40),
-    ("sampling frames", "visual", "Analysing motion & players", 45),
-    ("co-deciding", "deciding", "Building candidates", 52),
-    ("ball arbiter", "ball_tracking", "Tracking the ball", 54),
-    ("match-state validation: checking server pose", "pose", "Checking serve poses", 76),
-    ("match-state validation: checking stationary", "pose", "Checking player setup", 82),
-    ("match-state validation: checking ball", "serve", "Validating serves", 83),
-    ("point outcomes:", "deciding", "Classifying point results", 87),
+    ("tracking target-court players", "visual", "Tracking target players", 38),
+    ("building shared all-player pose timeline", "pose", "Reading all-player poses", 45),
+    ("pose refinement progress", "pose", "Refining player actions", 66),
     ("decoded", "deciding", "Points found", 89),
-    ("court serve detection", "refining", "Reusing player tracks", 68),
-    ("serve set-up moved", "refining", "Anchoring serve starts", 72),
-    ("ball point-end", "refining", "Refining rally ends", 89),
-    ("computing waveform", "waveform", "Building timeline", 90),
+    ("writing event timeline", "waveform", "Building timeline", 90),
     ("rendering", "rendering", "Rendering video", 92),
     ("cutting", "rendering", "Rendering video", 92),
     ("wrote", "writing", "Writing output", 95),
@@ -393,26 +363,19 @@ _STAGE_RULES = [
 
 def _stage_for_message(message: str) -> dict[str, Any]:
     text = message.lower()
-    tracking = re.search(r"ball tracking progress\s+(\d+)%", text)
-    if tracking:
-        completed = max(0, min(100, int(tracking.group(1))))
+    refinement = re.search(r"pose refinement progress\s+(\d+)\s*/\s*(\d+)", text)
+    if refinement:
+        done, total = int(refinement.group(1)), max(1, int(refinement.group(2)))
         return {
-            "stage": "ball_tracking", "label": "Tracking the ball",
-            "percent": 54 + int(round(0.21 * completed)),
+            "stage": "pose", "label": "Refining player actions",
+            "percent": 60 + int(round(15 * min(1.0, done / total))),
         }
-    pose = re.search(r"match pose progress\s+(\d+)\s*/\s*(\d+)", text)
-    if pose:
-        done, total = int(pose.group(1)), max(1, int(pose.group(2)))
+    timeline = re.search(r"pose timeline progress\s+(\d+)\s*/\s*(\d+)", text)
+    if timeline:
+        done, total = int(timeline.group(1)), max(1, int(timeline.group(2)))
         return {
-            "stage": "pose", "label": "Checking serve poses",
-            "percent": 76 + int(round(0.06 * min(100, 100 * done / total))),
-        }
-    serves = re.search(r"serve validation progress\s+(\d+)\s*/\s*(\d+)", text)
-    if serves:
-        done, total = int(serves.group(1)), max(1, int(serves.group(2)))
-        return {
-            "stage": "serve", "label": "Validating serves",
-            "percent": 83 + int(round(0.05 * min(100, 100 * done / total))),
+            "stage": "pose", "label": "Reading all-player poses",
+            "percent": 45 + int(round(15 * min(1.0, done / total))),
         }
     for needle, stage, label, percent in _STAGE_RULES:
         if needle in text:
@@ -504,19 +467,413 @@ def _media_urls(job: dict[str, Any]) -> dict[str, str | None]:
     return urls
 
 
+def _player_thumbnail_dir(job_id: str) -> Path:
+    return _job_dir(job_id) / "output" / "player_thumbnails"
+
+
+def _signal_artifact_dir(job_id: str) -> Path:
+    return _job_dir(job_id) / "output" / "signal_evidence"
+
+
+def _snapshot_attempt_id(job: dict[str, Any]) -> str | None:
+    snapshot = job.get("signal_snapshot")
+    attempt_id = str(snapshot.get("attempt_id") or "") if isinstance(snapshot, dict) else ""
+    return attempt_id if re.fullmatch(r"[0-9a-f]{32}", attempt_id) else None
+
+
+def _player_artifact_dir(job: dict[str, Any]) -> Path:
+    attempt_id = _snapshot_attempt_id(job)
+    if attempt_id:
+        live = _job_dir(job["id"]) / "output" / f".player-thumbnails.{attempt_id}"
+        if live.is_dir():
+            return live
+    return _player_thumbnail_dir(job["id"])
+
+
+def _serve_artifact_dir(job: dict[str, Any]) -> Path:
+    attempt_id = _snapshot_attempt_id(job)
+    if attempt_id:
+        live = _job_dir(job["id"]) / "output" / f".signal-evidence.{attempt_id}" / "serves"
+        if live.is_dir():
+            return live
+    return _signal_artifact_dir(job["id"]) / "serves"
+
+
+def _action_artifact_dir(job: dict[str, Any]) -> Path:
+    attempt_id = _snapshot_attempt_id(job)
+    if attempt_id:
+        live = _job_dir(job["id"]) / "output" / f".signal-evidence.{attempt_id}" / "actions"
+        if live.is_dir():
+            return live
+    return _signal_artifact_dir(job["id"]) / "actions"
+
+
+def _public_match(
+    job_id: str, raw_match: Any, *, artifact_root: Path | None = None,
+) -> dict[str, Any]:
+    """Attach cache-busted identity crops without persisting transient API URLs."""
+    match = dict(raw_match) if isinstance(raw_match, dict) else {}
+    roster = []
+    root = artifact_root or _player_thumbnail_dir(job_id)
+    for raw_record in match.get("roster") or []:
+        if not isinstance(raw_record, dict):
+            continue
+        record = dict(raw_record)
+        player_id = str(record.get("id") or "")
+        inspection_sources = (
+            record.get("inspection_sources") or record.get("thumbnail_sources") or [])
+        inspection_images = []
+        for index, source in enumerate(inspection_sources):
+            path = root / f"{player_id}_{index}.jpg"
+            if not path.is_file():
+                continue
+            try:
+                version = path.stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+            inspection_images.append({
+                "url": f"/api/jobs/{job_id}/players/{player_id}/thumbnails/{index}?v={version}",
+                "time_s": source.get("time_s"),
+                "index": index,
+            })
+        thumbnail_times: set[float] = set()
+        for source in record.get("thumbnail_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            try:
+                value = float(source.get("time_s"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                thumbnail_times.add(round(value, 3))
+        thumbnails = [
+            image for image in inspection_images
+            if isinstance(image.get("time_s"), (int, float))
+            and round(float(image["time_s"]), 3) in thumbnail_times
+        ][:3]
+        if not thumbnails:
+            thumbnails = inspection_images[:3]
+        record["thumbnails"] = thumbnails
+        record["inspection_images"] = inspection_images
+        record["signal_gallery_url"] = (
+            f"/jobs/{job_id}/signals/players/{player_id}")
+        roster.append(record)
+    match["roster"] = roster
+    return match
+
+
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     """Strip internal ``*_path`` fields and attach browser-facing media URLs."""
     if not job:
         return {}
     data = {k: v for k, v in job.items() if not k.endswith("_path")}
+    snapshot = data.pop("signal_snapshot", None)
+    if isinstance(snapshot, dict):
+        data["signals_live"] = {
+            "current_stage": snapshot.get("current_stage"),
+            "updated_at": snapshot.get("updated_at"),
+        }
     if isinstance(data.get("result"), dict):
         output = Path(job["output_path"]) if job.get("output_path") else None
         data["result"] = _normalise_web_sidecar(
             job, data["result"], output_ready=bool(output and output.exists()))
+        if isinstance(data["result"].get("match"), dict):
+            data["result"]["match"] = _public_match(
+                job["id"], data["result"]["match"],
+                artifact_root=_player_artifact_dir(job))
+    if isinstance(data.get("match"), dict):
+        data["match"] = _public_match(
+            job["id"], data["match"], artifact_root=_player_artifact_dir(job))
+    if data.get("status") in {"queued", "running"}:
+        # Keep the prior profile internally so user-entered names can be merged into the
+        # fresh ReID roster, but never expose stale players/results during a reprocess.
+        data["match"] = {"roster": []}
     if data.get("error") and len(str(data["error"])) > 1500:
         data["error"] = str(data["error"])[:1500].rstrip() + " ..."
     data["media"] = _media_urls(job)
     return data
+
+
+def _render_match_player_thumbnails(
+    source: Path, match: dict[str, Any], destination: Path,
+) -> int:
+    """Crop representative player views recorded by persistent identity tracking."""
+    import cv2
+
+    destination.mkdir(parents=True, exist_ok=True)
+    if not any(
+        isinstance(record, dict)
+        and (record.get("inspection_sources") or record.get("thumbnail_sources"))
+        for record in (match.get("roster") or [])
+    ):
+        return 0
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise RuntimeError("could not open source video for player thumbnails")
+    written = 0
+    try:
+        for record in match.get("roster") or []:
+            player_id = str(record.get("id") or "")
+            if not _ROSTER_ID.fullmatch(player_id):
+                continue
+            samples = (
+                record.get("inspection_sources")
+                or record.get("thumbnail_sources")
+                or []
+            )
+            for index, sample in enumerate(samples[:40]):
+                try:
+                    time_s = float(sample["time_s"])
+                    foot_x = float(sample["foot_x_norm"])
+                    foot_y = float(sample["foot_y_norm"])
+                    area = float(sample["box_area_norm"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (math.isfinite(time_s) and math.isfinite(foot_x)
+                        and math.isfinite(foot_y) and math.isfinite(area) and area > 0):
+                    continue
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_s) * 1000.0)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                height, width = frame.shape[:2]
+                bbox = sample.get("bbox_norm")
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    bx0, by0, bx1, by1 = [float(value) for value in bbox]
+                    box_w = max(1.0, (bx1 - bx0) * width)
+                    box_h = max(1.0, (by1 - by0) * height)
+                    centre_x = 0.5 * (bx0 + bx1) * width
+                    bottom = by1 * height
+                else:
+                    # Compatibility for results produced before full body boxes were
+                    # retained by the ReID pass.
+                    box_h = math.sqrt(area / 0.38) * height
+                    box_w = area * width * height / max(box_h, 1.0)
+                    centre_x = foot_x * width
+                    bottom = foot_y * height
+                box_h = max(36.0, min(float(height), box_h))
+                box_w = max(18.0, min(float(width), box_w))
+                x0 = max(0, int(round(centre_x - 0.72 * box_w)))
+                x1 = min(width, int(round(centre_x + 0.72 * box_w)))
+                y0 = max(0, int(round(bottom - 1.10 * box_h)))
+                y1 = min(height, int(round(bottom + 0.06 * box_h)))
+                if x1 - x0 < 16 or y1 - y0 < 32:
+                    continue
+                crop = frame[y0:y1, x0:x1]
+                path = destination / f"{player_id}_{index}.jpg"
+                temp = destination / f".{player_id}_{index}.{uuid.uuid4().hex}.jpg"
+                if not cv2.imwrite(str(temp), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
+                    raise RuntimeError(f"could not write player thumbnail: {path}")
+                os.replace(temp, path)
+                written += 1
+    finally:
+        cap.release()
+    return written
+
+
+def _render_serve_signal_artifacts(
+    source: Path, stages: dict[str, Any], destination: Path,
+) -> int:
+    """Write one annotated source frame for every RTMPose serve proposal."""
+    import cv2
+
+    observations = ((stages.get("serve_pose") or {}).get("observations") or [])
+    if not observations:
+        return 0
+    destination.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise RuntimeError("could not open source video for serve-pose evidence")
+    skeleton = (
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+    )
+    written = 0
+    try:
+        for index, observation in enumerate(observations):
+            if not isinstance(observation, dict):
+                continue
+            raw_time = observation.get("pose_evidence_time")
+            if raw_time is None:
+                raw_time = observation.get("first_strike")
+            try:
+                time_s = float(raw_time)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(time_s):
+                continue
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_s) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            height, width = frame.shape[:2]
+            accepted = bool(observation.get("accepted"))
+            color = (60, 190, 90) if accepted else (60, 80, 220)
+            bbox = observation.get("server_bbox_norm")
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                x0, y0, x1, y1 = (
+                    int(round(float(bbox[0]) * width)),
+                    int(round(float(bbox[1]) * height)),
+                    int(round(float(bbox[2]) * width)),
+                    int(round(float(bbox[3]) * height)),
+                )
+                cv2.rectangle(frame, (x0, y0), (x1, y1), color, 3)
+            racket_bbox = observation.get("racket_bbox_norm") or []
+            if len(racket_bbox) == 4:
+                racket_box = tuple(
+                    round(float(value) * (width if offset % 2 == 0 else height))
+                    for offset, value in enumerate(racket_bbox))
+                cv2.rectangle(
+                    frame, (racket_box[0], racket_box[1]),
+                    (racket_box[2], racket_box[3]), (0, 220, 255), 3)
+            keypoints = observation.get("pose_keypoints_norm") or []
+            confidence = observation.get("pose_keypoint_confidence") or []
+            points: list[tuple[int, int] | None] = []
+            for joint, score in zip(keypoints, confidence):
+                if (not isinstance(joint, (list, tuple)) or len(joint) != 2
+                        or float(score) < 0.2):
+                    points.append(None)
+                    continue
+                point = (int(round(float(joint[0]) * width)),
+                         int(round(float(joint[1]) * height)))
+                points.append(point)
+                cv2.circle(frame, point, 4, color, -1, lineType=cv2.LINE_AA)
+            for left, right in skeleton:
+                if left < len(points) and right < len(points) \
+                        and points[left] is not None and points[right] is not None:
+                    cv2.line(frame, points[left], points[right], color, 2,
+                             lineType=cv2.LINE_AA)
+            hand = observation.get("racket_hand_xy_norm")
+            if isinstance(hand, (list, tuple)) and len(hand) == 2:
+                hand_point = (int(round(float(hand[0]) * width)),
+                              int(round(float(hand[1]) * height)))
+                cv2.circle(frame, hand_point, 12, (0, 220, 255), 3,
+                           lineType=cv2.LINE_AA)
+            label = (
+                f"{'ACCEPT' if accepted else 'REJECT'}  {time_s:.2f}s  "
+                f"sequence={'yes' if observation.get('serve_sequence_evidence') else 'no'}  "
+                f"rise={float(observation.get('wrist_rise_span') or 0):.2f}  "
+                f"knee={int(observation.get('knee_bend_frames') or 0)}"
+            )
+            cv2.rectangle(frame, (0, 0), (min(width, 760), 42), (20, 20, 20), -1)
+            cv2.putText(frame, label, (12, 29), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.68, color, 2, lineType=cv2.LINE_AA)
+            path = destination / f"serve_{index}.jpg"
+            temporary = destination / f".serve_{index}.{uuid.uuid4().hex}.jpg"
+            if not cv2.imwrite(str(temporary), frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
+                raise RuntimeError(f"could not write serve-pose evidence: {path}")
+            os.replace(temporary, path)
+            written += 1
+    finally:
+        cap.release()
+    return written
+
+
+def _racket_actions(stages: dict[str, Any]) -> list[dict[str, Any]]:
+    stage = stages.get("racket_actions") or {}
+    episodes = stage.get("episodes")
+    if isinstance(episodes, list):
+        return [dict(raw) for raw in episodes if isinstance(raw, dict)]
+    actions: list[dict[str, Any]] = []
+    for decision in stage.get("decisions") or []:
+        if not isinstance(decision, dict):
+            continue
+        episodes = decision.get("stroke_episodes")
+        if isinstance(episodes, list):
+            actions.extend(dict(raw) for raw in episodes if isinstance(raw, dict))
+            continue
+        for raw in decision.get("actions") or []:
+            if isinstance(raw, dict) and raw.get("action") != "serve":
+                actions.append(dict(raw))
+    return actions
+
+
+def _render_racket_signal_artifacts(
+    source: Path, stages: dict[str, Any], destination: Path,
+) -> int:
+    """Write an annotated frame for each temporal wrist-motion stroke decision."""
+    import cv2
+
+    actions = _racket_actions(stages)
+    if not actions:
+        return 0
+    destination.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise RuntimeError("could not open source video for racket-action evidence")
+    skeleton = (
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+    )
+    written = 0
+    try:
+        for index, action in enumerate(actions):
+            try:
+                time_s = float(action.get("time"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(time_s):
+                continue
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_s) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            height, width = frame.shape[:2]
+            accepted = bool(action.get("accepted", True))
+            color = (75, 205, 95) if accepted else (70, 95, 235)
+            bbox = action.get("bbox_norm") or []
+            if len(bbox) == 4:
+                box = tuple(int(round(float(value) * (width if offset % 2 == 0 else height)))
+                            for offset, value in enumerate(bbox))
+                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 3)
+            racket_bbox = action.get("racket_bbox_norm") or []
+            if len(racket_bbox) == 4:
+                racket_box = tuple(
+                    round(float(value) * (width if offset % 2 == 0 else height))
+                    for offset, value in enumerate(racket_bbox))
+                cv2.rectangle(
+                    frame, (racket_box[0], racket_box[1]),
+                    (racket_box[2], racket_box[3]), (0, 220, 255), 3)
+            keypoints = action.get("keypoints_norm") or []
+            confidence = action.get("keypoint_confidence") or []
+            points: list[tuple[int, int] | None] = []
+            for joint_index in range(min(17, len(keypoints))):
+                joint = keypoints[joint_index]
+                score = float(confidence[joint_index]) if joint_index < len(confidence) else 0.0
+                if not isinstance(joint, (list, tuple)) or len(joint) != 2 or score < 0.2:
+                    points.append(None)
+                    continue
+                point = (int(round(float(joint[0]) * width)),
+                         int(round(float(joint[1]) * height)))
+                points.append(point)
+                cv2.circle(frame, point, 4, color, -1, lineType=cv2.LINE_AA)
+            for left, right in skeleton:
+                if left < len(points) and right < len(points) \
+                        and points[left] is not None and points[right] is not None:
+                    cv2.line(frame, points[left], points[right], color, 2,
+                             lineType=cv2.LINE_AA)
+            label = (
+                f"{'ACCEPT' if accepted else 'REJECT'}  "
+                f"{str(action.get('action') or 'stroke').upper()}  "
+                f"{action.get('actor_id') or 'unassigned'}  {time_s:.2f}s  "
+                f"confidence={float(action.get('confidence') or 0):.2f}"
+            )
+            cv2.rectangle(frame, (0, 0), (min(width, 850), 42), (20, 20, 20), -1)
+            cv2.putText(frame, label, (12, 29), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.68, color, 2, lineType=cv2.LINE_AA)
+            path = destination / f"action_{index}.jpg"
+            temporary = destination / f".action_{index}.{uuid.uuid4().hex}.jpg"
+            if not cv2.imwrite(str(temporary), frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
+                raise RuntimeError(f"could not write racket-action evidence: {path}")
+            os.replace(temporary, path)
+            written += 1
+    finally:
+        cap.release()
+    return written
 
 
 def _merge_match_profile(existing: Any, detected: Any) -> dict[str, Any]:
@@ -561,34 +918,13 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
         clips = add_real_context(
             points, total_s, cfg.point_start_buffer_s, cfg.point_end_buffer_s)
 
-        speed_candidates = (((clean.get("stages") or {}).get("ball_arbiter") or {})
-                            .get("verification") or {}).get("candidates") or []
         point_events = clean.get("points") or []
-
-        def speed_for(point: tuple[float, float]) -> tuple[Optional[float], Optional[dict]]:
-            best_overlap = 0.0
-            best_speed: Optional[float] = None
-            best_estimate: Optional[dict] = None
-            for candidate in speed_candidates:
-                output = candidate.get("output")
-                speed = candidate.get("peak_ball_speed_kmh")
-                if not output or speed is None:
-                    continue
-                overlap = max(0.0, min(point[1], float(output[1]))
-                              - max(point[0], float(output[0])))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speed = float(speed)
-                    estimate = candidate.get("ball_speed_estimate")
-                    best_estimate = dict(estimate) if isinstance(estimate, dict) else None
-            return best_speed, best_estimate
 
         cursor = 0.0
         layout = []
         gap_s = float(cfg.inter_point_gap_s)
         for index, (point, clip) in enumerate(zip(points, clips)):
             clip_duration = max(0.0, clip[1] - clip[0])
-            speed, speed_estimate = speed_for(point)
             point_event = next((event for event in point_events
                                 if int(event.get("index", -1)) == index), None)
             item = {
@@ -599,12 +935,11 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
                 "detected_end": round(point[1], 3),
                 "output_start": round(cursor, 3),
                 "output_end": round(cursor + clip_duration, 3),
-                "peak_ball_speed_kmh": speed,
-                "ball_speed_estimate": speed_estimate,
             }
             if point_event is not None:
                 item["participants"] = point_event.get("participants") or {}
                 item["termination"] = point_event.get("termination") or {}
+                item["actions"] = point_event.get("actions") or []
             layout.append(item)
             cursor += clip_duration
             if index < len(points) - 1:
@@ -630,47 +965,25 @@ def _normalise_web_sidecar(job: dict[str, Any], sidecar: dict[str, Any], *,
 # --------------------------------------------------------------------------- #
 # config from web options (mirrors the CLI flags)                             #
 # --------------------------------------------------------------------------- #
-def _required_web_options(options: dict[str, Any]) -> dict[str, Any]:
-    """Full evidence is mandatory for web jobs, including legacy re-runs."""
-    required = dict(options or {})
-    required.update(ball_arbiter=True, court_auto=True, detect_players=True)
-    return required
-
-
 def _config_from_options(options: dict[str, Any]) -> RallyConfig:
-    overrides: dict[str, Any] = {"match_auto_fail_closed": True}
-    if options.get("play_mode") is not None:
-        overrides["play_mode"] = options["play_mode"]
-    if options.get("static_camera"):
-        overrides.update(
-            w_audio=0.7, w_motion=0.1, rhythm_window_s=5.0,
-            strike_snr_ratio=5.5,
-        )
+    overrides: dict[str, Any] = {}
     mapping = {
-        "analysis_fps": "analysis_fps",
+        "pose_fps": "pose_timeline_fps",
         "min_rally": "min_rally_s",
         "skip_intro": "skip_intro_s",
         "gap": "inter_point_gap_s",
         "start_buffer": "point_start_buffer_s",
         "end_buffer": "point_end_buffer_s",
-        "serve_preroll": "serve_preroll_s",
-        "tail": "landing_tail_s",
     }
     for opt, cfg_name in mapping.items():
         val = options.get(opt)
         if val is not None:
             overrides[cfg_name] = val
-            if opt == "serve_preroll":
-                overrides["toss_preroll_s"] = val
     if options.get("no_labels"):
         overrides["label_points"] = False
-    if options.get("hysteresis"):
-        overrides["use_dp_decoder"] = False
     if options.get("fast"):
         overrides["reencode"] = False
-    # Web jobs never run the audio-only reduced path. Setup/startup preflight guarantees
-    # these dependencies exist; the CLI/library API still supports explicit experiments.
-    overrides["ball_arbiter"] = True
+    # Setup/startup preflight guarantees the required modern runtime dependencies.
     overrides["court_auto"] = True
     return RallyConfig(**overrides)
 
@@ -678,15 +991,14 @@ def _config_from_options(options: dict[str, Any]) -> RallyConfig:
 def _validate_options(options: dict[str, Any]) -> None:
     """Reject invalid or pathological web options before accepting an upload."""
     non_negative = (
-        "min_rally", "skip_intro", "gap", "start_buffer", "end_buffer",
-        "serve_preroll", "tail")
+        "min_rally", "skip_intro", "gap", "start_buffer", "end_buffer")
     for name in non_negative:
         value = options.get(name)
         if value is not None and value < 0:
             raise HTTPException(status_code=400, detail=f"{name} must be non-negative")
-    analysis_fps = options.get("analysis_fps")
-    if analysis_fps is not None and not 0 < analysis_fps <= 120:
-        raise HTTPException(status_code=400, detail="analysis_fps must be in (0, 120]")
+    pose_fps = options.get("pose_fps")
+    if pose_fps is not None and not 0 < pose_fps <= 120:
+        raise HTTPException(status_code=400, detail="pose_fps must be in (0, 120]")
     try:
         _config_from_options(options)
     except (TypeError, ValueError) as exc:
@@ -941,22 +1253,18 @@ def _render_output(src: Path, segments: list[tuple[float, float]], dst: Path,
 
 
 def _write_waveform(job_id: str, src: Path, duration: float, cfg: RallyConfig, progress,
-                    strike_times: list[float] | tuple[float, ...] | None = None,
+                    serve_times: list[float] | tuple[float, ...] | None = None,
                     destination: Path | None = None) -> None:
-    """Cache ball-strike times (+ duration) so the review timeline can draw them.
-
-    Prefer onsets already produced by analysis. Older pipeline results do not
-    expose them, so retain the decode fallback for backward compatibility.
-    """
+    """Cache visual serve events for the review timeline; never decode audio."""
+    del src, cfg
     try:
-        if strike_times is not None:
-            progress("writing waveform from analysis strike times")
-            strikes = [float(t) for t in strike_times if math.isfinite(float(t))]
-        else:
-            progress("computing waveform (strike timeline)")
-            strikes = detect_strikes_stream(
-                iter_audio_mono(str(src), cfg.audio_sr, chunk_s=60.0), cfg.audio_sr, cfg)
-        data = {"duration": round(duration, 3), "strikes": [round(float(t), 3) for t in strikes]}
+        progress("writing event timeline from visual serve times")
+        serves = [
+            float(value) for value in (serve_times or ())
+            if math.isfinite(float(value))
+        ]
+        data = {"duration": round(duration, 3),
+                "serves": [round(value, 3) for value in serves]}
         _atomic_write_json(destination or (_job_dir(job_id) / "waveform.json"), data)
     except Exception as exc:
         progress(f"  waveform cache skipped ({exc})")
@@ -1022,6 +1330,7 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
         if cancel_event.is_set():
             raise _JobCancelled("processing stopped by user")
 
+    keep_partial_artifacts = False
     try:
         check_cancel()
         job_dir = _job_dir(job_id)
@@ -1029,6 +1338,8 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
         json_path = job_dir / "output" / "rallies.json"
         attempt_output_path = output_path.with_name(f".rallies.{attempt_id}.mp4")
         attempt_waveform_path = job_dir / f".waveform.{attempt_id}.json"
+        attempt_player_thumbnails = output_path.parent / f".player-thumbnails.{attempt_id}"
+        attempt_signal_artifacts = output_path.parent / f".signal-evidence.{attempt_id}"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         def start(current: dict[str, Any]) -> None:
@@ -1037,13 +1348,23 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
             current["status"] = "running"
             current["cancel_requested"] = False
             current["error"] = None
+            current["signal_snapshot"] = {
+                "attempt_id": attempt_id,
+                "current_stage": "starting",
+                "total_seconds": 0.0,
+                "stages": {},
+                "match": {"roster": [], "teams": []},
+                "points": [],
+                "segments": [],
+                "updated_at": _now(),
+            }
             _mark_labeling_stale(current)
             _set_processing(current, "starting", "Starting", 12, "Preparing output files")
 
         job = _mutate_job(job_id, start)
         if job.get("active_attempt_id") != attempt_id:
             return
-        _archive_label_artifacts(job_id)
+        _prune_label_revisions(job_id)
         _append_progress(job_id, "processing started", attempt_id=attempt_id)
         # Publish an original-video still immediately so the primary processed-video
         # panel has useful visual context throughout analysis and rendering. This is
@@ -1055,22 +1376,75 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
             _append_progress(job_id, message, attempt_id=attempt_id)
             check_cancel()
 
-        options = _required_web_options(job.get("options", {}))
+        options = dict(job.get("options", {}))
         cfg = _config_from_options(options)
+
+        def publish_signal_snapshot(raw_snapshot: dict[str, Any]) -> None:
+            """Publish stage data immediately, then attach optional visual artifacts."""
+            check_cancel()
+            snapshot = dict(raw_snapshot)
+            stage = str(snapshot.get("current_stage") or "unknown")
+            with _LOCK:
+                current = _read_json(_job_meta_path(job_id), None)
+                if not current or current.get("active_attempt_id") != attempt_id:
+                    return
+                match = snapshot.get("match")
+                if isinstance(match, dict) and match.get("roster"):
+                    snapshot["match"] = _merge_match_profile(current.get("match"), match)
+                snapshot["attempt_id"] = attempt_id
+                snapshot["updated_at"] = _now()
+                current["signal_snapshot"] = snapshot
+                current["updated_at"] = snapshot["updated_at"]
+                _atomic_write_json(_job_meta_path(job_id), current)
+
+            artifact_stage = stage in {
+                "match_format", "serve_pose", "racket_actions"}
+            if not artifact_stage:
+                return
+            artifact_errors: list[str] = []
+            try:
+                if stage == "serve_pose":
+                    _render_serve_signal_artifacts(
+                        Path(job["original_path"]), snapshot.get("stages") or {},
+                        attempt_signal_artifacts / "serves")
+                elif stage == "racket_actions":
+                    _render_racket_signal_artifacts(
+                        Path(job["original_path"]), snapshot.get("stages") or {},
+                        attempt_signal_artifacts / "actions")
+                else:
+                    _render_match_player_thumbnails(
+                        Path(job["original_path"]), snapshot.get("match") or {},
+                        attempt_player_thumbnails)
+            except Exception as exc:
+                artifact_errors.append(str(exc))
+            check_cancel()
+            with _LOCK:
+                current = _read_json(_job_meta_path(job_id), None)
+                live = current.get("signal_snapshot") if current else None
+                if (not current or current.get("active_attempt_id") != attempt_id
+                        or not isinstance(live, dict)
+                        or live.get("current_stage") != stage):
+                    return
+                live["updated_at"] = _now()
+                if artifact_errors:
+                    live["artifact_errors"] = artifact_errors
+                current["updated_at"] = live["updated_at"]
+                _atomic_write_json(_job_meta_path(job_id), current)
 
         # Analysis only: always yields a segment list, even without ffmpeg encode.
         result = trim(job["original_path"], output_path=None, cfg=cfg, json_path=None,
                       detect_players=True,
-                      progress=progress, cancel_check=check_cancel)
+                      progress=progress, cancel_check=check_cancel,
+                      signal_callback=publish_signal_snapshot)
 
         sidecar = result.sidecar()
         info = probe(job["original_path"])
         sidecar["info"] = {"fps": info.fps, "width": info.width,
                            "height": info.height, "has_audio": info.has_audio}
 
-        strike_times = sidecar.get("strike_times")
+        serve_times = sidecar.get("serve_times")
         _write_waveform(job_id, Path(job["original_path"]), result.total_seconds, cfg, progress,
-                        strike_times if isinstance(strike_times, (list, tuple)) else None,
+                        serve_times if isinstance(serve_times, (list, tuple)) else None,
                         destination=attempt_waveform_path)
 
         rendered = False
@@ -1082,6 +1456,18 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
         check_cancel()
         output_ready = rendered and attempt_output_path.exists()
         sidecar = _normalise_web_sidecar(job, sidecar, output_ready=output_ready)
+        if not attempt_player_thumbnails.exists():
+            _render_match_player_thumbnails(
+                Path(job["original_path"]), sidecar.get("match") or {},
+                attempt_player_thumbnails)
+        if not (attempt_signal_artifacts / "serves").exists():
+            _render_serve_signal_artifacts(
+                Path(job["original_path"]), sidecar.get("stages") or {},
+                attempt_signal_artifacts / "serves")
+        if not (attempt_signal_artifacts / "actions").exists():
+            _render_racket_signal_artifacts(
+                Path(job["original_path"]), sidecar.get("stages") or {},
+                attempt_signal_artifacts / "actions")
         # Generation-checked atomic publication: an attempt from a server process that
         # was superseded by a retry may finish later, but it cannot replace newer media,
         # metadata, progress, or terminal state.
@@ -1099,11 +1485,20 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
                 output_path.unlink(missing_ok=True)
             if attempt_waveform_path.exists():
                 os.replace(attempt_waveform_path, job_dir / "waveform.json")
+            published_thumbnails = _player_thumbnail_dir(job_id)
+            shutil.rmtree(published_thumbnails, ignore_errors=True)
+            if attempt_player_thumbnails.exists():
+                os.replace(attempt_player_thumbnails, published_thumbnails)
+            published_signals = _signal_artifact_dir(job_id)
+            shutil.rmtree(published_signals, ignore_errors=True)
+            if attempt_signal_artifacts.exists():
+                os.replace(attempt_signal_artifacts, published_signals)
             _atomic_write_json(json_path, sidecar)
             current["status"] = "complete" if output_ready else "no_output"
             current["retryable"] = False
             current["cancel_requested"] = False
             current["result"] = sidecar
+            current.pop("signal_snapshot", None)
             current["json_path"] = str(json_path)
             current["output_path"] = str(output_path) if output_ready else None
             if output_ready:
@@ -1122,6 +1517,13 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
         if output_ready:
             _append_progress(job_id, "wrote output", attempt_id=attempt_id)
     except Exception as exc:
+        error = str(exc)
+        try:
+            partial = (_read_json(_job_meta_path(job_id), {}) or {}).get("signal_snapshot")
+            keep_partial_artifacts = bool(
+                isinstance(partial, dict) and (partial.get("stages") or {}))
+        except (OSError, ValueError):
+            keep_partial_artifacts = False
         try:
             attempt_output_path.unlink(missing_ok=True)
         except (NameError, OSError):
@@ -1142,7 +1544,7 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
                     current["status"] = "failed"
                     current["retryable"] = True
                     current["cancel_requested"] = False
-                    current["error"] = str(exc)
+                    current["error"] = error
                     output = (Path(current["output_path"])
                               if current.get("output_path") else None)
                     metadata = (Path(current["json_path"])
@@ -1154,20 +1556,23 @@ def _run_trim_job(job_id: str, attempt_id: str | None = None) -> None:
                             else "no_output")
                         _set_processing(
                             current, current["status"], "Previous result retained", 100,
-                            f"Re-run failed: {exc}",
+                            f"Re-run failed: {error}",
                         )
                     else:
-                        _set_processing(current, "failed", "Failed", 100, str(exc))
+                        _set_processing(current, "failed", "Failed", 100, error)
 
                 _mutate_job(job_id, fail)
                 _append_progress(
-                    job_id, f"processing failed: {exc}", attempt_id=attempt_id)
+                    job_id, f"processing failed: {error}", attempt_id=attempt_id)
         except HTTPException:
             pass
     finally:
         try:
             attempt_output_path.unlink(missing_ok=True)
             attempt_waveform_path.unlink(missing_ok=True)
+            if not keep_partial_artifacts:
+                shutil.rmtree(attempt_player_thumbnails, ignore_errors=True)
+                shutil.rmtree(attempt_signal_artifacts, ignore_errors=True)
         except (NameError, OSError):
             pass
         with _LOCK:
@@ -1210,13 +1615,21 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
         # Admission succeeded.  A full reprocess invalidates its prior publication
         # immediately; failed or cancelled attempts must not resurrect stale analysis.
         _discard_published_result(job_id, job)
-        # Old jobs may have been created when the UI exposed reduced audio-only switches.
-        # A re-run upgrades them before queueing so the failure cannot recur.
-        job["options"] = _required_web_options(job.get("options", {}))
+        job["options"] = dict(job.get("options", {}))
         attempt_id = uuid.uuid4().hex
         cancel_event = threading.Event()
         _CANCEL_EVENTS[job_id] = (attempt_id, cancel_event)
         job["active_attempt_id"] = attempt_id
+        job["signal_snapshot"] = {
+            "attempt_id": attempt_id,
+            "current_stage": "queued",
+            "total_seconds": 0.0,
+            "stages": {},
+            "match": {"roster": [], "teams": []},
+            "points": [],
+            "segments": [],
+            "updated_at": _now(),
+        }
         job["status"] = "queued"
         job["retryable"] = False
         job["cancel_requested"] = False
@@ -1230,7 +1643,7 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
         _atomic_write_json(_job_meta_path(job_id), job)
 
     try:
-        _archive_label_artifacts(job_id)
+        _prune_label_revisions(job_id)
         _append_progress(job_id, "queued for processing", attempt_id=attempt_id)
         future = _EXECUTOR.submit(_run_trim_job, job_id, attempt_id)
         with _LOCK:
@@ -1239,6 +1652,7 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
             lambda completed, jid=job_id, aid=attempt_id: (
                 _forget_job_future(jid, aid, completed)))
     except Exception as exc:
+        error = str(exc)
         with _LOCK:
             _SUBMITTED.discard(job_id)
             _UPLOAD_RESERVED.discard(job_id)
@@ -1251,11 +1665,11 @@ def _submit_job(job_id: str, *, reserved_upload: bool = False,
         def fail_submission(current: dict[str, Any]) -> None:
             current["status"] = "failed"
             current["retryable"] = True
-            current["error"] = f"could not queue processing: {exc}"
+            current["error"] = f"could not queue processing: {error}"
             _set_processing(current, "failed", "Failed", 100, current["error"])
 
         _mutate_job(job_id, fail_submission)
-        raise RuntimeError(f"could not queue processing: {exc}") from exc
+        raise RuntimeError(f"could not queue processing: {error}") from exc
     return _load_job(job_id)
 
 
@@ -1327,11 +1741,14 @@ def _recover_interrupted_jobs() -> dict[str, int]:
             _submit_job(job_id, _recovering=True)
             submitted += 1
         except Exception as exc:
+            error = str(exc)
             try:
-                def fail_recovery(current: dict[str, Any]) -> None:
+                def fail_recovery(
+                    current: dict[str, Any], error: str = error
+                ) -> None:
                     current["status"] = "failed"
                     current["retryable"] = True
-                    current["error"] = f"could not recover queued processing: {exc}"
+                    current["error"] = f"could not recover queued processing: {error}"
                     _set_processing(current, "failed", "Failed", 100, current["error"])
 
                 _mutate_job(job_id, fail_recovery)
@@ -1352,6 +1769,16 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/jobs/{job_id}")
+@app.get("/jobs/{job_id}/signals")
+@app.get("/jobs/{job_id}/signals/players/{player_id}")
+def job_page(job_id: str, player_id: str | None = None) -> FileResponse:
+    _load_job(job_id)
+    if player_id is not None and not _ROSTER_ID.fullmatch(player_id):
+        raise HTTPException(status_code=404, detail="player not found")
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -1394,45 +1821,28 @@ def get_golden_media(dataset_id: str, kind: str, download: bool = False) -> File
 @app.post("/api/jobs")
 async def create_job(
     file: UploadFile = File(...),
-    play_mode: str = Form("auto"),
-    static_camera: bool = Form(False),
-    detect_players: bool = Form(True),
     fast: bool = Form(False),
-    hysteresis: bool = Form(False),
     no_labels: bool = Form(False),
-    ball_arbiter: bool = Form(True),
-    court_auto: bool = Form(True),
     run_now: bool = Form(True),
-    analysis_fps: Optional[str] = Form(None),
+    pose_fps: Optional[str] = Form(None),
     min_rally: Optional[str] = Form(None),
     skip_intro: Optional[str] = Form(None),
     gap: Optional[str] = Form(None),
     start_buffer: Optional[str] = Form(None),
     end_buffer: Optional[str] = Form(None),
-    serve_preroll: Optional[str] = Form(None),
-    tail: Optional[str] = Form(None),
 ) -> JSONResponse:
     # Parse and validate all options before creating a job directory or retaining
     # any upload bytes. Invalid forms must not leave orphan jobs behind.
     options = {
-        "play_mode": play_mode,
-        "static_camera": static_camera,
-        "detect_players": detect_players,
         "fast": fast,
-        "hysteresis": hysteresis,
         "no_labels": no_labels,
-        "ball_arbiter": ball_arbiter,
-        "court_auto": court_auto,
-        "analysis_fps": _parse_optional_float(analysis_fps),
+        "pose_fps": _parse_optional_float(pose_fps),
         "min_rally": _parse_optional_float(min_rally),
         "skip_intro": _parse_optional_float(skip_intro),
         "gap": _parse_optional_float(gap),
         "start_buffer": _parse_optional_float(start_buffer),
         "end_buffer": _parse_optional_float(end_buffer),
-        "serve_preroll": _parse_optional_float(serve_preroll),
-        "tail": _parse_optional_float(tail),
     }
-    options = _required_web_options(options)
     options = {k: v for k, v in options.items() if v is not None}
     _validate_options(options)
 
@@ -1621,31 +2031,19 @@ def update_match_roster(job_id: str, update: MatchRosterUpdate) -> JSONResponse:
                 sidecar["match"] = match
                 _atomic_write_json(Path(job["json_path"]), sidecar)
         _atomic_write_json(path, job)
-    return JSONResponse({"match": match})
+    return JSONResponse({"match": _public_match(job_id, match)})
 
 
 def _capabilities() -> dict[str, Any]:
     """Report the required processing features verified again at server startup.
 
     The UI still exposes per-job controls, but a missing required feature is now a startup
-    error rather than a reason to launch a degraded audio-only service.
+    error rather than a reason to launch a degraded service.
     """
     import importlib.util
 
-    torch_ok = importlib.util.find_spec("torch") is not None
     players_ok = importlib.util.find_spec("ultralytics") is not None
     rtmlib_ok = importlib.util.find_spec("rtmlib") is not None
-    try:
-        from rally.signals.ball import discover_ball_weights
-        weights = discover_ball_weights()
-    except Exception:
-        weights = None
-    if not torch_ok:
-        hint = "install PyTorch (pip install torch) and TrackNet weights"
-    elif not weights:
-        hint = "no TrackNet weights found — run: python -m rally.tools.fetch_models --help"
-    else:
-        hint = ""
     try:
         from rally.config import RallyConfig
         from rally.signals.pose import (
@@ -1665,18 +2063,17 @@ def _capabilities() -> dict[str, Any]:
         pose_providers = []
         pose_device = "unavailable"
     return {
-        "ball_arbiter": {
-            "available": bool(weights) and torch_ok,
-            "weights_present": bool(weights),
-            "torch_installed": torch_ok,
-            "hint": hint,
+        "racket_actions": {
+            "available": bool(players_ok and rtmlib_ok and pose_model_present),
+            "backend": "shared_rtmpose_coco17_timeline",
+            "ball_tracking": False,
         },
         # classical court detection only needs OpenCV, a core dependency
         "court_auto": {"available": True},
         "players": {
             "available": players_ok,
             "hint": ("" if players_ok else
-                     "Ultralytics is not installed; match-state pose validation is unavailable"),
+                     "Ultralytics is not installed; player tracking is unavailable"),
         },
         "pose": {
             "available": bool(players_ok and rtmlib_ok and pose_model_present),
@@ -1790,13 +2187,195 @@ def get_media(job_id: str, kind: str, download: bool = False):
                         content_disposition_type=disposition)
 
 
+@app.get("/api/jobs/{job_id}/players/{player_id}/thumbnails/{index}")
+def get_player_thumbnail(job_id: str, player_id: str, index: int) -> FileResponse:
+    """Serve only tracker-owned identity thumbnails from this completed job."""
+    if not _ROSTER_ID.fullmatch(player_id) or not 0 <= index < 40:
+        raise HTTPException(status_code=404, detail="player thumbnail not found")
+    job = _load_job(job_id)
+    snapshot = job.get("signal_snapshot") if isinstance(job.get("signal_snapshot"), dict) else {}
+    match = snapshot.get("match") or job.get("match") or {}
+    record = next((
+        item for item in match.get("roster", [])
+        if isinstance(item, dict) and str(item.get("id")) == player_id
+    ), None)
+    sources = ((record or {}).get("inspection_sources")
+               or (record or {}).get("thumbnail_sources") or [])
+    if record is None or index >= len(sources):
+        raise HTTPException(status_code=404, detail="player thumbnail not found")
+    path = _player_artifact_dir(job) / f"{player_id}_{index}.jpg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="player thumbnail not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+def _signal_payload(job: dict[str, Any]) -> dict[str, Any]:
+    snapshot = job.get("signal_snapshot")
+    has_snapshot = isinstance(snapshot, dict)
+    live = bool(has_snapshot and job.get("status") in {"queued", "running"})
+    result = snapshot if has_snapshot else (
+        job.get("result") if isinstance(job.get("result"), dict) else {})
+    stages = result.get("stages") if isinstance(result.get("stages"), dict) else {}
+    match = _public_match(
+        job["id"], result.get("match") or job.get("match") or {},
+        artifact_root=_player_artifact_dir(job))
+    pose_stage = stages.get("serve_pose") if isinstance(stages.get("serve_pose"), dict) else {}
+    raw_pose_observations = pose_stage.get("observations") or []
+    serve_root = _serve_artifact_dir(job)
+    serve_observations = []
+    for index, raw in enumerate(raw_pose_observations):
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "index": index,
+            "time": raw.get("first_strike"),
+            "pose_evidence_time": raw.get("pose_evidence_time"),
+            "point": raw.get("point"),
+            "pose_accepted": bool(raw.get("accepted")),
+            "serve_motion": bool(raw.get("serve_motion")),
+            "serve_sequence": bool(raw.get("serve_sequence_evidence")),
+            "serve_sequence_score": raw.get("serve_sequence_score"),
+            "overhead_frames": int(raw.get("overhead_frames") or 0),
+            "overhead_ratio": raw.get("overhead_max_ratio"),
+            "wrist_rise_span": raw.get("wrist_rise_span"),
+            "hand_speed_body_s": raw.get("hand_speed_body_s"),
+            "knee_bend_frames": int(raw.get("knee_bend_frames") or 0),
+            "server_load_frames": int(raw.get("server_load_frames") or 0),
+            "leg_drive_frames": int(raw.get("leg_drive_frames") or 0),
+            "server_baseline_frames": int(raw.get("server_baseline_frames") or 0),
+            "opposed_formation_frames": int(raw.get("opposed_formation_frames") or 0),
+            "position_accepted": bool(raw.get("position_setup_evidence")),
+            "position_score": raw.get("position_score"),
+            "pose_frames": int(raw.get("pose_frames") or 0),
+            "sampled_frames": int(raw.get("sampled_frames") or 0),
+            "ready_frames": int(raw.get("ready_frames") or 0),
+            "racket_hand_confidence": raw.get("racket_hand_confidence"),
+            "racket_observed_frames": int(raw.get("racket_observed_frames") or 0),
+            "racket_wrist_associated": bool(raw.get("racket_wrist_associated")),
+            "server_end": raw.get("pose_server_end") or raw.get("position_server_end"),
+            "server_court_x_m": raw.get("pose_server_court_x_m"),
+        }
+        path = serve_root / f"serve_{index}.jpg"
+        if path.is_file():
+            item["image"] = (
+                f"/api/jobs/{job['id']}/signals/serves/{index}?v={path.stat().st_mtime_ns}")
+        serve_observations.append(item)
+    action_stage = (stages.get("racket_actions")
+                    if isinstance(stages.get("racket_actions"), dict) else {})
+    action_root = _action_artifact_dir(job)
+    actions = _racket_actions(stages)
+    for index, action in enumerate(actions):
+        action["index"] = index
+        path = action_root / f"action_{index}.jpg"
+        if path.is_file():
+            action["image"] = (
+                f"/api/jobs/{job['id']}/signals/actions/{index}?v={path.stat().st_mtime_ns}")
+    endpoint_stage = stages.get("endpoints") if isinstance(stages.get("endpoints"), dict) else {}
+    quality_stage = (stages.get("quality_control")
+                     if isinstance(stages.get("quality_control"), dict) else {})
+    stage_order = (
+        "audio", "court", "visual", "match_format", "pose_timeline", "serve_pose", "candidate_generation",
+        "racket_actions", "endpoints", "quality_control",
+    )
+    stage_summary = []
+    for name in stage_order:
+        raw = stages.get(name)
+        if isinstance(raw, dict):
+            stage_summary.append({
+                "name": name,
+                "status": raw.get("status", "recorded"),
+                "reason": raw.get("reason"),
+            })
+    return {
+        "job": {"id": job["id"], "filename": job.get("filename"),
+                "status": job.get("status"),
+                "processing": job.get("processing") or {}},
+        "live": live,
+        "current_stage": result.get("current_stage"),
+        "updated_at": result.get("updated_at") or job.get("updated_at"),
+        "duration": result.get("total_seconds", 0),
+        "stage_summary": stage_summary,
+        "court": stages.get("court") or {},
+        "visual": stages.get("visual") or {},
+        "match_format": stages.get("match_format") or {},
+        "pose_timeline": stages.get("pose_timeline") or {},
+        "candidate_generation": stages.get("candidate_generation") or {},
+        "players": match.get("roster") or [],
+        "teams": match.get("teams") or [],
+        "serve_pose": {**pose_stage, "observations": serve_observations},
+        "racket_actions": {**action_stage, "actions": actions},
+        "points": result.get("points") or [],
+        "endpoints": endpoint_stage,
+        "quality_control": quality_stage,
+    }
+
+
+@app.get("/api/jobs/{job_id}/signals")
+def get_job_signals(job_id: str) -> JSONResponse:
+    return JSONResponse(_signal_payload(_load_job(job_id)))
+
+
+@app.get("/api/jobs/{job_id}/signals/players/{player_id}")
+def get_player_signals(job_id: str, player_id: str) -> JSONResponse:
+    if not _ROSTER_ID.fullmatch(player_id):
+        raise HTTPException(status_code=404, detail="player not found")
+    payload = _signal_payload(_load_job(job_id))
+    player = next((record for record in payload["players"]
+                   if str(record.get("id")) == player_id), None)
+    if player is None:
+        raise HTTPException(status_code=404, detail="player not found")
+    return JSONResponse({
+        "job": payload["job"],
+        "duration": payload["duration"],
+        "live": payload["live"],
+        "current_stage": payload["current_stage"],
+        "updated_at": payload["updated_at"],
+        "player": player,
+    })
+
+
+@app.get("/api/jobs/{job_id}/signals/serves/{index}")
+def get_serve_signal_image(job_id: str, index: int) -> FileResponse:
+    if not 0 <= index < 10000:
+        raise HTTPException(status_code=404, detail="serve evidence not found")
+    job = _load_job(job_id)
+    source = (job.get("signal_snapshot")
+              if isinstance(job.get("signal_snapshot"), dict)
+              else (job.get("result") or {}))
+    observations = (((source.get("stages") or {})
+                     .get("serve_pose") or {}).get("observations") or [])
+    if index >= len(observations):
+        raise HTTPException(status_code=404, detail="serve evidence not found")
+    path = _serve_artifact_dir(job) / f"serve_{index}.jpg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="serve evidence not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/jobs/{job_id}/signals/actions/{index}")
+def get_racket_action_image(job_id: str, index: int) -> FileResponse:
+    if not 0 <= index < 100000:
+        raise HTTPException(status_code=404, detail="racket-action evidence not found")
+    job = _load_job(job_id)
+    source = (job.get("signal_snapshot")
+              if isinstance(job.get("signal_snapshot"), dict)
+              else (job.get("result") or {}))
+    actions = _racket_actions(source.get("stages") or {})
+    if index >= len(actions):
+        raise HTTPException(status_code=404, detail="racket-action evidence not found")
+    path = _action_artifact_dir(job) / f"action_{index}.jpg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="racket-action evidence not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
 @app.get("/api/jobs/{job_id}/waveform")
 def get_waveform(job_id: str) -> JSONResponse:
     job = _load_job(job_id)
-    data = _read_json(_job_dir(job_id) / "waveform.json", {"strikes": [], "duration": 0})
+    data = _read_json(_job_dir(job_id) / "waveform.json", {"serves": [], "duration": 0})
     result = job.get("result") or {}
-    if isinstance(result.get("strike_times"), list):
-        data["strikes"] = result["strike_times"]
+    if isinstance(result.get("serve_times"), list):
+        data["serves"] = result["serve_times"]
     data["segments"] = result.get("segments", [])
     if not data.get("duration"):
         data["duration"] = result.get("total_seconds", 0)
@@ -1844,11 +2423,11 @@ def _rewrite_sidecar(job: dict[str, Any], segs: list[tuple[float, float]]) -> di
     sidecar["total_seconds"] = round(total, 3)
     sidecar["compression_ratio"] = round(kept / total, 4) if total else 0.0
     sidecar["edited"] = True
-    # Point actors/outcomes are derived from the exact automatic boundaries and evidence
-    # graph. Manual interval edits invalidate them; retain the durable match roster only.
+    # Point action groupings are derived from automatic boundaries. Manual edits
+    # invalidate those groupings; retain the durable match roster only.
     sidecar["points"] = []
     stages = sidecar.setdefault("stages", {})
-    stages["point_outcomes"] = {
+    stages["racket_actions"] = {
         "status": "stale", "reason": "manual segment boundaries changed",
     }
     if job.get("json_path"):
@@ -1937,7 +2516,7 @@ def edit_segments(job_id: str, edit: SegmentEdit) -> JSONResponse:
                                 "All segments were removed")
 
         job = _mutate_job(job_id, finish_edit)
-        _archive_label_artifacts(job_id)
+        _prune_label_revisions(job_id)
         # The metadata pointer now owns the new immutable artifacts. Old files can be
         # removed afterward without ever leaving the job with no valid published result.
         for key in ("output_path", "json_path"):
@@ -1946,6 +2525,7 @@ def edit_segments(job_id: str, edit: SegmentEdit) -> JSONResponse:
                 Path(old).unlink(missing_ok=True)
         return JSONResponse(_public_job(job))
     except Exception as exc:
+        error = str(exc)
         attempt_out.unlink(missing_ok=True)
         attempt_json.unlink(missing_ok=True)
         try:
@@ -1956,7 +2536,7 @@ def edit_segments(job_id: str, edit: SegmentEdit) -> JSONResponse:
                 current["json_path"] = previous_job.get("json_path")
                 current["output_path"] = previous_job.get("output_path")
                 current["labeling"] = previous_job.get("labeling", {})
-                current["error"] = f"could not apply segment edits: {exc}"
+                current["error"] = f"could not apply segment edits: {error}"
                 _set_processing(
                     current,
                     "complete" if current.get("output_path") else "no_output",
@@ -1994,24 +2574,6 @@ def delete_job(job_id: str) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # labelling: generate raw samples (player crops + serve clips) to annotate     #
 # --------------------------------------------------------------------------- #
-def _labels_dir(job_id: str) -> Path:
-    with _LOCK:
-        job = _read_json(_job_meta_path(job_id), {})
-        revision = (job.get("labeling") or {}).get("revision")
-    if revision:
-        return _job_dir(job_id) / "label_revisions" / str(revision) / "labels"
-    return _job_dir(job_id) / "labels"  # legacy/no-live-revision path
-
-
-def _assets_dir(job_id: str) -> Path:
-    with _LOCK:
-        job = _read_json(_job_meta_path(job_id), {})
-        revision = (job.get("labeling") or {}).get("revision")
-    if revision:
-        return _job_dir(job_id) / "label_revisions" / str(revision) / "label_assets"
-    return _job_dir(job_id) / "label_assets"
-
-
 def _label_root_locked(job_id: str, *, writable: bool) -> tuple[dict[str, Any], Path]:
     """Resolve one stable revision; stale revisions are readable but never writable."""
     job = _read_json(_job_meta_path(job_id), None)
@@ -2025,11 +2587,6 @@ def _label_root_locked(job_id: str, *, writable: bool) -> tuple[dict[str, Any], 
             or job.get("status") in {"queued", "running"}):
         raise HTTPException(status_code=409, detail="no stable label revision")
     return job, _job_dir(job_id) / "label_revisions" / str(revision)
-
-
-def _live_label_root_locked(job_id: str) -> tuple[dict[str, Any], Path]:
-    """Backward-compatible name for mutation callers requiring the ready revision."""
-    return _label_root_locked(job_id, writable=True)
 
 
 def _clean_label_values(kind: str, values: dict[str, Any], roster_ids: set[str]) -> dict:
@@ -2210,7 +2767,7 @@ def _resolve_match_type(requested: str, persons_per_frame: list[int]) -> str:
 
 def _generate_player_tasks(job_id: str, src: Path, segments: list[dict], duration: float,
                            max_items: int, match_type_req: str, regenerate: bool,
-                           assets_dir: Optional[Path] = None):
+                           assets_dir: Path):
     """Detect players, build a roster, and crop one-player pictures to annotate."""
     import cv2
 
@@ -2242,7 +2799,7 @@ def _generate_player_tasks(job_id: str, src: Path, segments: list[dict], duratio
     match_type = _resolve_match_type(match_type_req, persons_per_frame)
     roster = _roster_for(match_type)
 
-    assets = assets_dir or _assets_dir(job_id)
+    assets = assets_dir
     tasks: list[dict[str, Any]] = []
     idx = 0
     for (t, frame, boxes) in grabbed:
@@ -2287,21 +2844,29 @@ def _generate_player_tasks(job_id: str, src: Path, segments: list[dict], duratio
 
 
 def _generate_serve_tasks(job_id: str, src: Path, segments: list[dict], duration: float,
-                          max_items: int, regenerate: bool, match_state: Optional[dict] = None,
-                          assets_dir: Optional[Path] = None) -> list[dict[str, Any]]:
+                          max_items: int, regenerate: bool, assets_dir: Path,
+                          serve_pose: Optional[dict] = None) -> list[dict[str, Any]]:
     """Cut short clips around each serve moment (rally start) to classify."""
     count = min(max_items, max(1, len(segments) or max_items))
     if segments:
         selected = _evenly_pick(list(enumerate(segments)), count)
     else:
         selected = [(None, {"start": value}) for value in _serve_times([], duration, count)]
-    groups = (match_state or {}).get("logical_groups") or []
-    assets = assets_dir or _assets_dir(job_id)
+    observations = (serve_pose or {}).get("observations") or []
+    assets = assets_dir
     tasks: list[dict[str, Any]] = []
     for i, (source_index, segment) in enumerate(selected[:max_items]):
         start = float(segment["start"])
-        clip_start = max(0.0, start - 1.5)
-        clip_end = min(duration, start + 3.5) if duration else start + 3.5
+        end = float(segment.get("end", start + 5.0))
+        observation = next((
+            (index, item) for index, item in enumerate(observations)
+            if isinstance(item, dict) and item.get("accepted")
+            and start <= float(item.get("first_strike", -1.0)) <= end
+        ), None)
+        event_time = (float(observation[1]["first_strike"])
+                      if observation is not None else start)
+        clip_start = max(0.0, event_time - 1.5)
+        clip_end = min(duration, event_time + 3.5) if duration else event_time + 3.5
         rel = f"serve_{i:04d}.mp4"
         path = assets / rel
         if regenerate or not path.exists():
@@ -2310,20 +2875,18 @@ def _generate_serve_tasks(job_id: str, src: Path, segments: list[dict], duration
         if source_index is not None:
             stable_context["source_segment_index"] = int(
                 segment.get("index", source_index))
-            group = next((record for record in groups
-                          if record.get("output")
-                          and record.get("serve_member_index") is not None
-                          and abs(float(record["output"][0]) - start) <= 0.01), None)
-            if group is not None:
+            if observation is not None:
+                observation_index, record = observation
                 stable_context.update({
-                    "logical_group": int(group["group_index"]),
-                    "match_state_observation_index": int(group["serve_member_index"]),
+                    "serve_pose_observation_index": int(observation_index),
+                    "suggested_server_id": record.get("actor_id"),
+                    "serve_sequence_score": record.get("serve_sequence_score"),
                 })
         tasks.append({
             "id": f"serve_{i:04d}",
             "kind": "serve_motion",
             "title": f"Serve clip {i + 1}",
-            "time_s": round(float(start), 3),
+            "time_s": round(event_time, 3),
             "media_type": "video",
             "asset_url": f"/api/jobs/{job_id}/assets/{rel}",
             **stable_context,
@@ -2383,11 +2946,16 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
             _set_labeling(job_id, detail="Cutting serve clips")
             tasks.extend(_generate_serve_tasks(
                 job_id, src, segments, duration, req.max_items, True,
-                match_state=((result.get("stages") or {}).get("match_state") or {}),
+                serve_pose=((result.get("stages") or {}).get("serve_pose") or {}),
                 assets_dir=build_assets))
 
         # persist roster (preserve any user-renamed names) + tasks
-        existing = _read_json(_labels_dir(job_id) / "roster.json", None)
+        previous_revision = (job.get("labeling") or {}).get("revision")
+        previous_roster = (
+            _job_dir(job_id) / "label_revisions" / str(previous_revision)
+            / "labels" / "roster.json"
+            if previous_revision else None)
+        existing = _read_json(previous_roster, None) if previous_roster else None
         if existing and not req.regenerate:
             names = {r["id"]: r.get("name") for r in existing if isinstance(r, dict)}
             for r in roster:
@@ -2405,10 +2973,11 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
         _atomic_write_json(build_labels / "tasks.json", tasks)
         stages = result.get("stages") or {}
         _atomic_write_json(build_labels / "feature_context.json", {
-            "schema_version": "rally.serve_rule_context.v1",
-            "strike_times": result.get("strike_times", []),
+            "schema_version": "rally.pose_serve_context.v1",
+            "serve_times": result.get("serve_times", []),
             "segments": result.get("segments", []),
-            "match_state": stages.get("match_state", {}),
+            "serve_pose": stages.get("serve_pose", {}),
+            "pipeline_config": result.get("config", {}),
         })
         # New media invalidates old human answers even when stable task IDs happen to
         # repeat. Publish an explicitly empty label set with the new revision.
@@ -2431,7 +3000,7 @@ def _run_label_gen(job_id: str, req: LabelTaskRequest) -> None:
                        updated_at=_now())
 
         _mutate_job(job_id, publish_revision)  # atomic pointer switch in job.json
-        _archive_label_artifacts(job_id)       # migrate legacy dirs + prune older revisions
+        _prune_label_revisions(job_id)
     except Exception as exc:
         _set_labeling(job_id, status="failed", error=str(exc), detail=str(exc))
     finally:
@@ -2513,7 +3082,7 @@ def update_roster(job_id: str, update: RosterUpdate) -> JSONResponse:
               "side": r.get("side"), "col": r.get("col")}
              for r in update.roster]
     with _LOCK:
-        job, root = _live_label_root_locked(job_id)
+        job, root = _label_root_locked(job_id, writable=True)
         if update.revision != str((job.get("labeling") or {}).get("revision") or ""):
             raise HTTPException(status_code=409, detail="label revision changed; reload samples")
         _atomic_write_json(root / "labels" / "roster.json", clean)
@@ -2535,7 +3104,7 @@ def save_label(job_id: str, payload: LabelPayload) -> JSONResponse:
     if len(json.dumps(payload.values)) > 64 * 1024:
         raise HTTPException(status_code=413, detail="label values are too large")
     with _LOCK:
-        job, root = _live_label_root_locked(job_id)
+        job, root = _label_root_locked(job_id, writable=True)
         if payload.revision != str((job.get("labeling") or {}).get("revision") or ""):
             raise HTTPException(status_code=409, detail="label revision changed; reload samples")
         tasks = _read_json(root / "labels" / "tasks.json", [])
@@ -2560,19 +3129,12 @@ def download_labels(job_id: str) -> Response:
         job, root = _label_root_locked(job_id, writable=False)
         labels_dir = root / "labels"
         path = labels_dir / "labels.json"
-        result = job.get("result") or {}
-        stages = result.get("stages") or {}
         feature_context = _read_json(labels_dir / "feature_context.json", None)
         if not isinstance(feature_context, dict):
-            # Legacy revisions predate context snapshots. They remain exportable for
-            # audit, while stable-ID training rejects heuristic/absent joins for gating.
-            feature_context = {
-                "schema_version": "rally.serve_rule_context.v1",
-                "strike_times": result.get("strike_times", []),
-                "segments": result.get("segments", []),
-                "match_state": stages.get("match_state", {}),
-                "legacy_revision_context": True,
-            }
+            raise HTTPException(
+                status_code=409,
+                detail="label revision lacks feature context; regenerate label samples",
+            )
         export = {"schema_version": "rally.web_labels.v2",
                   "job_id": job_id, "filename": job.get("filename"),
                   "roster": _read_json(labels_dir / "roster.json", []),

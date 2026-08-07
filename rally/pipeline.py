@@ -1,1788 +1,381 @@
-"""End-to-end orchestration: video in -> rally-only video (+ JSON sidecar) out.
+"""Continuous all-player pose tennis point trimming with no audio or ball inference.
 
-``trim`` is a thin orchestrator; each analysis/refinement stage is its own
-function below so the flow reads top-to-bottom:
+The pipeline has one direction of evidence:
 
-    probe -> [audio | visual | ball | pose] channels -> co-decide (fuse)
-          -> derive points -> anchor serves
-          -> ball arbiter: validate + bound each candidate   (default; ball_arbiter)
-             OR legacy trim-ball-ends                          (when ball_arbiter off)
-          -> validate match serve/setup sequence -> drop non-play -> write sidecar + cut
+    court -> persistent target-player identities -> shared pose timeline
+        -> service/stroke events -> tennis point state -> positive between-point cut
+
+RTMPose COCO-17 has no racket keypoint, so ordinary strokes are inferred from ordered
+wrist motion on identified players.  Point discovery scans every tracked match player on
+both court ends and can recover an exchange whose serve is outside the video or missed by
+pose. Audio is only preserved in output; no bounce, line, let, or in/out claim is made.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
 from .config import RallyConfig
-from .pipeline_types import PipelineState as _Channels, RallyResult
-from .io.ffmpeg import (
-    iter_audio_mono,
-    probe,
-)
+from .fusion.points import total_kept_seconds
+from .io.ffmpeg import probe
 from .io.publish import write_output as _write_output
-from .signals.audio import detect_strikes_stream, strike_rhythm_features
-from .fusion.score import audio_score, motion_score, rally_probability
-from .fusion.intervals import (
-    contains_all_events as _point_fully_evaluated,
-    covered_by_regions as _point_covered_by_regions,
-    events_in as _point_strikes,
-    overlaps as _overlaps,
-)
-from .fusion.decode import segments_from_prob
-from .fusion.points import (
-    drop_isolated_points,
-    effective_strike_times,
-    points_from_strikes,
-    points_from_strikes_movement,
-    snap_serve_starts,
-    total_kept_seconds,
-)
+from .pipeline_types import PipelineState, RallyResult
 
-Segment = Tuple[float, float]
+Segment = tuple[float, float]
 Progress = Callable[[str], None]
 CancelCheck = Callable[[], None]
+SignalCallback = Callable[[dict], None]
 
 
 @contextmanager
-def _timed(ch: _Channels, name: str, progress: Progress):
-    """Record one wall-clock stage and emit a stable, machine-readable log line."""
+def _timed(state: PipelineState, name: str, progress: Progress):
     started = time.perf_counter()
     try:
         yield
     finally:
         elapsed = time.perf_counter() - started
-        ch.timings[name] = ch.timings.get(name, 0.0) + elapsed
+        state.timings[name] = state.timings.get(name, 0.0) + elapsed
         progress(f"timing {name}: {elapsed:.3f}s")
 
 
-def _file_sha256(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for block in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def player_timeline_array(duration: float, cfg: RallyConfig) -> np.ndarray:
+    """Times owned by the one expensive target-player identity pass."""
+    return np.arange(0.0, duration, 1.0 / cfg.player_fps)
 
 
-# --------------------------------------------------------------------------- #
-# analysis stages: each fills part of _Channels                               #
-# --------------------------------------------------------------------------- #
-def _audio_channel(input_path, info, timeline, cfg, ch, progress,
-                   cancel_check: CancelCheck = lambda: None) -> None:
-    """Ball-strike detection + strike-rhythm features (the primary rally cue)."""
-    if not info.has_audio:
-        ch.stages["audio"] = {"status": "unavailable", "reason": "no audio stream"}
-        return
-    try:
-        progress("decoding audio and detecting ball strikes")
-        def cancellable_chunks():
-            for chunk in iter_audio_mono(input_path, cfg.audio_sr, chunk_s=60.0):
-                cancel_check()
-                yield chunk
-
-        chunks = cancellable_chunks()
-        ch.onsets = detect_strikes_stream(chunks, cfg.audio_sr, cfg)
-        ch.n_strikes = int(ch.onsets.size)
-        progress(f"  {ch.n_strikes} strikes detected")
-        # Only vote when there are strikes. With zero strikes the rhythm features are all
-        # zero; adding them as a confident-0 channel would drag the fused probability down
-        # (a confident "no rally" everywhere) instead of abstaining. Let the other channels
-        # decide when audio has nothing to say.
-        if ch.n_strikes > 0:
-            ch.audio_rate, ch.audio_reg = strike_rhythm_features(ch.onsets, timeline, cfg)
-            ch.used.append("audio")
-            ch.stages["audio"] = {"status": "used", "strikes": ch.n_strikes,
-                                  "streaming": True}
-        else:
-            progress("  no strikes -> audio abstains from the fusion")
-            ch.stages["audio"] = {"status": "abstained", "strikes": 0,
-                                  "streaming": True}
-    except Exception as exc:  # pragma: no cover
-        ch.stages["audio"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  audio channel failed: {exc}")
-
-
-def _visual_channels(input_path, cfg, timeline, detect_players, ch, progress,
-                     cancel_check: CancelCheck = lambda: None) -> None:
-    """Frame-diff motion, camera-motion flag, player-geometry + near-player track."""
-    from .signals.visual import analyze_visual, opencv_available
-
-    if not opencv_available():  # pragma: no cover
-        ch.stages["visual"] = {"status": "unavailable", "reason": "OpenCV unavailable"}
-        progress("OpenCV not installed -> motion/geometry channels disabled")
-        return
-    try:
-        progress("sampling frames (motion / camera / players)")
-        detector = None
-        if detect_players:
-            from .signals.player import PlayerDetector
-
-            detector = PlayerDetector(model=cfg.player_detection_model)
-            ch.detector = detector  # reused by the serve-anchoring stage (no second load)
-            if not detector.available:
-                progress("  YOLO unavailable -> geometry channel disabled")
-        vis = analyze_visual(
-            input_path, cfg, timeline, detector, court=ch.court, progress=progress,
-            cancel_check=cancel_check)
-        ch.motion = vis["motion"]
-        ch.camera_moving = vis["camera_moving"]
-        ch.geometry = vis["geometry"]
-        ch.near_track = vis.get("near_track")
-        ch.player_samples = vis.get("player_samples") or []
-        ch.frame_size = vis.get("frame_size") or ch.frame_size
-        if ch.motion is not None:
-            ch.used.append("motion")
-        if ch.geometry is not None:
-            ch.used.append("geometry")
-        visual_used = ch.motion is not None or ch.geometry is not None
-        ch.stages["visual"] = {
-            "status": "used" if visual_used else "abstained",
-            "players": ch.geometry is not None,
-            "detection_model": cfg.player_detection_model,
-            "target_court_filtered": vis.get("target_court_filtered", False),
-            "device": (getattr(detector, "device", None) if detector is not None else None),
-            **({"detector_error": getattr(detector, "error")}
-               if detector is not None and getattr(detector, "error", None) else {}),
-            **({} if visual_used else {
-                "reason": "target court geometry unavailable or invalid",
-            }),
-        }
-    except Exception as exc:  # pragma: no cover
-        ch.stages["visual"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  visual channel failed: {exc}")
-
-
-def _ball_channel(input_path, timeline, cfg, ch, progress,
-                  cancel_check: CancelCheck = lambda: None) -> None:
-    """Opt-in: track the ball over the whole video as a co-deciding vote."""
-    if not (cfg.ball_channel and cfg.ball_weights):
-        if cfg.ball_channel:
-            ch.stages["ball_channel"] = {
-                "status": "unavailable", "reason": "explicit ball weights are required"}
-        return
-    if ch.court is None and cfg.target_court_required:
-        ch.stages["ball_channel"] = {
-            "status": "abstained",
-            "reason": "target court geometry is required outside casual mode",
-        }
-        return
-    try:
-        from .signals.ball import ball_in_play_channel, track_tracknet
-        progress("ball-in-play channel: tracking ball over the whole video (slow on CPU)")
-        btrack = track_tracknet(
-            input_path, cfg.ball_weights,
-            batch_size=cfg.ball_inference_batch_size,
-            tracking_fps=cfg.ball_tracking_fps,
-            half_precision=cfg.ball_half_precision,
-            court=ch.court,
-            cancel_check=cancel_check)
-        ch.ball = ball_in_play_channel(btrack, timeline, court=ch.court)
-        ch.used.append("ball")
-        ch.stages["ball_channel"] = {"status": "used", "weights": cfg.ball_weights}
-    except Exception as exc:  # pragma: no cover
-        ch.stages["ball_channel"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  ball channel failed: {exc}")
-
-
-def _pose_channel(input_path, timeline, cfg, ch, progress,
-                  cancel_check: CancelCheck = lambda: None) -> None:
-    """Opt-in: near-player pose activity as a confidence-weighted vote."""
-    if not cfg.player_pose:
-        return
-    if ch.court is None and cfg.target_court_required:
-        ch.stages["pose"] = {
-            "status": "abstained",
-            "model": cfg.player_pose_model,
-            "reason": "target court geometry is required outside casual mode",
-        }
-        return
-    try:
-        from .signals.player import pose_activity_track
-        progress("player pose channel: tracking pose over the video (slow)")
-        ch.pose, ch.pose_conf = pose_activity_track(
-            input_path, timeline, fps_a=cfg.player_pose_fps,
-            cancel_check=cancel_check,
-            model_name=cfg.player_pose_model,
-            pose_backend=cfg.player_pose_backend,
-            detection_model=cfg.player_detection_model,
-            rtmpose_runtime=cfg.rtmpose_runtime,
-            rtmpose_device=cfg.rtmpose_device,
-            court=ch.court)
-        ch.used.append("pose")
-        ch.stages["pose"] = {
-            "status": "used", "backend": cfg.player_pose_backend,
-            "model": cfg.player_pose_model}
-    except Exception as exc:  # pragma: no cover
-        ch.stages["pose"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  pose channel failed: {exc}")
-
-
-# --------------------------------------------------------------------------- #
-# decision + refinement stages: probability -> points -> refined points       #
-# --------------------------------------------------------------------------- #
-def _arbiter_candidates(regions: List[Segment], onsets: np.ndarray,
-                        split_gap_s: float, *, pre_context_s: float = 1.0,
-                        post_context_s: float = 1.0) -> List[Segment]:
-    """Turn broad recall regions into strike-bounded TrackNet candidates.
-
-    The proposal mask deliberately opens around every plausible transient and can bridge
-    most of a match. Passing every quiet interval between strike clusters to TrackNet made
-    a ten-minute upload require almost ten minutes of CNN input. Retain toss/landing
-    context around each cluster while leaving padding and endpoint extension to the ball
-    verifier. Regions with no audio still survive unchanged so player-derived, audio-missed
-    serves remain eligible.
-    """
-    onsets = np.sort(np.asarray(onsets, dtype=float))
-    out: List[Segment] = []
-    for rs, re in regions:
-        w = onsets[(onsets >= rs) & (onsets <= re)]
-        if w.size == 0:
-            out.append((rs, re))
-            continue
-        cuts = np.where(np.diff(w) > split_gap_s)[0]
-        starts = np.r_[0, cuts + 1]
-        stops = np.r_[cuts + 1, w.size]
-        for first, stop in zip(starts, stops):
-            cluster = w[int(first):int(stop)]
-            start = max(float(rs), float(cluster[0]) - max(0.0, pre_context_s))
-            end = min(float(re), float(cluster[-1]) + max(0.0, post_context_s))
-            if end > start:
-                out.append((start, end))
-    return out
-
-
-def _select_arbiter_candidates(
-    regions: List[Segment], coherent_points: List[Segment], onsets: np.ndarray,
-    player_hints: np.ndarray, cfg,
-) -> Tuple[List[Segment], dict]:
-    """Prefer point-level audio groups while retaining independent recovery evidence.
-
-    Every isolated transient used to launch TrackNet. In ordinary match recordings that
-    means score calls, footsteps, and ball hand-offs consume most of the source timeline.
-    Multi-contact coherent points remain high-recall primary candidates. A non-coherent
-    cluster survives only when target-player motion independently places a serve beside
-    one of its contacts; regions with no audio also survive for motion-only recovery.
-    """
-    raw = _arbiter_candidates(
-        regions, onsets, cfg.point_gap_s,
-        pre_context_s=cfg.toss_preroll_s,
-        post_context_s=cfg.landing_tail_s,
-    )
-    primary = []
-    for point in coherent_points:
-        local = effective_strike_times(
-            _point_strikes(point, np.asarray(onsets, dtype=float)),
-            cfg.echo_collapse_s,
-        )
-        if (len(local) >= cfg.min_rally_strikes
-                and _point_covered_by_regions(point, regions, onsets)):
-            primary.append(point)
-    selected = list(primary)
-    hint_recoveries = 0
-    audio_missed_recoveries = 0
-    hints = np.asarray(player_hints, dtype=float)
-    strikes = np.asarray(onsets, dtype=float)
-    for candidate in raw:
-        if any(_overlaps(candidate, point) for point in primary):
-            continue
-        local_strikes = strikes[
-            (strikes >= candidate[0]) & (strikes <= candidate[1])]
-        if local_strikes.size == 0:
-            selected.append(candidate)
-            audio_missed_recoveries += 1
-            continue
-        aligned = bool(hints.size and np.any(
-            np.abs(hints[:, None] - local_strikes[None, :])
-            <= cfg.match_player_hint_audio_guard_s
-        ))
-        if aligned:
-            selected.append(candidate)
-            hint_recoveries += 1
-    selected.sort()
-    return selected, {
-        "raw_candidates": len(raw),
-        "coherent_candidates": len(primary),
-        "player_hint_recoveries": hint_recoveries,
-        "audio_missed_recoveries": audio_missed_recoveries,
-        "discarded_unconfirmed_transient_clusters": (
-            len(raw) - len(primary) - hint_recoveries - audio_missed_recoveries),
-    }
-
-
-def _bounded_arbiter_regions(regions: List[Segment], evidence: np.ndarray,
-                             duration: float, cfg, ch) -> Tuple[List[Segment], List[Segment]]:
-    """Rank and cap expensive trajectory work without creating giant candidates.
-
-    The cap is a safety valve for adversarial/noisy footage, not an accuracy claim: stage
-    provenance records how much proposal time was omitted so callers can see degradation.
-    """
-    max_len = float(cfg.arbiter_max_candidate_s)
-    chunks: List[Segment] = []
-    for start, end in regions:
-        cursor = float(start)
-        while cursor < end:
-            stop = min(float(end), cursor + max_len)
-            if stop > cursor:
-                chunks.append((cursor, stop))
-            cursor = stop
-    proposed_s = sum(e - s for s, e in chunks)
-    if cfg.accuracy_mode:
-        # Accuracy runs must not make a correctness decision from whether an otherwise
-        # valid proposal happened to win a workload ranking.  The expensive model may be
-        # slower, but every proposed region receives the same trajectory opportunity.
-        budget = float(duration)
-    else:
-        budget = min(float(duration), float(cfg.arbiter_max_total_s),
-                     max(float(cfg.arbiter_min_total_s),
-                         float(duration) * float(cfg.arbiter_max_total_fraction)))
-
-    def tracked_seconds(items: List[Segment]) -> float:
-        padded = sorted((max(0.0, s - cfg.arbiter_pre_pad_s),
-                         min(duration, e + max(cfg.arbiter_post_pad_s,
-                                               cfg.ball_max_extend_s)))
-                        for s, e in items)
-        merged: List[List[float]] = []
-        for start, end in padded:
-            if merged and start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], end)
-            else:
-                merged.append([start, end])
-        return sum(end - start for start, end in merged)
-
-    proposed_tracked_s = tracked_seconds(chunks)
-    if proposed_tracked_s <= budget:
-        ch.stages["arbiter_proposal"] = {
-            "status": "used", "proposed_seconds": round(proposed_s, 3),
-            "selected_seconds": round(proposed_s, 3),
-            "tracked_seconds": round(proposed_tracked_s, 3), "capped": False,
-            "accuracy_mode": bool(cfg.accuracy_mode),
-            "selected_regions": len(chunks), "omitted_regions": 0,
-            "ranking": "audio_coherence_strikes_then_temporal_diversity"}
-        return chunks, []
-
-    fps = float(cfg.analysis_fps)
-
-    audio = None
-    if ch.audio_rate is not None and ch.audio_reg is not None:
-        audio = audio_score(ch.audio_rate, ch.audio_reg)
-    onsets = np.asarray(ch.onsets, dtype=float)
-
-    def peak(values: np.ndarray) -> float:
-        if values.size == 0:
-            return 0.0
-        # A point is short relative to a 45 s chunk. Mean-only ranking dilutes a real
-        # cadence into surrounding dead time, so combine its peak with a smaller mean.
-        return 0.8 * float(np.max(values)) + 0.2 * float(np.mean(values))
-
-    def quality(seg: Segment) -> float:
-        lo = max(0, int(np.floor(seg[0] * fps)))
-        hi = min(evidence.size, max(lo + 1, int(np.ceil(seg[1] * fps))))
-        generic = peak(evidence[lo:hi]) if hi > lo else 0.0
-        coherence = peak(audio[lo:hi]) if audio is not None and hi > lo else 0.0
-        n_strikes = int(np.sum((onsets >= seg[0]) & (onsets <= seg[1])))
-        strike_support = min(1.0, n_strikes / max(1, cfg.min_rally_strikes + 1))
-        # Audio cadence and multiple accepted transients are discriminative. Generic
-        # proposal evidence only breaks otherwise weak cases; it must not dominate.
-        return 0.70 * coherence + 0.20 * strike_support + 0.10 * generic
-
-    def diversity(seg: Segment, selected: List[Segment]) -> float:
-        midpoint = 0.5 * (seg[0] + seg[1])
-        if not selected:
-            # With tied evidence, begin near the centre rather than depending on input
-            # ordering. Subsequent farthest-point choices spread across the timeline.
-            return max(0.0, 1.0 - abs(midpoint - duration / 2) / max(duration / 2, 1e-9))
-        nearest = min(abs(midpoint - 0.5 * (s + e)) for s, e in selected)
-        return min(1.0, 2.0 * nearest / max(duration, 1e-9))
-
-    selected: List[Segment] = []
-    remaining = list(chunks)
-    while remaining:
-        feasible = [seg for seg in remaining
-                    if tracked_seconds([*selected, seg]) <= budget]
-        if not feasible:
-            break
-        chosen = max(
-            feasible,
-            key=lambda seg: (
-                quality(seg) + cfg.arbiter_diversity_weight * diversity(seg, selected),
-                quality(seg),
-                -abs(0.5 * (seg[0] + seg[1]) - duration / 2),
-            ),
-        )
-        selected.append(chosen)
-        remaining.remove(chosen)
-    selected.sort()
-    omitted = list(remaining)
-    omitted.sort()
-    selected_s = sum(e - s for s, e in selected)
-    selected_tracked_s = tracked_seconds(selected)
-    ch.stages["arbiter_proposal"] = {
-        "status": "capped", "proposed_seconds": round(proposed_s, 3),
-        "selected_seconds": round(selected_s, 3),
-        "tracked_seconds": round(selected_tracked_s, 3),
-        "omitted_seconds": round(max(0.0, proposed_s - selected_s), 3),
-        "budget_seconds": round(budget, 3),
-        "selected_regions": len(selected), "omitted_regions": len(omitted),
-        "ranking": "audio_coherence_strikes_then_temporal_diversity"}
-    return selected, omitted
-
-
-def _coherent_audio_fallback(regions: List[Segment], ch, duration: float,
-                             cfg) -> List[Segment]:
-    """Build audio hypotheses for TrackNet-omitted or indeterminate regions.
-
-    Accuracy mode deliberately retains short and single-contact hypotheses.  They remain
-    unevaluated evidence for the later serve/match decoder, not accepted rallies.  The
-    throughput mode keeps the older conservative coherence gate.
-    """
-    if not regions or ch.onsets.size == 0:
-        return []
-    # Computational chunk boundaries are not point boundaries. Rejoin adjacent selected
-    # or omitted chunks before audio clustering so a rally straddling 45 s is not split.
-    contiguous: List[Segment] = []
-    for start, end in sorted(regions):
-        if contiguous and start <= contiguous[-1][1] + 1e-9:
-            contiguous[-1] = (contiguous[-1][0], max(contiguous[-1][1], end))
-        else:
-            contiguous.append((start, end))
-    serve_window = cfg.serve_attach_window_s if cfg.serve_attach else 0.0
-    min_strikes = 1 if cfg.accuracy_mode else cfg.min_rally_strikes
-    min_duration = 0.0 if cfg.accuracy_mode else cfg.min_rally_dur_s
-    return points_from_strikes(
-        contiguous, ch.onsets, cfg.point_gap_s, min_strikes,
-        cfg.toss_preroll_s, cfg.landing_tail_s, duration,
-        echo_s=cfg.echo_collapse_s, min_dur_s=min_duration,
-        serve_window_s=serve_window,
-    )
-
-
-def _merge_point_sources(primary: List[Segment], fallback: List[Segment]) -> List[Segment]:
-    """Combine already-adjudicated sources without truncating whole fallback points.
-
-    Every interval in ``fallback`` reached this function because no single ball-verifier
-    verdict owned all of that point's strikes (or because proposal budgeting omitted it).
-    A partially accepted trajectory must therefore defer to the whole fallback point,
-    rather than deleting it merely because the two intervals overlap. Fully owned audio
-    points are removed earlier by :func:`_indeterminate_audio_fallback`, so they never
-    reach this merge.
-    """
-    precise = [(s, e) for s, e in primary if e > s]
-    owned_fallback = [
-        (s, e) for s, e in fallback
-        if e > s
-    ]
-    retained_precise = [
-        (s, e) for s, e in precise
-        if not any(_overlaps((s, e), point) for point in owned_fallback)
-    ]
-    return sorted([*retained_precise, *owned_fallback])
-
-
-def _player_activity_proposal(ch, cfg) -> np.ndarray:
-    """Recall-only player activity and stable-to-active serve-time hints.
-
-    The near-player track is sampled sparsely. Fill only intervals whose measured
-    displacement rate clears the activity threshold, discard short jitter bursts, then
-    require a stable near-court formation immediately before an activity run. The inferred
-    contact time precedes receiver movement by a small reaction lag. These hints only open
-    TrackNet work; later match validation must independently confirm the serve.
-    """
-    if ch.near_track is None:
-        return np.zeros(0, dtype=float)
-    px, py = (np.asarray(values, dtype=float) for values in ch.near_track)
-    n = min(px.size, py.size)
-    activity = np.zeros(n, dtype=float)
-    valid = np.flatnonzero(np.isfinite(px[:n]) & np.isfinite(py[:n]))
-    if valid.size < 3:
-        return activity
-
-    fps = float(cfg.analysis_fps)
-    for prior, current in zip(valid, valid[1:]):
-        dt = (current - prior) / fps
-        if dt <= 0.0 or dt > max(1.0, 3.0 / max(float(cfg.player_fps), 1e-6)):
-            continue
-        speed = float(np.hypot(px[current] - px[prior], py[current] - py[prior]) / dt)
-        if speed >= cfg.match_player_activity_speed:
-            activity[prior:current + 1] = 1.0
-
-    min_frames = max(1, int(round(cfg.match_player_activity_min_s * fps)))
-    active = activity > 0.0
-    edges = np.diff(np.r_[False, active, False].astype(np.int8))
-    runs = list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
-    activity[:] = 0.0
-    hints: list[float] = []
-    proposal_hints: list[float] = []
-    audio_supported = 0
-    onsets = np.asarray(ch.onsets, dtype=float)
-    stable_frames = max(1, int(round(cfg.match_player_stable_s * fps)))
-    for start, stop in runs:
-        if stop - start < min_frames:
-            continue
-        stable_start = max(0, int(start) - stable_frames)
-        stable_idx = valid[(valid >= stable_start) & (valid <= start)]
-        if stable_idx.size < max(3, int(round(cfg.match_player_stable_s * cfg.player_fps))):
-            continue
-        stable_span = max(
-            float(np.ptp(px[stable_idx])), float(np.ptp(py[stable_idx])))
-        near_y = float(np.median(py[stable_idx]))
-        if (stable_span <= cfg.match_player_stable_span
-                and near_y >= cfg.match_player_hint_near_y_min):
-            contact = max(
-                0.0, float(start) / fps - cfg.match_receiver_reaction_lag_s)
-            # Preserve every target-player stable-to-active transition as validation
-            # evidence. Audio suppresses only redundant TrackNet proposal work, not the
-            # independently observed receiver reaction itself.
-            hints.append(contact)
-            if (onsets.size and np.any(
-                    np.abs(onsets - contact) <= cfg.match_player_hint_audio_guard_s)):
-                # Audio already opened a candidate at this serve. Adding a second visual
-                # proposal only bridges neighbouring windows and repeats TrackNet work.
-                audio_supported += 1
-                continue
-            # Only the early reaction is needed to bridge the serve into a candidate.
-            # Capping it prevents subsequent pickup/walking from joining many otherwise
-            # independent TrackNet windows into one near-full-video inference group.
-            proposal_stop = min(
-                int(stop), int(start) + max(
-                    1, int(round(cfg.match_player_proposal_s * fps))))
-            activity[start:proposal_stop] = 1.0
-            proposal_hints.append(contact)
-
-    ch.player_serve_hints = np.asarray(hints, dtype=float)
-    ch.player_proposal_hints = np.asarray(proposal_hints, dtype=float)
-    ch.stages["player_activity_proposal"] = {
-        "status": "used" if hints else "no_hints",
-        "active_fraction": round(float(np.mean(activity > 0.0)), 4),
-        "serve_hints": [round(float(value), 3) for value in hints],
-        "proposal_hints": [round(float(value), 3) for value in proposal_hints],
-        "audio_supported_hints_suppressed": audio_supported,
-        "rule": "audio_missing_stable_formation_then_receiver_activity",
-    }
-    return activity
-
-
-def _player_hints_for_validation(ch) -> np.ndarray:
-    """Use every reaction only when detections were constrained to a target court.
-
-    In legacy/no-court mode, retain the previous behavior by exposing only reactions that
-    were needed to open an audio-missed proposal. Manually supplied hints (used by callers
-    and focused tests) predate proposal bookkeeping and remain valid as provided.
-    """
-    if ch.court is not None:
-        return np.asarray(ch.player_serve_hints, dtype=float)
-    if "player_activity_proposal" in ch.stages:
-        return np.asarray(ch.player_proposal_hints, dtype=float)
-    return np.asarray(ch.player_serve_hints, dtype=float)
-
-
-def _target_motion_times_for_validation(ch, cfg) -> np.ndarray:
-    """Times with independent motion inside the calibrated target-court mask."""
-    if ch.court is None or ch.motion is None:
-        return np.zeros(0, dtype=float)
-    evidence = np.nan_to_num(
-        motion_score(ch.motion, ch.camera_moving, cfg),
-        nan=0.0, posinf=0.0, neginf=0.0,
-    )
-    active = evidence >= 0.5
-    # A single noisy frame must not veto a measured neighboring-court contradiction. The
-    # verifier separately requires two active timestamps inside each candidate core.
-    return np.flatnonzero(active).astype(float) / float(cfg.analysis_fps)
-
-
-def _apply_ball_end_hints(segments: List[Segment], ch, cfg) -> List[Segment]:
-    """Refine fallback ends using impacts followed by measured outgoing ball motion."""
-    if not ch.ball_end_hints:
-        return segments
-    out: List[Segment] = []
-    changed = 0
-    for point in segments:
-        candidates = [
-            (region, hint) for region, hint in ch.ball_end_hints
-            if _point_fully_evaluated(point, region, ch.onsets)
-        ]
-        if not candidates:
-            out.append(point)
-            continue
-        # Computational proposal boundaries can overlap.  Prefer the hint requiring the
-        # smallest correction to this audio hypothesis, then keep it inside the source.
-        _region, hint = min(candidates, key=lambda item: abs(item[1] - point[1]))
-        # A trajectory component can disappear at an ordinary mid-rally occlusion.  Such
-        # a local endpoint is useful for removing a few seconds of chained pickup noise,
-        # but is not strong enough to delete a large suffix of an audio-supported point.
-        if (ch.court is None
-                and float(hint) < point[1] - cfg.ball_end_hint_max_uncalibrated_trim_s):
-            out.append(point)
-            continue
-        # An indeterminate trajectory hint may safely remove a tail, but it cannot prove
-        # that action continued after an audio fallback already ended. Accepted TrackNet
-        # points carry their own bounds and do not need hint-based extension here.
-        end = max(
-            point[0] + min(cfg.min_rally_s, 0.25),
-            min(float(point[1]), float(hint)),
-        )
-        out.append((point[0], end))
-        changed += int(abs(end - point[1]) > 1e-6)
-    ch.stages["ball_end_hints"] = {
-        "status": "used", "available": len(ch.ball_end_hints), "changed": changed,
-    }
-    return out
-
-
-def _indeterminate_audio_fallback(ch) -> Tuple[List[Segment], int, int]:
-    """Resolve selected audio points by whole-point tri-state ownership."""
-    kept: List[Segment] = []
-    suppressed = 0
-    superseded = 0
-    for point in ch.arbiter_selected_audio_fallback:
-        if any(_point_fully_evaluated(point, region, ch.onsets)
-               for region in ch.arbiter_accepted_regions):
-            superseded += 1
-            continue
-        if any(_point_fully_evaluated(point, region, ch.onsets)
-               for region in ch.arbiter_rejected_regions):
-            suppressed += 1
-            continue
-        if (any(_point_fully_evaluated(point, region, ch.onsets)
-                for region in ch.arbiter_indeterminate_regions)
-                # No single verdict evaluated the whole point (for example a computational
-                # boundary split it): retain conservative audio instead of silently losing it.
-                or not any(_point_fully_evaluated(point, region, ch.onsets)
-                           for region in [*ch.arbiter_accepted_regions,
-                                          *ch.arbiter_rejected_regions,
-                                          *ch.arbiter_indeterminate_regions])):
-            kept.append(point)
-    return kept, suppressed, superseded
-
-
-def _recover_fragmented_match_ends(
-    segments: List[Segment], ch, cfg, *, duration: Optional[float] = None,
-) -> List[Segment]:
-    """Recover a bounded tail after logical-point grouping and serve validation.
-
-    Doing this to individual audio fragments can extend score calls or mid-point chunks.
-    At this stage each segment is already one validated tennis point. Only a short point
-    with at least three de-duplicated impacts inside the terminal fragmented proposal may
-    borrow up to the configured recovery interval.
-    """
-    out: List[Segment] = []
-    records: list[dict] = []
-    for point_index, point in enumerate(segments):
-        if (duration is not None and point_index == len(segments) - 1
-                and 0.0 <= float(duration) - point[1]
-                <= cfg.ball_max_extend_s + 2.0 * cfg.ball_tail_s
-                and any(
-                    region[1] >= float(duration) - 0.1
-                    and _overlaps(point, region)
-                    for region in ch.arbiter_indeterminate_regions
-                )):
-            strikes = np.sort(_point_strikes(point, ch.onsets))
-            effective = effective_strike_times(strikes, cfg.echo_collapse_s)
-            if len(effective) >= cfg.min_rally_strikes + 1:
-                out.append((float(point[0]), float(duration)))
-                records.append({
-                    "point": [round(float(v), 3) for v in point],
-                    "output_end": round(float(duration), 3),
-                    "effective_strikes": len(effective),
-                    "reason": "validated terminal point reaches source boundary",
-                })
-                continue
-        if point[1] - point[0] >= 10.0:
-            out.append(point)
-            continue
-        candidates: list[tuple[Segment, int]] = []
-        for region in ch.arbiter_fragmented_regions:
-            if region[1] <= point[1] or not _overlaps(point, region):
-                continue
-            strikes = np.sort(_point_strikes(
-                (max(point[0], region[0]), min(point[1], region[1])), ch.onsets))
-            effective = effective_strike_times(strikes, cfg.echo_collapse_s)
-            if len(effective) >= cfg.min_rally_strikes + 1:
-                candidates.append((region, len(effective)))
-        if not candidates:
-            out.append(point)
-            continue
-        region, count = min(candidates, key=lambda item: item[0][1] - point[1])
-        end = min(
-            float(point[1]) + cfg.arbiter_fragmented_end_recovery_s,
-            float(region[1]) + cfg.ball_tail_s,
-        )
-        # This fallback recovers a visual tail after an already validated logical point;
-        # it must not swallow the next acoustic candidate (often a score call or ball
-        # hand-off). A genuine multi-impact continuation is grouped by match_state before
-        # reaching this fallback. Stop just before the first new outside onset.
-        outside_onsets = np.sort(np.asarray(ch.onsets, dtype=float))
-        outside_onsets = outside_onsets[
-            (outside_onsets > point[1] + 1e-9)
-            & (outside_onsets <= end + 1e-9)
-        ]
-        if outside_onsets.size:
-            end = max(float(point[1]), float(outside_onsets[0] - 0.1))
-        out.append((float(point[0]), end))
-        records.append({
-            "point": [round(float(v), 3) for v in point],
-            "proposal": [round(float(v), 3) for v in region],
-            "output_end": round(end, 3),
-            "effective_strikes": count,
-        })
-    if records:
-        ch.stages.setdefault("match_state", {})[
-            "fragmented_end_recoveries"
-        ] = records
-    return out
-
-
-def _clamp_player_recovered_starts(
-    segments: List[Segment], ch, *, max_lead_s: float = 4.0,
-    recovery_preroll_s: float = 0.5,
-) -> List[Segment]:
-    """Bound synthetic preroll near an independently inferred recovery window.
-
-    A recovery that overlaps only the tail of an already established long point is a
-    fragment of that point, not its start. Keep a small preparation buffer for genuine
-    recovered starts instead of cutting exactly at the computational proposal boundary.
-    """
-    if not ch.player_recovered_points:
-        return segments
-    out: List[Segment] = []
-    for start, end in segments:
-        floors = [
-            max(0.0, recovered[0] - recovery_preroll_s)
-            for recovered in ch.player_recovered_points
-            if _overlaps((start, end), recovered)
-            and recovered[0] <= end
-            and 0.0 <= recovered[0] - start <= max_lead_s
-        ]
-        out.append((max(start, min(floors)), end) if floors else (start, end))
-    return out
-
-
-def _derive_points(ch, duration, cfg, progress, *, for_ball_arbiter: bool = False) -> List[Segment]:
-    """Fuse channels into a rally probability, then cut it into individual points."""
-    # player presence (geometry) is a supporting vote only — two players are on court
-    # between points too, so audio/ball carry the "is it a rally" decision.
-    progress(f"co-deciding rally probability from channels: {', '.join(ch.used)}")
-    prob = rally_probability(
-        cfg, n=timeline_size(duration, cfg),
-        audio_rate=ch.audio_rate, audio_regularity=ch.audio_reg,
-        geometry=ch.geometry, motion=ch.motion, camera_moving=ch.camera_moving,
-        ball=ch.ball, pose=ch.pose, pose_conf=ch.pose_conf,
-    )
-    decision_prob = prob
-    if for_ball_arbiter:
-        # Proposal mode is intentionally more permissive than final classification. Weak
-        # visual cues may open a candidate but cannot survive without trajectory evidence.
-        proposal = prob.copy()
-        if ch.motion is not None:
-            motion_evidence = np.nan_to_num(
-                motion_score(ch.motion, ch.camera_moving, cfg),
-                nan=0.0, posinf=0.0, neginf=0.0,
-            )
-            active_fraction = float(np.mean(motion_evidence >= 0.5)) if motion_evidence.size else 0.0
-            if active_fraction <= cfg.arbiter_motion_max_active_frac:
-                proposal = np.maximum(proposal, 0.65 * motion_evidence)
-                ch.stages["motion_proposal"] = {
-                    "status": "used", "active_fraction": round(active_fraction, 4)}
-            else:
-                ch.stages["motion_proposal"] = {
-                    "status": "suppressed", "active_fraction": round(active_fraction, 4),
-                    "reason": "motion saturated; refusing unbounded ball-tracking work"}
-        if ch.pose is not None:
-            pose_evidence = np.nan_to_num(
-                ch.pose, nan=0.0, posinf=0.0, neginf=0.0)
-            proposal = np.maximum(proposal, 0.60 * np.clip(pose_evidence, 0.0, 1.0))
-        if ch.geometry is not None:
-            geometry_evidence = np.nan_to_num(
-                ch.geometry, nan=0.0, posinf=0.0, neginf=0.0)
-            proposal = np.maximum(
-                proposal, 0.40 * np.clip(geometry_evidence, 0.0, 1.0))
-        if cfg.play_mode != "casual" and ch.near_track is not None:
-            player_activity = _player_activity_proposal(ch, cfg)
-            if player_activity.size == proposal.size:
-                proposal = np.maximum(proposal, 0.65 * player_activity)
-                # The reaction begins shortly after contact. Open a compact bridge from
-                # the inferred contact into the measured activity run so smoothing cannot
-                # leave the serve itself outside the TrackNet candidate.
-                hint_pre = max(1, int(round(0.75 * cfg.analysis_fps)))
-                hint_post = max(1, int(round(0.75 * cfg.analysis_fps)))
-                for hint in ch.player_proposal_hints:
-                    center = int(round(float(hint) * cfg.analysis_fps))
-                    lo = max(0, center - hint_pre)
-                    hi = min(proposal.size, center + hint_post + 1)
-                    proposal[lo:hi] = np.maximum(proposal[lo:hi], 0.65)
-        # Every accepted transient gets a small proposal window. This is deliberately
-        # independent of cadence/coherence so one-hit points can reach the arbiter.
-        pre_frames = max(1, int(round(0.75 * cfg.analysis_fps)))
-        post_frames = max(1, int(round(1.25 * cfg.analysis_fps)))
-        for onset in ch.onsets:
-            center = int(round(float(onset) * cfg.analysis_fps))
-            lo, hi = max(0, center - pre_frames), min(proposal.size, center + post_frames + 1)
-            proposal[lo:hi] = np.maximum(proposal[lo:hi], 0.65)
-        decision_prob = proposal
-    regions = segments_from_prob(decision_prob, cfg.analysis_fps, cfg, total_s=duration)
-    onsets = ch.onsets
-    serve_window = cfg.serve_attach_window_s if cfg.serve_attach else 0.0
-
-    if for_ball_arbiter:
-        # Do not apply audio coherence here. Missed impacts and legitimate one-hit points
-        # (aces/double faults) must reach the expensive trajectory decision.
-        # Audio coherence is a point-level property. Compute it before computational
-        # chunking so a rally with strikes on both sides of a budget edge remains whole.
-        coherent_points = _coherent_audio_fallback(regions, ch, duration, cfg)
-        selected, omitted = _bounded_arbiter_regions(
-            regions, decision_prob, duration, cfg, ch)
-        ch.arbiter_selected_audio_fallback = [
-            point for point in coherent_points
-            if _point_covered_by_regions(point, selected, ch.onsets)
-        ]
-        ch.arbiter_audio_fallback = [
-            point for point in coherent_points
-            if not _point_covered_by_regions(point, selected, ch.onsets)
-        ]
-        candidates, candidate_selection = _select_arbiter_candidates(
-            selected, coherent_points, onsets, ch.player_proposal_hints, cfg,
-        )
-        proposal_stage = ch.stages["arbiter_proposal"]
-        padded = sorted(
-            (max(0.0, start - cfg.arbiter_pre_pad_s),
-             min(duration, end + max(cfg.arbiter_post_pad_s, cfg.ball_max_extend_s)))
-            for start, end in candidates
-        )
-        candidate_union: List[List[float]] = []
-        for start, end in padded:
-            if candidate_union and start <= candidate_union[-1][1]:
-                candidate_union[-1][1] = max(candidate_union[-1][1], end)
-            else:
-                candidate_union.append([start, end])
-        candidate_tracking_s = sum(end - start for start, end in candidate_union)
-        proposal_stage.update({
-            "selected_candidates": len(candidates),
-            "candidate_selection": candidate_selection,
-            "candidate_tracking_seconds": round(candidate_tracking_s, 3),
-            "audio_fallback_points": len(ch.arbiter_audio_fallback),
-            "audio_fallback_seconds": round(
-                total_kept_seconds(ch.arbiter_audio_fallback), 3),
-            "selected_audio_points_pending_verdict": len(
-                ch.arbiter_selected_audio_fallback),
-        })
-        player_stage = ch.stages.get("player_activity_proposal")
-        if player_stage is not None:
-            progress(
-                "  player serve proposal: "
-                f"{len(ch.player_serve_hints)} stable-to-active hint(s); "
-                f"TrackNet workload {proposal_stage.get('candidate_tracking_seconds', 0):.1f}s"
-            )
-        ch.stages["arbiter_audio_fallback"] = {
-            "status": ("ready" if (ch.arbiter_audio_fallback
-                                     or ch.arbiter_selected_audio_fallback) else "none"),
-            "source": "whole_coherent_audio_points_by_tracknet_ownership",
-            "omitted_points_ready": len(ch.arbiter_audio_fallback),
-            "omitted_seconds_ready": round(
-                total_kept_seconds(ch.arbiter_audio_fallback), 3),
-            "selected_points_pending_verdict": len(
-                ch.arbiter_selected_audio_fallback),
-        }
-        return candidates
-
-    if cfg.point_split and onsets.size:
-        if cfg.movement_merge and ch.near_track is not None:
-            # strike-bounded points, with short low-movement lulls merged (not new points)
-            px, py = ch.near_track
-            return points_from_strikes_movement(
-                regions, onsets, timeline_array(duration, cfg), px, py,
-                gap_s=cfg.point_gap_s, merge_max_gap_s=cfg.merge_max_gap_s,
-                move_thresh=cfg.move_thresh, min_strikes=cfg.min_rally_strikes,
-                toss_preroll_s=cfg.toss_preroll_s, landing_tail_s=cfg.landing_tail_s,
-                total_s=duration, echo_s=cfg.echo_collapse_s, min_dur_s=cfg.min_rally_dur_s,
-                serve_window_s=serve_window)
-        if cfg.movement_merge:
-            progress("  no player track -> movement merge disabled (gap-only splitting)")
-        # tightly bound each point to its ball strikes (excludes inter-point walking)
-        return points_from_strikes(
-            regions, onsets, cfg.point_gap_s, cfg.min_rally_strikes,
-            cfg.toss_preroll_s, cfg.landing_tail_s, duration,
-            echo_s=cfg.echo_collapse_s, min_dur_s=cfg.min_rally_dur_s,
-            serve_window_s=serve_window)
-    if cfg.snap_serve and onsets.size:
-        return snap_serve_starts(regions, onsets, cfg.serve_lookback_s, cfg.serve_preroll_s)
-    return regions
-
-
-def _anchor_serves(_input_path, segments, ch, cfg, progress) -> List[Segment]:
-    """Move point starts using detections retained from the single visual pass."""
-    if not (ch.court is not None and ch.onsets.size and segments):
-        return segments
-    if not ch.player_samples or ch.frame_size is None:
-        ch.stages["serve_anchor"] = {
-            "status": "skipped",
-            "source": "shared_visual_pass",
-            "reason": "shared target-court player samples unavailable",
-        }
-        progress(
-            "court serve detection: shared player samples unavailable -> starts unchanged")
-        return segments
-    try:
-        from .signals.player import PlayerTracker, refine_starts_with_serve
-
-        progress(
-            f"court serve detection: reusing {len(ch.player_samples)} "
-            "visual-pass player samples")
-        pt = PlayerTracker(ch.detector).court_track_from_samples(
-            ch.player_samples,
-            ch.court,
-            ch.frame_size,
-        )
-        measured = int(np.sum(np.isfinite(pt.cx) & np.isfinite(pt.cy)))
-        if measured == 0:
-            ch.stages["serve_anchor"] = {
-                "status": "skipped",
-                "source": "shared_visual_pass",
-                "samples": len(pt.t),
-                "measured_samples": 0,
-                "reason": "no near-player observations in shared samples",
-            }
-            progress("  no shared near-player track -> starts unchanged")
-            return segments
-        before = list(segments)
-        segments = refine_starts_with_serve(
-            segments, ch.onsets, pt.t, pt.cy, pt.speed,
-            lookback_s=cfg.serve_setup_lookback_s, baseline_y=cfg.serve_baseline_y_m,
-            still_speed=cfg.serve_still_speed_mps, preroll_s=cfg.serve_setup_preroll_s,
-            max_lead_s=cfg.serve_max_lead_s)
-        moved = sum(1 for (a, _), (b, _) in zip(before, segments) if b < a - 0.3)
-        ch.stages["serve_anchor"] = {
-            "status": "used",
-            "source": "shared_visual_pass",
-            "moved": moved,
-            "candidates": len(segments),
-            "samples": len(pt.t),
-            "measured_samples": measured,
-        }
-        progress(f"  serve set-up moved {moved}/{len(segments)} point starts to the serve")
-    except Exception as exc:  # pragma: no cover
-        ch.stages["serve_anchor"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  court serve detection failed: {exc}")
-        if not cfg.allow_degraded:
-            raise RuntimeError(f"court serve detection failed: {exc}") from exc
-    return segments
-
-
-def _resolve_court(input_path, cfg, progress):
-    """Court homography from (in priority order) manual corners, then auto-detection.
-
-    Returns a :class:`~rally.signals.court.Court` or ``None`` (the arbiter degrades to
-    in-play + bounce-count structure without a court)."""
-    # Explicit manual calibration wins — it's the user's stated intent and the most
-    # reliable; only auto-detect when no corners were given.
-    if cfg.court_corners is not None:
-        from .signals.court import Court
-        return Court.calibrate(*cfg.court_corners)
-    if cfg.court_auto:
-        try:
-            from .signals.court_detect import detect_court
-            court = detect_court(input_path, cfg, progress=progress)
-            if court is not None:
-                progress("  court auto-detected")
-                return court
-            progress("  court auto-detection found no court -> in-play + bounce only")
-        except Exception as exc:  # pragma: no cover
-            progress(f"  court auto-detection error: {exc}")
-    return None
-
-
-def _recover_player_hint_points(report, ch, cfg) -> List[Segment]:
-    """Recover audio-missed points from independent player and ball structure.
-
-    Fragmentation is missing evidence, not proof of a dead ball. A recovery is allowed
-    only when a stable-to-active player hint precedes a well-measured live-ball component
-    that contains normal rally structure. The later match stage re-tracks the serve window
-    and requires the stationary-baseline/serve event before publication.
-    """
-    recovered: List[Segment] = []
-    records: list[dict] = []
-    for candidate in report.candidates:
-        verdict = candidate.verdict
-        selected = getattr(verdict, "selected_component", None)
-        reason_code = getattr(verdict, "reason_code", "")
-        fragmented_structure = bool(
-            reason_code == "fragmented_live_track"
-            and getattr(verdict, "in_play_span_s", 0.0)
-            >= min(1.0, cfg.arbiter_min_in_play_span_s)
-            and (getattr(verdict, "n_bounces", 0)
-                 >= min(1, cfg.arbiter_min_bounces)
-                 or getattr(verdict, "n_net_crossings", 0) >= 1)
-        )
-        short_aligned_component = bool(
-            reason_code == "component_too_short"
-            and getattr(verdict, "in_play_span_s", 0.0) >= 0.75
-            and getattr(verdict, "strike_aligned", False)
-        )
-        if (verdict.state != "indeterminate" or selected is None
-                or getattr(verdict, "measured_coverage", 0.0)
-                < cfg.arbiter_player_recovery_min_coverage
-                or not (fragmented_structure or short_aligned_component)):
-            continue
-        hints = [
-            float(hint) for hint in _player_hints_for_validation(ch)
-            if candidate.candidate[0] - cfg.arbiter_pre_pad_s <= hint
-            <= candidate.candidate[1] + 1e-9
-            and hint <= selected[0] + cfg.match_receiver_reaction_lag_s
-            and selected[0] - hint <= cfg.match_fragment_merge_gap_s
-        ]
-        if not hints:
-            continue
-        contact = max(hints)
-        start = max(0.0, contact - cfg.toss_preroll_s)
-        end = (
-            float(candidate.candidate[1]) + cfg.ball_max_extend_s
-            if short_aligned_component
-            else float(selected[1]) + cfg.ball_tail_s
-        )
-        if end - start < cfg.min_rally_s:
-            continue
-        point = (start, end)
-        recovered.append(point)
-        if short_aligned_component:
-            ch.player_recovered_points.append(point)
-        records.append({
-            "candidate": [round(float(v), 3) for v in candidate.candidate],
-            "serve_hint": round(contact, 3),
-            "ball_component": [round(float(v), 3) for v in selected],
-            "output": [round(start, 3), round(end, 3)],
-            "reason": (
-                "stationary setup plus aligned short live-ball component"
-                if short_aligned_component else
-                "stationary setup plus fragmented rally structure"
-            ),
-        })
-    if records:
-        ch.stages.setdefault("player_activity_proposal", {
-            "status": "used", "serve_hints": [
-                round(float(value), 3) for value in ch.player_serve_hints],
-        })["recoveries"] = records
-    return recovered
-
-
-def _ball_arbiter(input_path, segments, ch, cfg, progress, *, weights=None,
-                  cancel_check: CancelCheck = lambda: None) -> List[Segment]:
-    """Ball-primary decision: track the ball inside each candidate window and keep only
-    the real rallies, bounded to their serve start / point-end (see fusion.ball_verify)."""
-    if not cfg.ball_arbiter:
-        return segments
-    if not segments:
-        ch.stages["ball_arbiter"] = {"status": "skipped", "reason": "no candidates"}
-        return segments
-    if cfg.target_court_required and ch.court is None:
-        reason = "target court geometry is required outside casual mode"
-        ch.stages["ball_arbiter"] = {"status": "abstained", "reason": reason}
-        if not cfg.allow_degraded:
-            raise RuntimeError(reason)
-        progress(f"  ball arbiter: {reason} -> degraded audio-only fallback")
-        return []
-    from .signals.ball import discover_ball_weights
-    weights = weights or cfg.ball_weights or discover_ball_weights()
-    if not weights:
-        progress("  ball arbiter: no TrackNet weights (set --ball-weights or drop one in "
-                 "models/) -> skipping validation")
-        ch.stages["ball_arbiter"] = {"status": "unavailable", "reason": "no weights"}
-        return segments
-    try:
-        from .fusion.ball_verify import verify_segments_detailed
-        from .signals.ball import resolve_device
-        # Court geometry is resolved before the visual pass so that neighboring-court
-        # players and motion cannot open candidates.  Reuse that exact calibration here;
-        # detecting it a second time can select a different quadrilateral and wastes a
-        # full stationary-frame scan.
-        court = ch.court
-        if court is None:
-            progress("  ball arbiter: casual mode without court geometry")
-        dev = resolve_device()
-        slow = " — slow" if str(dev) == "cpu" else ""
-        progress(f"ball arbiter: validating candidates by ball trajectory on {dev}{slow}")
-        verdict_kwargs = dict(
-            min_speed_px_s=cfg.arbiter_min_speed_px_s, min_conf=cfg.arbiter_min_conf,
-            min_in_play_frac=cfg.arbiter_min_in_play_frac,
-            min_in_play_span_s=cfg.arbiter_min_in_play_span_s,
-            max_fragment_join_gap_s=cfg.arbiter_fragment_join_gap_s,
-            min_bounces=cfg.arbiter_min_bounces, min_rally_s=cfg.min_rally_s,
-            toss_preroll_s=cfg.toss_preroll_s, tail_s=cfg.ball_tail_s,
-            require_court=cfg.target_court_required,
-            strike_cluster_gap_s=cfg.point_gap_s,
-        )
-        target_serve_times = _player_hints_for_validation(ch)
-        serve_times = np.unique(np.r_[ch.onsets, target_serve_times])
-        report = verify_segments_detailed(
-            input_path, segments, court=court, weights_path=weights,
-            pre_pad_s=cfg.arbiter_pre_pad_s, post_pad_s=cfg.arbiter_post_pad_s,
-            max_extend_s=cfg.ball_max_extend_s, verdict_kwargs=verdict_kwargs,
-            max_tracking_group_s=cfg.arbiter_max_tracking_group_s,
-            tracking_fps=cfg.ball_tracking_fps,
-            half_precision=cfg.ball_half_precision,
-            inference_batch_size=cfg.ball_inference_batch_size,
-            serve_times=serve_times,
-            audio_strike_times=ch.onsets,
-            target_serve_times=target_serve_times,
-            target_motion_times=_target_motion_times_for_validation(ch, cfg),
-            require_serve_evidence=cfg.arbiter_require_serve_evidence,
-            progress=progress, cancel_check=cancel_check)
-        player_recoveries = _recover_player_hint_points(report, ch, cfg)
-        segments = sorted([*report.segments, *player_recoveries])
-        ch.ball_track_cache = list(getattr(report, "track_cache", []))
-        ch.arbiter_accepted_regions = [
-            # An accepted local trajectory component supersedes only the audio evidence
-            # it actually evaluated. A broad proposal can also contain a later real point;
-            # claiming the whole proposal silently deletes that point when an earlier
-            # pickup/pass happens to have rally-like ball structure.
-            tuple(candidate.verdict.evidence_core
-                  or candidate.verdict.selected_component
-                  or candidate.candidate)
-            for candidate in report.candidates
-            if candidate.verdict.state == "accept"
-        ]
-        ch.arbiter_indeterminate_regions = [
-            tuple(candidate.candidate) for candidate in report.candidates
-            if candidate.verdict.state == "indeterminate"
-        ]
-        ch.arbiter_fragmented_regions = [
-            tuple(candidate.candidate) for candidate in report.candidates
-            if candidate.verdict.state == "indeterminate"
-            and getattr(candidate.verdict, "reason_code", "")
-            == "fragmented_live_track"
-        ]
-        ch.arbiter_rejected_regions = [
-            # Suppress fallback only where the verdict actually evaluated contradictory
-            # evidence. A broad recall-oriented proposal can contain several audio points;
-            # rejecting one local core does not justify deleting all of them.
-            tuple(candidate.verdict.evidence_core
-                  or candidate.verdict.selected_component
-                  or candidate.candidate)
-            for candidate in report.candidates
-            if candidate.verdict.state == "reject"
-        ]
-        ch.ball_end_hints = [
-            (tuple(candidate.candidate), float(
-                getattr(candidate.verdict, "trajectory_end_hint")))
-            for candidate in report.candidates
-            if getattr(candidate.verdict, "trajectory_end_hint", None) is not None
-        ]
-        ch.stages["ball_arbiter"] = {
-            "status": "used", "weights": str(weights), "court": court is not None,
-            "weights_sha256": _file_sha256(str(weights)),
-            # A digest identifies bytes; it does not establish authorship, training-data
-            # rights, or a redistribution licence for a locally discovered checkpoint.
-            "weights_provenance": "unknown_local_checkpoint",
-            "weights_license": "unknown",
-            "device": str(dev),
-            "inference_batch_size": (
-                getattr(report, "inference_batch_size", None)
-                or cfg.ball_inference_batch_size),
-            "tracking_groups": len(ch.ball_track_cache),
-            "tracked_seconds": round(sum(
-                max(0.0, float(region[1]) - float(region[0]))
-                for region, _track in ch.ball_track_cache
-            ), 3),
-            "track_cache_reused_for_serve_validation": True,
-            "tracking_fps": cfg.ball_tracking_fps,
-            "half_precision": cfg.ball_half_precision,
-            "serve_evidence_required": cfg.arbiter_require_serve_evidence}
-        ch.stages["ball_arbiter"]["verification"] = report.as_dict()
-    except Exception as exc:  # pragma: no cover
-        ch.stages["ball_arbiter"] = {"status": "failed", "reason": str(exc),
-                                     "weights": str(weights),
-                                     "fallback_policy": "coherent_audio_only"}
-        if cfg.allow_degraded:
-            progress(f"  ball arbiter failed; using coherent audio fallback only: {exc}")
-            ch.arbiter_indeterminate_regions = list(segments)
-            # These are broad, recall-oriented computational proposals, not publishable
-            # points. Mark them indeterminate so the whole-point resolver can recover
-            # coherent audio, but never return them as ball-primary output.
-            return []
-        # Once a checkpoint is present, silently publishing unvalidated candidates makes
-        # an "accurate" run indistinguishable from a failed fallback. Fail the run instead.
-        raise RuntimeError(f"ball arbiter failed with {weights}: {exc}") from exc
-    return segments
-
-
-def _trim_ball_ends(input_path, segments, ch, cfg, progress,
-                    cancel_check: CancelCheck = lambda: None) -> List[Segment]:
-    """Opt-in (TrackNet + calibration): trim each rally end to the point-ending bounce."""
-    if not (cfg.ball_weights and ch.court is not None and ch.onsets.size and segments):
-        return segments
-    try:
-        from .fusion.ball_end import refine_ends_with_ball
-        from .signals.ball import resolve_device
-        dev = resolve_device()
-        slow = " — slow" if str(dev) == "cpu" else ""
-        progress(f"ball point-end: tracking ball over each rally on {dev}{slow}")
-        segments = refine_ends_with_ball(
-            input_path, segments, ch.court, cfg.ball_weights,
-            min_rally_s=cfg.min_rally_s, tail_s=cfg.ball_tail_s,
-            max_extend_s=cfg.ball_max_extend_s,
-            inference_batch_size=cfg.ball_inference_batch_size,
-            tracking_fps=cfg.ball_tracking_fps,
-            half_precision=cfg.ball_half_precision,
-            progress=progress, cancel_check=cancel_check)
-        ch.stages["ball_end"] = {"status": "used", "weights": cfg.ball_weights}
-    except Exception as exc:  # pragma: no cover
-        ch.stages["ball_end"] = {"status": "failed", "reason": str(exc)}
-        progress(f"  ball point-end failed: {exc}")
-        if not cfg.allow_degraded:
-            raise RuntimeError(f"ball point-end failed: {exc}") from exc
-    return segments
-
-
-def _filter_nonplay(segments, cfg, progress) -> List[Segment]:
-    """Drop warm-up (before skip_intro) and temporally isolated (non-match) points."""
-    n_before = len(segments)
-    if cfg.skip_intro_s > 0:
-        segments = [(s, e) for s, e in segments if s >= cfg.skip_intro_s]
-    if cfg.drop_isolated:
-        segments = drop_isolated_points(segments, cfg.isolation_gap_s)
-    if len(segments) < n_before:
-        progress(f"  non-play filter dropped {n_before - len(segments)} isolated/intro points")
-    return segments
-
-
-def _aligned_receiver_reaction_hint(
-    observation, validation_onsets: np.ndarray, player_hints: np.ndarray, cfg,
-    *, previous_candidate_end: Optional[float] = None,
-    gap_setup_evidence: bool = False,
-    independent_player_hints: Optional[np.ndarray] = None,
-) -> Optional[float]:
-    """Match one independently observed target-player reaction to a candidate.
-
-    The stable-to-active player transition is its own typed visual event. Audio can open
-    the same candidate, but must not be a prerequisite: quiet far-side serves are the
-    reason this recovery signal exists.
-    """
-    hints = np.asarray(player_hints, dtype=float)
-    independent = np.asarray(
-        independent_player_hints if independent_player_hints is not None else [],
-        dtype=float,
-    )
-    if hints.size == 0 and independent.size == 0:
-        return None
-    start, end = observation.point
-    # The recall-oriented proposal can begin at a return after missing a quiet serve.
-    # Search only the same bounded preroll used for the eventual output start; this
-    # recovers the serve without borrowing an event from an earlier point.
-    search_start = max(0.0, float(start) - cfg.match_point_start_preroll_s - 0.2)
-    latest_early_reaction = min(
-        float(end), float(observation.first_strike) + cfg.match_player_proposal_s)
-    candidate_gap = (
-        float(start - previous_candidate_end)
-        if previous_candidate_end is not None else 0.0
-    )
-    point_contact_count = int(np.count_nonzero(
-        (np.asarray(validation_onsets, dtype=float) >= start - 1e-9)
-        & (np.asarray(validation_onsets, dtype=float) <= end + 1e-9)
-    ))
-    if (previous_candidate_end is not None
-            and candidate_gap > cfg.match_fragment_merge_gap_s
-            and (gap_setup_evidence or observation.position_setup_evidence
-                 or (candidate_gap > (
-                         cfg.match_attempt_merge_gap_s + cfg.match_player_proposal_s)
-                     and point_contact_count < cfg.min_rally_strikes))):
-        gap_candidates = independent[
-            (independent > previous_candidate_end + 1e-9)
-            & (independent <= latest_early_reaction + 1e-9)
-        ]
-        if gap_candidates.size:
-            # A late tail candidate can be the first detected fragment after a quiet
-            # serve. The earliest stable-to-active transition in the candidate-free gap
-            # is the serve; later transitions are usually rally movement.
-            return float(np.min(gap_candidates))
-    independent_candidates = independent[
-        (independent >= search_start - 1e-9)
-        & (independent <= latest_early_reaction + 1e-9)
-    ]
-    if independent_candidates.size:
-        return float(min(
-            independent_candidates,
-            key=lambda hint: (
-                abs(float(hint) - observation.first_strike), float(hint)),
-        ))
-
-    # Audio-supported transitions retain the original cross-source guard. They are useful
-    # corroboration, but ordinary between-point movement must not become a serve merely
-    # because the same player track produced a hint elsewhere in the candidate window.
-    early = np.sort(np.asarray(validation_onsets, dtype=float))
-    early = early[(early >= search_start - 1e-9) & (early <= end + 1e-9)]
-    early = np.asarray(
-        effective_strike_times(early, cfg.echo_collapse_s), dtype=float)
-    if not early.size:
-        return None
-    # Contacts in the lookback can belong to a preceding fragment. They must not consume
-    # the small "early impacts" budget for a reaction inside this candidate. Conversely,
-    # a reaction before the candidate is precisely the quiet-serve recovery case, so it
-    # may align to a lookback contact without making later in-rally movement eligible.
-    candidate_early = early[early >= start - 1e-9]
-    candidate_early = candidate_early[: int(cfg.match_serve_strikes_to_check)]
-    lookback_early = early[early < start - 1e-9]
-    candidates = hints[
-        (hints >= search_start - 1e-9)
-        & (hints <= latest_early_reaction + 1e-9)
-    ]
-    guard = float(cfg.match_player_hint_audio_guard_s)
-    candidates = np.asarray([
-        hint for hint in candidates
-        if (
-            hint < start
-            and (
-                (lookback_early.size
-                 and np.min(np.abs(lookback_early - hint)) <= guard + 1e-9)
-                or
-                (candidate_early.size
-                 and np.min(np.abs(candidate_early - hint)) <= guard + 1e-9)
-            )
-        ) or (
-            hint >= start
-            and candidate_early.size
-            and np.min(np.abs(candidate_early - hint)) <= guard + 1e-9
-        )
-    ], dtype=float)
-    if not candidates.size:
-        return None
-    return float(min(candidates, key=lambda hint: (
-        abs(float(hint) - observation.first_strike), float(hint))))
-
-
-def _validate_match_state(input_path, segments, ch, cfg, progress, *, weights=None,
-                          cancel_check: CancelCheck = lambda: None) -> List[Segment]:
-    """Require an observed serve event inside match play, never receiver pose alone."""
-    if cfg.play_mode == "casual":
-        ch.stages["match_state"] = {
-            "status": "skipped", "mode": "casual",
-            "reason": "tennis match sequence rules disabled for casual rallying",
-        }
-        return segments
-    usable_player_hints = _player_hints_for_validation(ch)
-    if not segments or (ch.onsets.size == 0 and usable_player_hints.size == 0):
-        ch.stages["match_state"] = {
-            "status": "skipped", "mode": cfg.play_mode,
-            "reason": "no point candidates or strike times",
-        }
-        return segments
-    try:
-        from .fusion.match_state import validate_match_sequence
-        from .signals.player import (
-            observe_position_setups,
-            observe_serve_setups,
-            resolve_yolo_device,
-        )
-        from .signals.pose import resolve_rtmpose_device, rtmpose_execution_providers
-        from .signals.serve import BallServeObservation, observe_ball_serves
-
-        progress("match-state validation: checking server pose near early impacts")
-        # Player reactions may open expensive video probes, but they are not ball strikes.
-        # Keep the typed streams separate so a visual twitch cannot increment an audio
-        # contact count, self-corroborate its own alignment, or enter learned audio fields.
-        probe_times = np.unique(np.r_[ch.onsets, usable_player_hints])
-        with _timed(ch, "match_pose", progress):
-            observations = observe_serve_setups(
-                input_path, segments, probe_times, cfg,
-                progress_callback=lambda done, total: progress(
-                    f"match pose progress {done}/{total}"),
-                cancel_check=cancel_check,
-                court=ch.court,
-                detector=ch.detector)
-        progress("match-state validation: checking stationary baseline player setup")
-        with _timed(ch, "match_position", progress):
-            position_observations = observe_position_setups(
-                segments,
-                probe_times,
-                ch.player_samples,
-                cfg,
-                court=ch.court,
-                frame_size=ch.frame_size,
-            )
-        if len(position_observations) != len(observations):
-            raise RuntimeError("position observations do not align with point candidates")
-        enriched_observations = []
-        previous_candidate_end: Optional[float] = None
-        for pose, position in zip(observations, position_observations):
-            reaction_time = _aligned_receiver_reaction_hint(
-                pose, ch.onsets, usable_player_hints, cfg,
-                previous_candidate_end=previous_candidate_end,
-                gap_setup_evidence=position.setup_evidence,
-                independent_player_hints=ch.player_proposal_hints)
-            enriched_observations.append(replace(
-                pose,
-                position_checked=position.checked,
-                position_setup_evidence=position.setup_evidence,
-                position_best_strike=position.best_strike,
-                position_setup_strikes=position.setup_strikes,
-                position_score=position.score,
-                position_server_end=position.server_end,
-                position_server_span=position.server_span,
-                position_player_tracks=position.player_tracks,
-                position_stable_tracks=position.stable_tracks,
-                position_stable_fraction=position.stable_fraction,
-                setup_evidence=(pose.setup_evidence or position.setup_evidence),
-                receiver_reaction_time=reaction_time,
-                receiver_reaction_evidence=reaction_time is not None,
-            ))
-            previous_candidate_end = float(pose.point[1])
-        observations = enriched_observations
-        if weights:
-            progress("match-state validation: checking ball toss/serve motion")
-            serve_cache_hits = 0
-
-            # Ball inference is meaningful only when the independently measured player
-            # channel found a stationary formation, serve pose, or receiver reaction.
-            # This combines the evidence as one serve decision and prevents score calls
-            # and between-game walking from launching TrackNet merely because they made a
-            # sound. Mark prefiltered entries as checked-negative so auto mode fails
-            # closed rather than preserving them as unevaluated fallbacks.
-            ball_probe_indices = [
-                index for index, observation in enumerate(observations)
-                if observation.setup_evidence
-                or observation.receiver_reaction_evidence
-            ]
-            ball_probe_segments = [segments[index] for index in ball_probe_indices]
-
-            def serve_progress(done: int, total: int, cache_hits: int) -> None:
-                nonlocal serve_cache_hits
-                serve_cache_hits = cache_hits
-                progress(
-                    f"serve validation progress {done}/{total} "
-                    f"({cache_hits} reused TrackNet window(s))")
-
-            with _timed(ch, "match_ball_serve", progress):
-                probed_ball_observations = observe_ball_serves(
-                    input_path, ball_probe_segments, probe_times, weights, cfg,
-                    court=ch.court,
-                    track_cache=ch.ball_track_cache,
-                    progress_callback=serve_progress,
-                    cancel_check=cancel_check)
-            if len(probed_ball_observations) != len(ball_probe_indices):
-                raise RuntimeError("ball serve observations do not align with point candidates")
-            ball_observations = [
-                BallServeObservation(
-                    point=tuple(map(float, point)), checked=True, confirmed=False,
-                    best_strike=None, coverage=0.0, vertical_span=0.0,
-                    outgoing_span=0.0, ordered=False, measured_samples=0,
-                )
-                for point in segments
-            ]
-            for index, ball in zip(ball_probe_indices, probed_ball_observations):
-                ball_observations[index] = ball
-            observations = [
-                replace(
-                    pose,
-                    ball_checked=ball.checked,
-                    ball_serve_evidence=ball.confirmed,
-                    ball_best_strike=ball.best_strike,
-                    ball_coverage=ball.coverage,
-                    ball_vertical_span=ball.vertical_span,
-                    ball_outgoing_span=ball.outgoing_span,
-                    ball_ordered_evidence=ball.ordered,
-                    ball_measured_samples=ball.measured_samples,
-                )
-                for pose, ball in zip(observations, ball_observations)
-            ]
-        elif cfg.play_mode == "match" and not cfg.allow_degraded:
-            raise RuntimeError(
-                "match mode requires TrackNet weights to confirm far-side serves")
-        with _timed(ch, "match_sequence_decode", progress):
-            protected = {
-                index for index, point in enumerate(segments)
-                if any(_point_fully_evaluated(point, region, ch.onsets)
-                       for region in ch.arbiter_accepted_regions)
-            }
-            from .fusion.serve_model import apply_eligible_serve_model
-            observations, learned_model_stage = apply_eligible_serve_model(
-                observations, ch.onsets, cfg)
-            before = len(segments)
-            segments, stage = validate_match_sequence(
-                segments, ch.onsets, observations, cfg,
-                protected_indices=protected,
-                contact_onsets=ch.onsets,
-            )
-        # A credible rally trajectory does not prove it started with a serve (warm-up and
-        # cooperative feeds also rally). Keep this for diagnostics, never as a bypass.
-        stage["trajectory_accepted_indices"] = sorted(protected)
-        stage["player_serve_hints"] = [
-            round(float(value), 3) for value in ch.player_serve_hints]
-        stage["pose_device"] = (
-            (resolve_rtmpose_device(cfg.rtmpose_device, cfg.rtmpose_runtime)
-             if cfg.player_pose_backend == "rtmlib" else resolve_yolo_device())
-            if any(observation.pose_frames for observation in observations)
-            else None
-        )
-        stage["pose_backend"] = cfg.player_pose_backend
-        stage["pose_model"] = cfg.player_pose_model
-        stage["pose_execution_providers"] = (
-            rtmpose_execution_providers(cfg.rtmpose_runtime)
-            if cfg.player_pose_backend == "rtmlib" else [])
-        stage["ball_inference_batch_size"] = cfg.ball_inference_batch_size
-        stage["serve_track_cache_hits"] = (
-            serve_cache_hits if weights else 0)
-        stage["serve_track_cache_candidates"] = (
-            len(ball_probe_indices) if weights else 0)
-        stage["serve_ball_prefilter_skipped"] = (
-            len(observations) - len(ball_probe_indices) if weights else 0)
-        stage["learned_serve_model"] = learned_model_stage
-        ch.stages["match_state"] = stage
-        removed = before - len(segments)
-        if removed:
-            progress(f"  serve validator rejected {removed} candidate(s) without a serve")
-        else:
-            progress("  match-state sequence is consistent or inconclusive")
-    except Exception as exc:  # pragma: no cover - optional heavy dependency/runtime
-        ch.stages["match_state"] = {
-            "status": "failed", "mode": cfg.play_mode, "reason": str(exc),
-        }
-        progress(f"  match-state validation failed: {exc}")
-        if cfg.play_mode == "match" and not cfg.allow_degraded:
-            raise RuntimeError(f"match-state validation failed: {exc}") from exc
-    return segments
-
-
-# --------------------------------------------------------------------------- #
-# timeline helpers (single source of truth for the analysis grid)             #
-# --------------------------------------------------------------------------- #
-def timeline_array(duration: float, cfg: RallyConfig) -> np.ndarray:
-    return np.arange(0.0, duration, 1.0 / cfg.analysis_fps)
-
-
-def timeline_size(duration: float, cfg: RallyConfig) -> int:
-    return timeline_array(duration, cfg).size
-
-
-def _validate_paths(input_path: str, output_path: Optional[str], json_path: Optional[str]) -> None:
-    """Prevent source/output/sidecar aliases, including symlinks and hardlinks."""
+def _validate_paths(input_path: str, output_path: str | None, json_path: str | None) -> None:
     named = [("input", input_path), ("output", output_path), ("json", json_path)]
     present = [(name, Path(path)) for name, path in named if path]
 
-    def aliases(a: Path, b: Path) -> bool:
+    def aliases(left: Path, right: Path) -> bool:
         try:
-            if a.exists() and b.exists() and os.path.samefile(a, b):
+            if left.exists() and right.exists() and os.path.samefile(left, right):
                 return True
         except OSError:
             pass
-        return a.resolve(strict=False) == b.resolve(strict=False)
+        return left.resolve(strict=False) == right.resolve(strict=False)
 
-    for i, (name_a, path_a) in enumerate(present):
-        for name_b, path_b in present[i + 1:]:
-            if aliases(path_a, path_b):
+    for index, (left_name, left) in enumerate(present):
+        for right_name, right in present[index + 1:]:
+            if aliases(left, right):
                 raise ValueError(
-                    f"{name_a} and {name_b} paths must differ (would overwrite data): {path_a}")
+                    f"{left_name} and {right_name} paths must differ: {left}")
+
+
+def _resolve_court(input_path: str, cfg: RallyConfig, progress: Progress):
+    if cfg.court_corners is not None:
+        from .signals.court import Court
+
+        return Court.calibrate(*cfg.court_corners)
+    if not cfg.court_auto:
+        return None
+    try:
+        from .signals.court_detect import detect_court
+
+        court = detect_court(input_path, cfg, progress=progress)
+        if court is not None:
+            progress("  target court located")
+            return court
+    except Exception as exc:
+        raise RuntimeError(f"court detection failed: {exc}") from exc
+    raise RuntimeError("target court could not be located")
+
+
+def _visual_channels(
+    input_path: str,
+    cfg: RallyConfig,
+    timeline: np.ndarray,
+    detect_players: bool,
+    state: PipelineState,
+    progress: Progress,
+    cancel_check: CancelCheck,
+) -> None:
+    from .signals.player import PlayerDetector
+    from .signals.visual import analyze_visual, opencv_available
+
+    if not opencv_available():
+        raise RuntimeError("OpenCV is required for the vision-first pipeline")
+    detector = PlayerDetector(model=cfg.player_detection_model) if detect_players else None
+    if detector is None or not detector.available:
+        reason = "player detection was disabled" if detector is None else detector.error
+        raise RuntimeError(f"target-player detector is unavailable: {reason}")
+    progress("tracking target-court player identities")
+    visual = analyze_visual(
+        input_path,
+        cfg,
+        timeline,
+        detector,
+        court=state.court,
+        progress=progress,
+        cancel_check=cancel_check,
+    )
+    state.player_track_samples = visual.get("player_track_samples") or []
+    state.frame_size = visual.get("frame_size") or state.frame_size
+    if not state.player_track_samples:
+        raise RuntimeError("no persistent target-court player tracks were measured")
+    state.used.append("target_player_identities")
+    state.stages["visual"] = {
+        "status": "used",
+        "detection_model": cfg.player_detection_model,
+        "target_court_filtered": bool(visual.get("target_court_filtered")),
+        "identity_tracking": "botsort_reid_plus_clothing",
+        "tracking_frames": len(state.player_track_samples),
+        "racket_observations": int(visual.get("racket_observations") or 0),
+        "racket_detection": "same_pass_coco_tennis_racket_class",
+        "device": detector.device,
+    }
+
+
+def _continuous_pose_stage(
+    input_path: str,
+    duration: float,
+    state: PipelineState,
+    cfg: RallyConfig,
+    progress: Progress,
+    cancel_check: CancelCheck,
+    publish_stage: Callable[..., None],
+) -> tuple[list[Segment], list[dict]]:
+    """Build one shared pose timeline and decode all point/event stages from it."""
+    from .fusion.tennis_state import decode_pose_points
+    from .signals.player import create_pose_runtime
+    from .signals.pose_timeline import (
+        build_pose_timeline,
+        detect_serves,
+        detect_strokes,
+    )
+
+    pose_runtime = create_pose_runtime(cfg)
+    progress("building shared all-player pose timeline")
+    timeline = build_pose_timeline(
+        input_path,
+        duration,
+        cfg,
+        pose_runtime=pose_runtime,
+        court=state.court,
+        player_track_samples=state.player_track_samples,
+        match=state.match_profile,
+        progress_callback=progress,
+        cancel_check=cancel_check,
+    )
+    between_intervals: list[list[float]] = []
+    engaged_intervals: list[list[float]] = []
+    between_start: float | None = None
+    engaged_start: float | None = None
+    prior_time = 0.0
+    for frame in timeline.frames:
+        frame_time = float(frame["time"])
+        if frame.get("between_like") and between_start is None:
+            between_start = frame_time
+        elif not frame.get("between_like") and between_start is not None:
+            between_intervals.append([round(between_start, 3), round(prior_time, 3)])
+            between_start = None
+        if frame.get("engaged_like") and engaged_start is None:
+            engaged_start = frame_time
+        elif not frame.get("engaged_like") and engaged_start is not None:
+            engaged_intervals.append([round(engaged_start, 3), round(prior_time, 3)])
+            engaged_start = None
+        prior_time = frame_time
+    if between_start is not None:
+        between_intervals.append([round(between_start, 3), round(prior_time, 3)])
+    if engaged_start is not None:
+        engaged_intervals.append([round(engaged_start, 3), round(prior_time, 3)])
+    state.stages["pose_timeline"] = {
+        "status": "used",
+        "backend": "rtmpose_coco17_in_tracker_owned_boxes",
+        "coarse_fps": cfg.pose_timeline_fps,
+        "refine_fps": cfg.pose_refine_fps,
+        "refine_motion_windows_per_minute": cfg.pose_refine_motion_windows_per_minute,
+        "coarse_frames": timeline.coarse_frames,
+        "refined_frames": timeline.refined_frames,
+        "pose_records": timeline.sampled_boxes,
+        "actors": sorted(timeline.records_by_actor),
+        "pose_records_by_actor": {
+            actor: len(records)
+            for actor, records in sorted(timeline.records_by_actor.items())
+        },
+        "frames_with_pose": sum(
+            int(frame.get("visible_players", 0) > 0) for frame in timeline.frames),
+        "frames_with_both_ends": sum(
+            set(frame.get("ends") or []) == {"near", "far"}
+            for frame in timeline.frames),
+        "between_like_intervals": between_intervals,
+        "engaged_like_intervals": engaged_intervals,
+        "reused_player_detections": True,
+        "audio_used": False,
+        "ball_tracking_used": False,
+    }
+    publish_stage("pose_timeline")
+    serves = detect_serves(timeline, cfg)
+    raw_actions, stroke_episodes = detect_strokes(timeline, serves, cfg)
+    segments, points, reports = decode_pose_points(
+        timeline, serves, raw_actions, stroke_episodes, duration, cfg)
+    state.stages["serve_pose"] = reports["serve_pose"]
+    observations = state.stages["serve_pose"].get("observations") or []
+    state.serve_times = np.asarray(
+        [float(item["first_strike"]) for item in observations if item.get("accepted")],
+        dtype=float,
+    )
+    publish_stage("serve_pose")
+    state.stages["candidate_generation"] = reports["candidate_generation"]
+    publish_stage("candidate_generation")
+    state.stages["racket_actions"] = reports["racket_actions"]
+    publish_stage("racket_actions", points=points, segments=segments)
+    state.stages["endpoints"] = reports["endpoints"]
+    publish_stage("endpoints", points=points, segments=segments)
+    state.stages["quality_control"] = reports["quality_control"]
+    publish_stage("quality_control", points=points, segments=segments)
+    state.used.extend(["shared_all_player_pose_timeline", "pose_tennis_state_decoder"])
+    if cfg.skip_intro_s > 0:
+        retained = [
+            (segment, point) for segment, point in zip(segments, points, strict=True)
+            if segment[0] >= cfg.skip_intro_s
+        ]
+        segments = [item[0] for item in retained]
+        points = [item[1] for item in retained]
+    return segments, points
 
 
 def trim(
     input_path: str,
-    output_path: Optional[str] = None,
-    cfg: Optional[RallyConfig] = None,
+    output_path: str | None = None,
+    cfg: RallyConfig | None = None,
     *,
-    json_path: Optional[str] = None,
+    json_path: str | None = None,
     detect_players: bool = True,
-    progress: Progress = lambda _msg: None,
+    progress: Progress = lambda _message: None,
     cancel_check: CancelCheck = lambda: None,
+    signal_callback: SignalCallback = lambda _snapshot: None,
 ) -> RallyResult:
-    """Analyse ``input_path`` and (if ``output_path`` given) write the trimmed video.
-
-    Expected unavailable optional sources abstain. Unexpected failures in enabled stages
-    are fatal unless ``cfg.allow_degraded`` explicitly permits a partial result.
-    """
     cfg = cfg or RallyConfig()
-    pipeline_started = time.perf_counter()
+    started = time.perf_counter()
     if not os.path.isfile(input_path):
         raise FileNotFoundError(input_path)
     _validate_paths(input_path, output_path, json_path)
+    state = PipelineState()
 
-    ch = _Channels()
-    cancel_check()
     progress(f"probing {input_path}")
-    with _timed(ch, "probe", progress):
+    with _timed(state, "probe", progress):
         info = probe(input_path)
-    duration = info.duration_s
+    duration = float(info.duration_s)
     if duration <= 0:
         raise RuntimeError("could not determine video duration")
+    timeline = player_timeline_array(duration, cfg)
+    state.frame_size = (int(info.width), int(info.height))
 
-    timeline = timeline_array(duration, cfg)
-    progress(f"duration={duration:.1f}s  analysis frames={timeline.size}  "
-             f"({cfg.analysis_fps} fps)")
-
-    # ---- gather channels ----------------------------------------------------
-    ch.frame_size = (int(info.width), int(info.height))
-    # Target-court geometry is a prerequisite for interpreting motion, people, and ball
-    # trajectories in multi-court footage.  Resolve it before any visual analysis rather
-    # than using whole-frame evidence to propose points and calibrating only afterward.
-    if cfg.court_corners is not None or cfg.court_auto:
-        progress("locating the target court")
-        with _timed(ch, "court_detection", progress):
-            ch.court = _resolve_court(input_path, cfg, progress)
-        ch.stages["court"] = {
-            "status": "used" if ch.court is not None else "unavailable",
-            "source": "manual" if cfg.court_corners is not None else "automatic",
-            **({"corners": np.asarray(ch.court.corners_img, float).round(3).tolist()}
-               if ch.court is not None else {}),
-            **({} if ch.court is not None else {
-                "reason": "target court could not be detected",
-            }),
+    def publish_signals(
+        current_stage: str, *, points: list[dict] | None = None,
+        segments: list[Segment] | None = None,
+    ) -> None:
+        """Expose only completed, JSON-compatible evidence to an optional observer."""
+        snapshot = {
+            "current_stage": current_stage,
+            "total_seconds": round(duration, 3),
+            "n_serves": int(state.serve_times.size),
+            "serve_times": [round(float(value), 3) for value in state.serve_times],
+            "stages": deepcopy(state.stages),
+            "match": deepcopy(state.match_profile),
+            "points": deepcopy(points or []),
+            "segments": [
+                {"index": index, "start": round(start, 3), "end": round(end, 3),
+                 "duration": round(end - start, 3)}
+                for index, (start, end) in enumerate(segments or [])
+            ],
+            "timings_seconds": {
+                name: round(float(seconds), 3)
+                for name, seconds in state.timings.items()
+            },
         }
-    with _timed(ch, "audio", progress):
-        _audio_channel(input_path, info, timeline, cfg, ch, progress, cancel_check)
+        try:
+            signal_callback(snapshot)
+        except Exception as exc:  # noqa: BLE001 - inspector failure must not fail analysis
+            progress(f"signal inspector publication skipped: {exc}")
+
+    state.stages["audio"] = {
+        "status": "disabled",
+        "reason": "mixed-court audio cannot be attributed to the target court",
+        "preserved_in_output": bool(info.has_audio),
+    }
+    publish_signals("probe")
+
     cancel_check()
-    with _timed(ch, "visual", progress):
-        _visual_channels(input_path, cfg, timeline, detect_players, ch, progress, cancel_check)
+    with _timed(state, "court_detection", progress):
+        state.court = _resolve_court(input_path, cfg, progress)
+    state.stages["court"] = {
+        "status": "used" if state.court is not None else "unavailable",
+        "source": "manual" if cfg.court_corners is not None else "automatic",
+        **({"corners": np.asarray(state.court.corners_img).round(3).tolist()}
+           if state.court is not None else {}),
+    }
+    publish_signals("court")
     cancel_check()
-    if not ch.used:
-        raise RuntimeError(
-            "no usable channels (need at least an audio track or OpenCV) — cannot segment"
+    with _timed(state, "visual", progress):
+        _visual_channels(
+            input_path, cfg, timeline, detect_players, state, progress, cancel_check)
+    publish_signals("visual")
+
+    if state.court is not None and state.frame_size is not None:
+        from .fusion.player_identity import identify_match_players, infer_match_format
+
+        state.match_format_evidence = infer_match_format(
+            state.player_track_samples,
+            state.court,
+            state.frame_size,
         )
-    with _timed(ch, "ball_channel", progress):
-        _ball_channel(input_path, timeline, cfg, ch, progress, cancel_check)
-    cancel_check()
-    with _timed(ch, "pose_channel", progress):
-        _pose_channel(input_path, timeline, cfg, ch, progress, cancel_check)
-    cancel_check()
-    failures = {name: stage for name, stage in ch.stages.items()
-                if stage.get("status") == "failed"}
-    if failures and not cfg.allow_degraded:
-        detail = "; ".join(f"{name}: {stage.get('reason', 'unknown error')}"
-                           for name, stage in failures.items())
-        raise RuntimeError(f"enabled analysis stage failed ({detail}); "
-                           "set allow_degraded=True to accept a partial result")
+        inferred = str(state.match_format_evidence.get("format", "unknown"))
+        state.match_format = inferred if inferred in {"singles", "doubles"} else "unknown"
+        state.match_profile = identify_match_players(
+            court=state.court,
+            frame_size=state.frame_size,
+            player_track_samples=state.player_track_samples,
+            format_evidence=state.match_format_evidence,
+        )
+    state.stages["match_format"] = {
+        "status": "used" if state.match_format != "unknown" else "indeterminate",
+        **state.match_format_evidence,
+    }
+    publish_signals("match_format")
 
-    # ---- decide + refine ----------------------------------------------------
-    arbiter_weights = None
-    if cfg.ball_arbiter:
-        from .signals.ball import discover_ball_weights
-        arbiter_weights = cfg.ball_weights or discover_ball_weights()
-        if not arbiter_weights:
-            ch.stages["ball_arbiter"] = {"status": "unavailable", "reason": "no weights"}
-    use_ball_arbiter = bool(arbiter_weights)
-    with _timed(ch, "candidate_generation", progress):
-        segments = _derive_points(
-            ch, duration, cfg, progress, for_ball_arbiter=use_ball_arbiter)
-    if use_ball_arbiter:
-        # Candidate pre-padding and serve_times let the detailed trajectory verifier find
-        # the serve. Moving starts after proposal budgeting would invalidate its workload
-        # cap and can enter omitted intervals.
-        ch.stages["serve_anchor"] = {
-            "status": "skipped", "reason": "ball arbiter owns serve boundary recovery"}
-    else:
-        with _timed(ch, "serve_anchor", progress):
-            segments = _anchor_serves(input_path, segments, ch, cfg, progress)
-    if cfg.ball_arbiter:
-        # ball-primary: the trajectory validates each candidate and sets its bounds
-        with _timed(ch, "ball_arbiter", progress):
-            segments = _ball_arbiter(
-                input_path, segments, ch, cfg, progress, weights=arbiter_weights,
-                cancel_check=cancel_check)
-        indeterminate_fallback, suppressed_rejects, superseded_accepts = (
-            _indeterminate_audio_fallback(ch))
-        all_fallback = sorted([*ch.arbiter_audio_fallback, *indeterminate_fallback])
-        if all_fallback:
-            primary_count = len(segments)
-            partial_primary_count = sum(
-                any(_overlaps(primary, fallback) for fallback in all_fallback)
-                for primary in segments
-            )
-            segments = _merge_point_sources(segments, all_fallback)
-            fallback_stage = ch.stages["arbiter_audio_fallback"]
-            fallback_stage.update({
-                "status": "used", "ball_primary_points": primary_count,
-                "combined_points": len(segments),
-                "omitted_points_used": len(ch.arbiter_audio_fallback),
-                "indeterminate_points_used": len(indeterminate_fallback),
-                "explicit_reject_points_suppressed": suppressed_rejects,
-                "accepted_audio_points_superseded": superseded_accepts,
-                "partial_ball_points_deferred_to_audio": partial_primary_count,
-            })
-        elif "arbiter_audio_fallback" in ch.stages:
-            ch.stages["arbiter_audio_fallback"].update({
-                "status": "none_used",
-                "indeterminate_points_used": 0,
-                "explicit_reject_points_suppressed": suppressed_rejects,
-                "accepted_audio_points_superseded": superseded_accepts,
-            })
-    else:
-        # audio-primary (legacy): only trim rally ends by the ball, if configured
-        with _timed(ch, "ball_end", progress):
-            segments = _trim_ball_ends(
-                input_path, segments, ch, cfg, progress, cancel_check)
     cancel_check()
-    with _timed(ch, "match_state_validation", progress):
-        segments = _apply_ball_end_hints(segments, ch, cfg)
-        segments = _validate_match_state(
-            input_path, segments, ch, cfg, progress, weights=arbiter_weights,
-            cancel_check=cancel_check)
-    with _timed(ch, "point_finalization", progress):
-        segments = _clamp_player_recovered_starts(segments, ch)
-        segments = _recover_fragmented_match_ends(
-            segments, ch, cfg, duration=duration)
-        segments = _filter_nonplay(segments, cfg, progress)
-    cancel_check()
-
-    match: dict = {}
-    points: list[dict] = []
-    if segments:
-        progress("point outcomes: associating players and decoding tennis rule events")
-        with _timed(ch, "point_outcomes", progress):
-            from .fusion.point_outcomes import analyse_point_outcomes
-
-            match, points = analyse_point_outcomes(
-                segments,
-                track_cache=ch.ball_track_cache,
-                court=ch.court,
-                player_samples=ch.player_samples,
-                frame_size=ch.frame_size,
-                onsets=ch.onsets,
-                match_state=ch.stages.get("match_state") or {},
-            )
-        ch.stages["point_outcomes"] = {
-            "status": "used",
-            "schema_version": "rally.point_events.v1",
-            "match_format": match.get("format", "unknown"),
-            "match_format_confidence": match.get("format_confidence", 0.0),
-            "players": len(match.get("roster") or []),
-            "classified": sum(
-                (point.get("termination") or {}).get("rule_event") != "unknown"
-                for point in points
-            ),
-            "unknown": sum(
-                (point.get("termination") or {}).get("rule_event") == "unknown"
-                for point in points
-            ),
-            "ball_track_cache_reused": bool(ch.ball_track_cache),
-        }
-    else:
-        ch.stages["point_outcomes"] = {
-            "status": "skipped", "reason": "no accepted points",
-        }
+    with _timed(state, "pose_timeline_and_decode", progress):
+        segments, points = _continuous_pose_stage(
+            input_path, duration, state, cfg, progress, cancel_check,
+            publish_signals)
 
     kept = total_kept_seconds(segments)
+    state.timings["analysis_total"] = time.perf_counter() - started
     progress(f"decoded {len(segments)} points, {kept:.1f}s kept of {duration:.1f}s")
-    ch.timings["analysis_total"] = time.perf_counter() - pipeline_started
-
     result = RallyResult(
         input_path=input_path,
         output_path=output_path if segments else None,
         segments=segments,
         total_seconds=duration,
         kept_seconds=kept,
-        compression_ratio=(kept / duration) if duration else 0.0,
-        channels_used=ch.used,
-        n_strikes=ch.n_strikes,
-        strike_times=[float(t) for t in ch.onsets],
-        stages=ch.stages,
-        timings=ch.timings,
+        compression_ratio=kept / duration if duration else 0.0,
+        channels_used=state.used,
+        n_serves=int(state.serve_times.size),
+        serve_times=[float(value) for value in state.serve_times],
+        stages=state.stages,
+        timings=state.timings,
         config=asdict(cfg),
-        match=match,
+        match=state.match_profile,
         points=points,
     )
-
     _write_output(
-        input_path, output_path, json_path, result, info, cfg, progress,
-        pipeline_started=pipeline_started)
+        input_path,
+        output_path,
+        json_path,
+        result,
+        info,
+        cfg,
+        progress,
+        pipeline_started=started,
+    )
     return result

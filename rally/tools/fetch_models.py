@@ -1,34 +1,4 @@
-"""Fetch / verify the pretrained TrackNet ball-tracking weights used by ball-arbiter mode.
-
-Ball-primary detection (on by default; ``--no-ball-arbiter`` disables it) needs a 3-frame
-TrackNet checkpoint compatible
-with :class:`rally.vendor.tracknet_torch.BallTrackerNet`. Weights are NOT bundled with the
-repo. This helper downloads a checkpoint from a URL you provide and verifies it loads into
-the architecture, saving it where the pipeline auto-discovers it (``models/tracknet.pt``).
-
-The vendored architecture matches the ``yastrebksv/TrackNet`` port (3 stacked frames ->
-256-channel heatmap). Its weights are on Google Drive; usage examples::
-
-    # Google Drive (handles the large-file confirm-token via gdown):
-    python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl
-    python -m rally.tools.fetch_models --url https://drive.google.com/file/d/<ID>/view
-
-    # a plain direct URL:
-    python -m rally.tools.fetch_models --url <DIRECT_URL_TO_PT>
-
-    # verify (and install) a file you already downloaded:
-    python -m rally.tools.fetch_models --verify /path/to/model.pt
-
-Verification instantiates BallTrackerNet and calls ``load_state_dict`` (with
-``weights_only=True`` — the checkpoint must be a plain tensor state-dict), so a mismatched
-or tampered file fails loudly instead of silently producing garbage tracks.
-
-LICENSE NOTE: the ``yastrebksv/TrackNet`` repo has no LICENSE file ("unofficial
-implementation"), so the weights are not confirmed free-to-use — fine for personal/research
-experimentation, but get clearance before redistributing or shipping them in a product.
-The Drive ID and SHA-256 identify bytes only; they do not establish authorship, training-data
-provenance, or a licence grant.
-"""
+"""Download and strictly verify the pipeline's pinned inference checkpoints."""
 
 from __future__ import annotations
 
@@ -43,10 +13,6 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
-
-KNOWN_DRIVE_ID = "1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl"
-KNOWN_SHA256 = "c735bc1a1b13a35f179c6492f778ef4ebb9bffd512a96f4d970b32e076653076"
-
 
 def _max_model_bytes() -> int:
     return int(os.environ.get("RALLY_MAX_MODEL_BYTES", str(1024 * 1024 * 1024)))
@@ -73,17 +39,13 @@ def _check_digest(path: str, expected: Optional[str]) -> str:
     return actual
 
 
-def _verify(path: str) -> None:
-    """Load ``path`` into BallTrackerNet to confirm architecture compatibility."""
-    import torch
+def _verify_court(path: str) -> None:
+    from ..signals.court_detect import load_court_keypoint_model
 
-    from ..vendor.tracknet_torch import BallTrackerNet
-
-    sd = torch.load(path, map_location="cpu", weights_only=True)
-    state = sd["model_state"] if isinstance(sd, dict) and "model_state" in sd else sd
-    model = BallTrackerNet()
-    model.load_state_dict(state)   # raises on key/shape mismatch
-    print(f"[fetch_models] OK: {path} loads into BallTrackerNet")
+    model = load_court_keypoint_model(path, device="cpu")
+    if model is None:
+        raise RuntimeError("court model construction returned no model")
+    print(f"[fetch_models] OK: {path} loads into the 14-landmark ResNet50")
 
 
 def _drive_id_from_url(url: str) -> Optional[str]:
@@ -175,15 +137,15 @@ def _copy_bounded(source: str, dest: str) -> None:
         shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
-def _install_verified(source: str, dest: str, expected_digest: Optional[str] = None) -> str:
+def _install_verified(source: str, dest: str, expected_digest: Optional[str], verifier) -> str:
     """Verify a sibling temporary and atomically publish it over the final checkpoint."""
     dest_dir = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(dest_dir, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".tracknet.", suffix=".pt", dir=dest_dir)
+    fd, temporary = tempfile.mkstemp(prefix=".model.", suffix=".checkpoint", dir=dest_dir)
     os.close(fd)
     try:
         _copy_bounded(source, temporary)
-        _verify(temporary)
+        verifier(temporary)
         digest = _check_digest(temporary, expected_digest)
         with open(temporary, "rb") as fh:
             os.fsync(fh.fileno())
@@ -199,49 +161,51 @@ def _install_verified(source: str, dest: str, expected_digest: Optional[str] = N
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="rally.tools.fetch_models",
-        description="Download/verify pretrained TrackNet weights for ball-arbiter mode.",
+        description="Download and verify a pinned inference checkpoint.",
     )
-    p.add_argument("--url", help="direct URL, or a Google Drive share URL, to a TrackNet .pt")
-    p.add_argument("--drive-id", help="Google Drive file ID of the .pt (uses gdown)")
-    p.add_argument("--verify", metavar="PT", help="verify an already-downloaded .pt instead of downloading")
-    p.add_argument("--sha256", help="required SHA-256 identity (the known Drive model is pinned automatically)")
-    p.add_argument("--dest", default="models/tracknet.pt",
-                   help="where to save/copy the weights (default: models/tracknet.pt, auto-discovered)")
+    p.add_argument("--backend", choices=("court",), default="court")
+    p.add_argument("--url", help="direct URL or Google Drive share URL")
+    p.add_argument("--drive-id", help="Google Drive file ID (uses gdown)")
+    p.add_argument("--verify", metavar="CHECKPOINT",
+                   help="verify an existing checkpoint instead of downloading")
+    p.add_argument("--sha256", help="required SHA-256 identity")
+    p.add_argument("--dest", help="installation path; defaults to the backend's models path")
     args = p.parse_args(argv)
+    if args.dest is None:
+        args.dest = "models/court_keypoints_resnet50.pth"
     if args.sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
         p.error("--sha256 must be exactly 64 hexadecimal characters")
 
     if not args.url and not args.drive_id and not args.verify:
         p.print_help()
-        print("\n[fetch_models] nothing to do: pass --drive-id, --url, or --verify.\n"
-              "  Known TrackNet weights (yastrebksv/TrackNet, unlicensed — personal use):\n"
-              "    python -m rally.tools.fetch_models --drive-id 1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl",
+        print("\n[fetch_models] nothing to do: pass --drive-id, --url, or --verify.",
               file=sys.stderr)
         return 2
 
     try:
         drive_id = args.drive_id or (_drive_id_from_url(args.url) if args.url else None)
-        expected_digest = args.sha256 or (KNOWN_SHA256 if drive_id == KNOWN_DRIVE_ID else None)
+        expected_digest = args.sha256
         if args.verify:
             if os.path.abspath(args.verify) == os.path.abspath(args.dest):
                 _check_size(args.verify)
-                _verify(args.verify)
+                _verify_court(args.verify)
                 digest = _check_digest(args.verify, expected_digest)
             else:
-                digest = _install_verified(args.verify, args.dest, expected_digest)
+                digest = _install_verified(
+                    args.verify, args.dest, expected_digest, verifier=_verify_court)
                 print(f"[fetch_models] installed verified weights -> {args.dest}")
         else:
             dest_dir = os.path.dirname(os.path.abspath(args.dest)) or "."
             os.makedirs(dest_dir, exist_ok=True)
             fd, temporary = tempfile.mkstemp(
-                prefix=".tracknet-download.", suffix=".pt", dir=dest_dir)
+                prefix=".model-download.", suffix=".checkpoint", dir=dest_dir)
             os.close(fd)
             try:
                 if drive_id:
                     _download_drive(drive_id, temporary)
                 else:
                     _download(args.url, temporary)
-                _verify(temporary)
+                _verify_court(temporary)
                 digest = _check_digest(temporary, expected_digest)
                 with open(temporary, "rb") as fh:
                     os.fsync(fh.fileno())
@@ -254,7 +218,7 @@ def main(argv=None) -> int:
     except Exception as exc:
         print(f"[fetch_models] failed: {exc}", file=sys.stderr)
         return 1
-    print(f"[fetch_models] ready — sha256={digest}; ball-arbiter will auto-discover {args.dest}")
+    print(f"[fetch_models] ready - sha256={digest}; installed {args.dest}")
     return 0
 
 

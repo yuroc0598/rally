@@ -1,9 +1,4 @@
-"""Strict installation preflight for the accuracy-first web server.
-
-The analysis pipeline can expose individual optional channels to library/CLI callers, but
-the web server is an accuracy-first product surface.  It must never start from a partial
-installation and silently turn a requested match analysis into audio-only segmentation.
-"""
+"""Strict installation preflight for the vision-first web server."""
 
 from __future__ import annotations
 
@@ -11,8 +6,8 @@ import argparse
 import importlib
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Sequence
 
 import numpy as np
 
@@ -29,18 +24,18 @@ _REQUIRED_IMPORTS = {
     "imageio-ffmpeg": "imageio_ffmpeg",
     "OpenCV headless": "cv2",
     "PyTorch": "torch",
+    "TorchVision": "torchvision",
     "Ultralytics": "ultralytics",
+    "LAP assignment solver": "lap",
     "RTMLib": "rtmlib",
     "ONNX Runtime": "onnxruntime",
-    "gdown": "gdown",
     "FastAPI": "fastapi",
     "Uvicorn": "uvicorn",
     "python-multipart": "multipart",
-    "HTTPX": "httpx",
 }
 
 
-def _local_model_path(configured: Optional[str], discovered: Optional[str]) -> Optional[Path]:
+def _local_model_path(configured: str | None, discovered: str | None) -> Path | None:
     if configured:
         direct = Path(configured).expanduser()
         if direct.is_file():
@@ -77,28 +72,42 @@ def _check_ffmpeg() -> None:
             raise RuntimeError(f"encoded ffmpeg smoke test could not be probed: {info}")
 
 
-def _check_tracknet(path: Path) -> None:
-    import torch
-
-    from .vendor.tracknet_torch import BallTrackerNet
-
-    checkpoint = torch.load(str(path), map_location="cpu", weights_only=True)
-    state = (
-        checkpoint["model_state"]
-        if isinstance(checkpoint, dict) and "model_state" in checkpoint
-        else checkpoint
-    )
-    model = BallTrackerNet()
-    model.load_state_dict(state)
-
-
 def _check_yolo(path: Path) -> None:
     from ultralytics import YOLO
 
     model = YOLO(str(path))
     if getattr(model, "task", None) not in {None, "detect"}:
         raise RuntimeError(
-            f"player model must be a detection checkpoint, got {model.task!r}")
+            f"player/racket model must be a detection checkpoint, got {model.task!r}")
+    names = getattr(model, "names", {}) or {}
+    label = names.get(38) if isinstance(names, dict) else (
+        names[38] if len(names) > 38 else None)
+    if str(label).lower().replace("_", " ") != "tennis racket":
+        raise RuntimeError(
+            "player/racket model must expose COCO class 38 as 'tennis racket'")
+
+
+def _check_court(path: Path) -> None:
+    import hashlib
+
+    import torch
+
+    from .signals.court_detect import (
+        COURT_MODEL_SOURCE_SHA256,
+        COURT_MODEL_SOURCE_SIZE,
+        load_court_keypoint_model,
+    )
+
+    if path.stat().st_size != COURT_MODEL_SOURCE_SIZE:
+        raise RuntimeError("court checkpoint size does not match the pinned asset")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != COURT_MODEL_SOURCE_SHA256:
+        raise RuntimeError("court checkpoint SHA-256 does not match the pinned asset")
+    model = load_court_keypoint_model(str(path), device="cpu")
+    with torch.inference_mode():
+        output = model(torch.zeros((1, 3, 224, 224), dtype=torch.float32))
+    if tuple(output.shape) != (1, 28) or not torch.isfinite(output).all():
+        raise RuntimeError(f"unexpected court-model smoke output: {tuple(output.shape)}")
 
 
 def _check_rtmpose(path: Path, cfg: RallyConfig) -> None:
@@ -124,9 +133,9 @@ def _check_rtmpose(path: Path, cfg: RallyConfig) -> None:
 
 def installation_errors(
     *,
-    tracknet_path: Optional[str] = None,
-    yolo_path: Optional[str] = None,
-    rtmpose_path: Optional[str] = None,
+    yolo_path: str | None = None,
+    rtmpose_path: str | None = None,
+    court_path: str | None = None,
     check_packages: bool = True,
     check_ffmpeg: bool = True,
     load_models: bool = True,
@@ -137,28 +146,15 @@ def installation_errors(
         for label, module_name in _REQUIRED_IMPORTS.items():
             try:
                 importlib.import_module(module_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report every broken dependency
                 errors.append(f"required package {label} is unusable: {exc}")
 
     cfg = RallyConfig()
     try:
-        from .signals.ball import discover_ball_weights
-
-        ball_discovered = discover_ball_weights()
-    except Exception as exc:
-        ball_discovered = None
-        errors.append(f"TrackNet discovery failed: {exc}")
-    configured_ball = tracknet_path or cfg.ball_weights
-    ball = _local_model_path(
-        configured_ball,
-        None if configured_ball else ball_discovered,
-    )
-
-    try:
         from .signals.player import discover_yolo_weights
 
         yolo_discovered = discover_yolo_weights(cfg.player_detection_model)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - discovery failures are preflight output
         yolo_discovered = None
         errors.append(f"YOLO discovery failed: {exc}")
     yolo = _local_model_path(
@@ -170,7 +166,7 @@ def installation_errors(
         from .signals.pose import discover_rtmpose_weights
 
         pose_discovered = discover_rtmpose_weights(cfg.player_pose_model)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - discovery failures are preflight output
         pose_discovered = None
         errors.append(f"RTMPose discovery failed: {exc}")
     pose = _local_model_path(
@@ -178,11 +174,23 @@ def installation_errors(
         None if rtmpose_path else pose_discovered,
     )
 
-    required_models = (
-        ("TrackNet", ball, _check_tracknet),
+    try:
+        from .signals.court_detect import discover_court_weights
+
+        court_discovered = discover_court_weights(cfg.court_weights)
+    except Exception as exc:  # noqa: BLE001 - discovery failures are preflight output
+        court_discovered = None
+        errors.append(f"court-model discovery failed: {exc}")
+    court = _local_model_path(
+        court_path or cfg.court_weights,
+        None if court_path else court_discovered,
+    )
+
+    required_models = [
         ("YOLO player detector", yolo, _check_yolo),
         ("RTMPose", pose, lambda path: _check_rtmpose(path, cfg)),
-    )
+        ("court keypoint detector", court, _check_court),
+    ]
     for label, path, validator in required_models:
         if path is None:
             errors.append(f"required {label} model is missing")
@@ -190,13 +198,13 @@ def installation_errors(
         if load_models:
             try:
                 validator(path)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - validators cross library boundaries
                 errors.append(f"required {label} model is unusable ({path}): {exc}")
 
     if check_ffmpeg:
         try:
             _check_ffmpeg()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - ffmpeg diagnostics are preflight output
             errors.append(f"required ffmpeg H.264 runtime is unusable: {exc}")
     return errors
 
@@ -213,20 +221,20 @@ def require_server_install(**kwargs) -> None:
         )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m rally.preflight",
         description="Verify every package, binary, and model required by rally-web.",
     )
-    parser.add_argument("--tracknet")
     parser.add_argument("--yolo")
     parser.add_argument("--rtmpose")
+    parser.add_argument("--court")
     args = parser.parse_args(argv)
     try:
         require_server_install(
-            tracknet_path=args.tracknet,
             yolo_path=args.yolo,
             rtmpose_path=args.rtmpose,
+            court_path=args.court,
         )
     except InstallationError as exc:
         parser.exit(1, f"[preflight] {exc}\n")

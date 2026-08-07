@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rally — tennis rally trimmer</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260804-point-events2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260806-tennis-state" />
   </head>
   <body>
     <header class="topbar">
@@ -37,33 +37,22 @@
               <span class="drop-sub">mp4 · mov · mkv · webm</span>
             </label>
 
-            <!-- Ball, court, player, and pose evidence are mandatory server capabilities.
-                 Only output/presentation tuning remains optional here. -->
+            <!-- Court, player, and temporal pose evidence are mandatory server
+                 capabilities. Only output/presentation tuning remains optional here. -->
             <details class="advanced">
               <summary>Advanced options</summary>
               <p class="advanced-note">Defaults use the fullest available analysis path; verify results in the review screen.</p>
               <fieldset class="checks">
-                <label><input id="staticCamera" type="checkbox" checked /> Static camera</label>
                 <label><input id="fast" type="checkbox" /> Fast cut</label>
-                <label><input id="hysteresis" type="checkbox" /> Hysteresis</label>
                 <label><input id="noLabels" type="checkbox" /> No labels</label>
               </fieldset>
               <div class="number-grid">
-                <label>Play type
-                  <select id="playMode">
-                    <option value="auto" selected>Auto (match-aware)</option>
-                    <option value="match">Match</option>
-                    <option value="casual">Casual rally</option>
-                  </select>
-                </label>
-                <label>Analysis FPS<input id="analysisFps" type="number" min="0.5" step="0.5" placeholder="5" /></label>
+                <label>Pose FPS<input id="poseFps" type="number" min="0.5" step="0.5" placeholder="6" /></label>
                 <label>Min rally s<input id="minRally" type="number" min="0" step="0.5" placeholder="2" /></label>
                 <label>Skip intro s<input id="skipIntro" type="number" min="0" step="5" placeholder="0" /></label>
                 <label>Black gap s<input id="gap" type="number" min="0" step="0.1" placeholder="0 (off)" /></label>
                 <label>Output pre-roll s<input id="startBuffer" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
-                <label>Output post-roll s<input id="endBuffer" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
-                <label>Serve pre-roll s<input id="servePreroll" type="number" min="0" step="0.1" placeholder="1.8" /></label>
-                <label>Detection tail s<input id="tail" type="number" min="0" max="1" step="0.1" placeholder="1.0" /></label>
+                <label>Output post-roll s<input id="endBuffer" type="number" min="0" max="1" step="0.1" placeholder="0.5" /></label>
               </div>
             </details>
 
@@ -105,6 +94,7 @@
             <p id="detailMeta" class="muted"></p>
           </div>
           <div class="detail-actions">
+            <a id="inspectSignals" class="ghost disabled">Inspect signals</a>
             <button id="reprocessButton" type="button" class="ghost">Re-run</button>
             <a id="dlOutput" class="ghost disabled" download>Output</a>
             <a id="dlJson" class="ghost disabled" download>JSON</a>
@@ -137,10 +127,12 @@
                   <h3>Rallies only</h3>
                   <span><span id="currentPoint" class="point-readout">Point —</span><span id="outTime" class="mono muted">00:00</span></span>
                 </div>
-                <div class="video-shell interactive-player">
+                <div id="outputPlayerShell" class="video-shell interactive-player">
                   <video id="outputVideo" controls playsinline preload="metadata"></video>
-                  <div id="ballSpeed" class="ball-speed" title="Uncertain single-camera ground-plane estimate; not full 3-D ball speed">Ball speed —</div>
-                  <div id="pointOutcome" class="point-outcome">Point result unavailable</div>
+                  <div id="pointTelemetry" class="point-telemetry" aria-live="off">
+                    <div id="pointOutcome" class="point-outcome">Point: analyzing</div>
+                    <div id="pointActions" class="point-actions">Pose actions: —</div>
+                  </div>
                   <div id="playerHitLayer" class="player-hit-layer" aria-label="Video gestures">
                     <button id="previousPointZone" type="button" aria-label="Double-click for previous point" title="Double-click: previous point"></button>
                     <button id="nextPointZone" type="button" aria-label="Double-click for next point" title="Double-click: next point"></button>
@@ -175,13 +167,13 @@
                 <button id="saveMatchRoster" type="button" class="primary small" disabled>Save names</button>
               </div>
               <div id="matchRoster" class="match-roster"></div>
-              <p class="muted small match-help">Singles or doubles is detected automatically from persistent on-court tracks. Names survive reprocessing.</p>
+              <p class="muted small match-help">Each gallery follows the same persistent player ID used in point results. Click a crop to verify that player in the original video. Names survive reprocessing.</p>
             </div>
 
             <div class="card">
               <div class="card-head">
                 <h3>Timeline</h3>
-                <span class="legend"><i class="sw rally"></i>rally <i class="sw strike"></i>strike <i class="sw head"></i>playhead</span>
+                <span class="legend"><i class="sw rally"></i>rally <i class="sw strike"></i>visual serve <i class="sw head"></i>playhead</span>
               </div>
               <canvas id="timeline" height="80"></canvas>
               <p id="timelineMeta" class="mono muted small"></p>
@@ -308,9 +300,62 @@
           </div>
         </div>
       </section>
+
+      <!-- ================= SIGNAL INSPECTOR ================= -->
+      <section id="signalsView" class="view hidden">
+        <div class="detail-bar">
+          <a id="signalsBackJob" class="ghost">← Match review</a>
+          <div class="detail-title">
+            <h2 id="signalsTitle">Pipeline signals</h2>
+            <p id="signalsMeta" class="muted">Evidence captured during analysis</p>
+          </div>
+        </div>
+        <div id="signalStageRail" class="signal-stage-rail"></div>
+        <div class="signal-layout">
+          <section class="card signal-section">
+            <div class="card-head"><div><h3>Shared pose timeline</h3><p class="muted small">The common input to serve, stroke, point-state, and endpoint decoding</p></div></div>
+            <div id="signalTimeline" class="signal-chip-row"></div>
+          </section>
+          <section class="card signal-section">
+            <div class="card-head"><div><h3>Player identities</h3><p class="muted small">Grouped target-court tracks and retained crops</p></div></div>
+            <div id="signalPlayers" class="signal-player-grid"></div>
+          </section>
+          <section class="card signal-section">
+            <div class="card-head"><div><h3>Serve-pose proposals</h3><p id="signalServeSummary" class="muted small"></p></div></div>
+            <div id="signalServes" class="signal-serve-grid"></div>
+          </section>
+          <section class="card signal-section">
+            <div class="card-head"><div><h3>Racket-action poses</h3><p id="signalActionSummary" class="muted small"></p></div></div>
+            <div id="signalActions" class="signal-serve-grid"></div>
+          </section>
+          <section class="card signal-section">
+            <div class="card-head"><div><h3>Point endpoints</h3><p class="muted small">Presentation cuts are separate from rally validity; no bounce, line, let, or service-outcome claims</p></div></div>
+            <div id="signalEndpoints" class="signal-decision-list"></div>
+          </section>
+          <section class="card signal-section">
+            <details>
+              <summary>Raw staged evidence</summary>
+              <pre id="signalRaw" class="signal-json"></pre>
+            </details>
+          </section>
+        </div>
+      </section>
+
+      <!-- ================= PLAYER SIGNAL GALLERY ================= -->
+      <section id="playerSignalsView" class="view hidden">
+        <div class="detail-bar">
+          <a id="playerSignalsBack" class="ghost">← All signals</a>
+          <div class="detail-title">
+            <h2 id="playerSignalsTitle">Player</h2>
+            <p id="playerSignalsMeta" class="muted"></p>
+          </div>
+        </div>
+        <div id="playerSignalGallery" class="player-signal-gallery"></div>
+        <p id="playerSignalEmpty" class="empty hidden">No retained crops are available for this identity.</p>
+      </section>
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=20260804-point-events2"></script>
+    <script src="/static/app.js?v=20260806-pose-timeline-v3"></script>
   </body>
 </html>

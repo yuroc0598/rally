@@ -1,0 +1,15 @@
+# Accuracy-first player tracker. Unlike Ultralytics' default BoT-SORT profile, this
+# explicitly enables appearance ReID so court crossings and end changes do not redefine
+# a player's identity from position alone.
+tracker_type: botsort
+track_high_thresh: 0.35
+track_low_thresh: 0.10
+new_track_thresh: 0.40
+track_buffer: 120
+match_thresh: 0.80
+fuse_score: true
+gmc_method: sparseOptFlow
+proximity_thresh: 0.30
+appearance_thresh: 0.82
+with_reid: true
+model: auto

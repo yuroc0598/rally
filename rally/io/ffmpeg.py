@@ -18,12 +18,10 @@ import json
 import os
 import shutil
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-import numpy as np
 
 
 def _run_cancellable(cmd: list[str], cancel_check: Optional[Callable[[], None]] = None) -> None:
@@ -77,15 +75,6 @@ def add_real_context(
             ends[i] = min(ends[i], boundary)
             starts[i + 1] = max(starts[i + 1], boundary)
     return list(zip(starts, ends))
-
-
-def add_real_postroll(
-    segments: List[Tuple[float, float]], total_s: float, buffer_s: float
-) -> List[Tuple[float, float]]:
-    """Backward-compatible post-roll-only wrapper."""
-    return add_real_context(segments, total_s, 0.0, buffer_s)
-
-
 def _runs(path: Optional[str]) -> bool:
     """True if ``path -version`` actually executes (guards against broken PATH shims)."""
     if not path:
@@ -306,71 +295,6 @@ def _has_audio(path: str) -> bool:
         return "Audio:" in log
     except Exception:
         return False
-
-
-def iter_audio_mono(path: str, sr: int, *, chunk_s: float = 60.0) -> Iterator[np.ndarray]:
-    """Stream mono float32 PCM from ffmpeg in bounded chunks.
-
-    Audio is never buffered for the complete recording, keeping memory bounded for
-    multi-hour inputs.
-    """
-    if sr <= 0 or chunk_s <= 0:
-        raise ValueError("sr and chunk_s must be positive")
-    ffmpeg = _require("ffmpeg")
-    samples_per_chunk = max(1, int(round(sr * chunk_s)))
-    bytes_per_chunk = samples_per_chunk * np.dtype(np.float32).itemsize
-    proc = subprocess.Popen(
-        [ffmpeg, "-v", "error", "-i", path, "-ac", "1", "-ar", str(sr),
-         "-f", "f32le", "-"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert proc.stdout is not None and proc.stderr is not None
-    stderr_tail = bytearray()
-
-    def drain_stderr() -> None:
-        while True:
-            block = proc.stderr.read(4096)
-            if not block:
-                return
-            stderr_tail.extend(block)
-            if len(stderr_tail) > 64 * 1024:
-                del stderr_tail[:-64 * 1024]
-
-    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-    stderr_thread.start()
-    try:
-        try:
-            while True:
-                data = bytearray()
-                while len(data) < bytes_per_chunk:
-                    block = proc.stdout.read(bytes_per_chunk - len(data))
-                    if not block:
-                        break
-                    data.extend(block)
-                # ffmpeg emits complete float32 samples; ignore no bytes silently only at EOF.
-                usable = len(data) - (len(data) % np.dtype(np.float32).itemsize)
-                if usable:
-                    yield np.frombuffer(memoryview(data)[:usable], dtype=np.float32).copy()
-                if len(data) < bytes_per_chunk:
-                    break
-            rc = proc.wait()
-            stderr_thread.join(timeout=5)
-            if rc:
-                detail = bytes(stderr_tail).decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"ffmpeg audio decode failed ({rc}): {detail[-1000:]}")
-        finally:
-            proc.stdout.close()
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:  # pragma: no cover - wedged external process
-                    proc.kill()
-                    proc.wait()
-    finally:
-        proc.stderr.close()
-        stderr_thread.join(timeout=5)
 
 
 def find_font() -> str | None:

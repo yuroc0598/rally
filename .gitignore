@@ -23,6 +23,7 @@ train_candidates/
 # local model binaries; retain only the directory documentation
 models/*
 !models/README.md
+!models/*.manifest.json
 
 # environment-specific ffmpeg shim symlinks (point into .venv)
 .ffbin/

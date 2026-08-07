@@ -1,9 +1,8 @@
-"""Top-down player-pose inference inside YOLO target-court crops.
+"""Top-down player-pose inference inside YOLO target-player crops.
 
-YOLO remains responsible for deciding *which person* belongs to the recorded court.
-RTMPose receives only those boxes and performs higher-resolution keypoint estimation on
-each crop. This separation keeps neighboring courts out of the pose signal and makes a
-small far-side server materially larger to the pose network.
+Court geometry initializes target attribution and persistent tracker overlap preserves an
+established player who legally chases outside the court apron. RTMPose receives only those
+boxes and performs higher-resolution keypoint estimation on each crop.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from ..config import DEFAULT_RTMPOSE_MODEL, DEFAULT_YOLO_DETECTION_MODEL
+from ..config import DEFAULT_RTMPOSE_MODEL
 
 
 @dataclass(frozen=True)
@@ -104,26 +103,16 @@ def rtmpose_execution_providers(runtime: str = "onnxruntime") -> list[str]:
 
 
 class CroppedRTMPose:
-    """Batched YOLO detection followed by top-down RTMPose on selected boxes."""
+    """Batched top-down RTMPose inside caller-owned player boxes."""
 
     def __init__(
         self,
         *,
-        detection_model: str = DEFAULT_YOLO_DETECTION_MODEL,
         pose_model: str = DEFAULT_RTMPOSE_MODEL,
         runtime: str = "onnxruntime",
         pose_device: str = "auto",
-        detector=None,
         estimator=None,
-        detection_device: Optional[str] = None,
     ) -> None:
-        if detector is None:
-            from ultralytics import YOLO
-            from .player import discover_yolo_weights, resolve_yolo_device
-
-            detection_device = detection_device or resolve_yolo_device()
-            detector = YOLO(discover_yolo_weights(detection_model))
-            detector.to(detection_device)
         if estimator is None:
             try:
                 from rtmlib import RTMPose
@@ -144,9 +133,7 @@ class CroppedRTMPose:
         else:
             self.pose_model = pose_model
             self.pose_device = pose_device
-        self.detector = detector
         self.estimator = estimator
-        self.detection_device = detection_device or "cpu"
         self.runtime = runtime
 
     def _predict_dynamic_onnx_batch(
@@ -229,63 +216,45 @@ class CroppedRTMPose:
             for index, boxes in enumerate(boxes_by_frame)
         ]
 
-    def predict(
+    def predict_boxes(
         self,
         frames: Sequence[np.ndarray],
+        boxes_by_frame: Sequence[np.ndarray],
         *,
-        court=None,
-        target_required: bool = True,
-        confidence: float = 0.15,
-        image_size: int = 1280,
-        batch_size: int = 16,
+        batch_size: int = 32,
     ) -> list[PoseFrameResult]:
-        if not frames:
-            return []
-        detections = self.detector.predict(
-            list(frames), conf=confidence, classes=[0], verbose=False,
-            imgsz=int(image_size), device=self.detection_device,
-            batch=min(int(batch_size), len(frames)),
-        )
-        if len(detections) != len(frames):
-            raise RuntimeError(
-                "YOLO detector returned a different number of results than pose frames")
-        boxes_by_frame: list[np.ndarray] = []
-        for frame, detection in zip(frames, detections):
-            raw_boxes = getattr(detection, "boxes", None)
-            if raw_boxes is None or len(raw_boxes) == 0:
-                boxes_by_frame.append(np.empty((0, 4), dtype=float))
-                continue
-            values = raw_boxes.xyxy
-            boxes = np.asarray(
-                values.cpu().numpy() if hasattr(values, "cpu") else values,
-                dtype=float,
-            ).reshape(-1, 4)
-            if court is not None:
-                from .player import target_court_box_indices
+        """Estimate poses in caller-owned player boxes without repeating detection.
 
-                indices = target_court_box_indices(boxes, court, frame.shape[:2])
-                boxes = boxes[indices]
-            elif target_required:
-                boxes = np.empty((0, 4), dtype=float)
-            if boxes.size == 0:
-                boxes_by_frame.append(np.empty((0, 4), dtype=float))
-                continue
-            height, width = frame.shape[:2]
-            boxes[:, (0, 2)] = np.clip(boxes[:, (0, 2)], 0, max(0, width - 1))
-            boxes[:, (1, 3)] = np.clip(boxes[:, (1, 3)], 0, max(0, height - 1))
-            valid = (boxes[:, 2] - boxes[:, 0] >= 4) & (boxes[:, 3] - boxes[:, 1] >= 8)
-            boxes = boxes[valid]
-            if boxes.size == 0:
-                boxes = np.empty((0, 4), dtype=float)
-            boxes_by_frame.append(boxes)
+        The visual identity pass has already run YOLO/BoT-SORT and attributed people to
+        the target court. Reusing those boxes is both faster and safer than independently
+        redetecting a different set of people during each downstream signal stage.
+        """
+        if len(frames) != len(boxes_by_frame):
+            raise ValueError("pose boxes must align one-to-one with frames")
+        prepared: list[np.ndarray] = []
+        for frame, raw in zip(frames, boxes_by_frame, strict=True):
+            boxes = np.asarray(raw, dtype=float).reshape(-1, 4).copy()
+            if boxes.size:
+                height, width = frame.shape[:2]
+                boxes[:, (0, 2)] = np.clip(
+                    boxes[:, (0, 2)], 0, max(0, width - 1))
+                boxes[:, (1, 3)] = np.clip(
+                    boxes[:, (1, 3)], 0, max(0, height - 1))
+                valid = (
+                    (boxes[:, 2] - boxes[:, 0] >= 4)
+                    & (boxes[:, 3] - boxes[:, 1] >= 8)
+                )
+                boxes = boxes[valid]
+            prepared.append(
+                boxes if boxes.size else np.empty((0, 4), dtype=float))
 
         batched = self._predict_dynamic_onnx_batch(
-            frames, boxes_by_frame, batch_size)
+            frames, prepared, max(1, int(batch_size)))
         if batched is not None:
             return batched
 
         output: list[PoseFrameResult] = []
-        for frame, boxes in zip(frames, boxes_by_frame):
+        for frame, boxes in zip(frames, prepared, strict=True):
             if boxes.size == 0:
                 output.append(PoseFrameResult.empty())
                 continue

@@ -1,8 +1,6 @@
 "use strict";
 
-/* Rally web UI — a small vanilla-JS SPA over the FastAPI backend.
-   Two views: a gallery of jobs and a per-job detail workspace (review +
-   editable segments). No build step, no framework. */
+/* Rally web UI — a small vanilla-JS SPA over the FastAPI backend. */
 
 // --------------------------------------------------------------------------- //
 // tiny helpers                                                                //
@@ -48,17 +46,24 @@ const state = {
   goldenSignature: "",
   current: null,        // full public job object
   pollTimer: null,
+  signalPollTimer: null,
+  signalGeneration: 0,
+  signalRevision: "",
   goldenPollTimer: null,
   goldenGeneration: 0,
   galleryRequest: 0,
   processingClockTimer: null,
-  waveform: null,       // {duration, strikes[], segments[]}
+  waveform: null,       // {duration, serves[], segments[]}
   editSegments: null,   // [[start,end], ...] working copy while editing
   detailJobId: null,    // requested detail, even while its GET is in flight
   detailGeneration: 0, // invalidates stale job/waveform responses after navigation/mutation
   videoTab: null,
   hadOutput: false,
   outputLayout: [],
+  signalData: null,
+  fullscreenTelemetryTrack: null,
+  fullscreenTelemetryCue: null,
+  webkitVideoFullscreen: false,
   activeUploads: new Map(),
   uploadSequence: 0,
 };
@@ -135,7 +140,7 @@ function statusClass(job) {
   if (["complete", "ready"].includes(s)) return "ok";
   if (["failed", "error"].includes(s)) return "err";
   if (["no_output", "cancelled"].includes(s)) return "warn";
-  if (["running", "queued", "cancelling", "starting", "audio", "visual", "ball_tracking", "pose", "serve", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
+  if (["running", "queued", "cancelling", "starting", "audio", "visual", "racket_actions", "pose", "serve", "deciding", "rendering", "probing", "writing", "waveform", "refining"].includes(s)) return "busy";
   return "";
 }
 
@@ -212,19 +217,12 @@ function uploadJob(file, openWhenBatchFinishes = false) {
   paintUploadProgress();
   const fd = new FormData();
   fd.append("file", file);
-  fd.append("play_mode", $("#playMode").value);
-  fd.append("detect_players", "true");
-  fd.append("static_camera", $("#staticCamera").checked);
   fd.append("fast", $("#fast").checked);
-  fd.append("hysteresis", $("#hysteresis").checked);
   fd.append("no_labels", $("#noLabels").checked);
-  fd.append("ball_arbiter", "true");
-  fd.append("court_auto", "true");
   fd.append("run_now", "true");
   const opt = {
-    analysis_fps: "#analysisFps", min_rally: "#minRally", skip_intro: "#skipIntro",
+    pose_fps: "#poseFps", min_rally: "#minRally", skip_intro: "#skipIntro",
     gap: "#gap", start_buffer: "#startBuffer", end_buffer: "#endBuffer",
-    serve_preroll: "#servePreroll", tail: "#tail",
   };
   for (const [k, id] of Object.entries(opt)) {
     const v = numOrEmpty(id);
@@ -270,9 +268,12 @@ function uploadJob(file, openWhenBatchFinishes = false) {
 // detail view                                                                 //
 // --------------------------------------------------------------------------- //
 function showView(which) {
+  if (which !== "signals" && which !== "player-signals") stopSignalPolling();
   $("#galleryView").classList.toggle("hidden", which !== "gallery");
   $("#goldenView").classList.toggle("hidden", which !== "golden");
   $("#detailView").classList.toggle("hidden", which !== "detail");
+  $("#signalsView").classList.toggle("hidden", which !== "signals");
+  $("#playerSignalsView").classList.toggle("hidden", which !== "player-signals");
   $("#galleryButton").classList.toggle("active", which === "gallery");
   $("#goldenButton").classList.toggle("active", which === "golden");
 }
@@ -405,6 +406,7 @@ function backToGallery() {
   state.current = null;
   $("#originalVideo").pause();
   $("#outputVideo").pause();
+  window.history.replaceState({}, "", "/");
   refreshGallery();
 }
 
@@ -451,7 +453,7 @@ function renderDetail(job) {
   if (r.total_seconds) metaBits.push(fmtDur(r.total_seconds));
   if (info.width) metaBits.push(`${info.width}×${info.height}`);
   if (r.channels_used?.length) metaBits.push(`channels: ${r.channels_used.join(", ")}`);
-  if (r.n_strikes != null) metaBits.push(`${r.n_strikes} strikes`);
+  if (r.n_serves != null) metaBits.push(`${r.n_serves} visual serves`);
   $("#detailMeta").textContent = metaBits.join("  ·  ");
 
   // progress
@@ -498,7 +500,7 @@ function renderDetail(job) {
     if (out.dataset.src !== m.output) { out.src = m.output; out.dataset.src = m.output; }
     outState.classList.add("hidden");
     $("#playerHitLayer").classList.remove("hidden");
-    $("#ballSpeed").classList.remove("hidden");
+    $("#pointTelemetry").classList.remove("hidden");
     $("#pointOutcome").classList.remove("hidden");
   } else {
     if (out.dataset.src || out.hasAttribute("src")) {
@@ -531,7 +533,7 @@ function renderDetail(job) {
     $("#processingPercent").textContent = `${Math.round(pct)}%`;
     $("#processingBar").value = pct;
     $("#playerHitLayer").classList.add("hidden");
-    $("#ballSpeed").classList.add("hidden");
+    $("#pointTelemetry").classList.add("hidden");
     $("#pointOutcome").classList.add("hidden");
   }
   updateProcessingClock(job);
@@ -542,6 +544,9 @@ function renderDetail(job) {
   // downloads
   setLink($("#dlOutput"), m.output_download);
   setLink($("#dlJson"), m.metadata_download);
+  const signalsAvailable = Boolean(job.result || job.signals_live
+    || ["queued", "running"].includes(job.status));
+  setLink($("#inspectSignals"), signalsAvailable ? `/jobs/${job.id}/signals` : null);
 
   // labeling section reflects the job's labeling status
   renderMatchSetup(job);
@@ -603,49 +608,35 @@ function currentOutputPoint(time = $("#outputVideo").currentTime) {
   return { point: layout[layout.length - 1], index: layout.length - 1 };
 }
 
+function pointOutcomeText(current) {
+  const participants = current?.point?.participants || {};
+  const point = current?.point || {};
+  const termination = point.termination || {};
+  const server = matchPlayerName(participants.server_id);
+  const endpoint = String(termination.source || "presentation estimate").replaceAll("_", " ");
+  const bits = [String(point.classification || "pose-confirmed rally").replaceAll("_", " ")];
+  bits.push(`Endpoint: ${endpoint}${termination.confidence ? ` (${termination.confidence})` : ""}`);
+  if (server) bits.push(`Serve: ${server}`);
+  bits.push("No bounce, line, let, or service outcome inferred");
+  return bits.join(" · ");
+}
+
 function updateOutputOverlay() {
   const current = currentOutputPoint();
   $("#currentPoint").textContent = current ? `Point ${current.index + 1}` : "Point —";
-  const estimate = current?.point?.ball_speed_estimate;
-  const speed = estimate?.value_kmh ?? current?.point?.peak_ball_speed_kmh;
-  const uncertainty = estimate?.uncertainty_kmh;
-  const readout = $("#ballSpeed");
-  if (Number.isFinite(speed)) {
-    const spread = Number.isFinite(uncertainty) ? ` ± ${Math.round(uncertainty)}` : "";
-    readout.textContent = `Ball ~${Math.round(speed)}${spread} km/h · uncertain ground-plane estimate`;
-    const limitations = Array.isArray(estimate?.limitations)
-      ? estimate.limitations.join("; ")
-      : "Single-camera court-plane estimate; ball height and full 3-D speed are not recovered.";
-    readout.title = limitations;
-  } else {
-    readout.textContent = "Ball speed unavailable";
-    readout.title = "Requires reliable ball trajectory and court calibration.";
-  }
   const outcome = $("#pointOutcome");
-  const participants = current?.point?.participants || {};
-  const termination = current?.point?.termination || {};
-  const server = matchPlayerName(participants.server_id);
-  const bits = [];
-  if (server) bits.push(`Server: ${server}`);
-  const winner = matchPlayerName(termination.winner_player_id)
-    || matchTeamName(termination.winner_team_id);
-  if (winner) bits.push(`Winner: ${winner}`);
-  const eventNames = {
-    double_fault: "Double fault", out: "Ball out", net_failure: "Hit into net",
-    second_bounce: "Second bounce", body_or_net_touch: "Player/net touch",
-  };
-  const creditNames = {
-    ace: "Ace", service_winner: "Service winner", clean_winner: "Winner",
-    forced_error: "Forced error", unforced_error: "Unforced error",
-    error_unknown: "Error",
-  };
-  const finish = creditNames[termination.credit] || eventNames[termination.rule_event];
-  if (finish) bits.push(`Finish: ${finish}`);
-  const errorPlayer = matchPlayerName(termination.error_player_id);
-  if (errorPlayer) bits.push(`Error: ${errorPlayer}`);
-  if (!bits.length) bits.push("Point result: insufficient evidence");
-  outcome.textContent = bits.join(" · ");
-  outcome.classList.toggle("unknown", !termination.rule_event || termination.rule_event === "unknown");
+  outcome.textContent = pointOutcomeText(current);
+  outcome.classList.remove("hidden");
+  outcome.classList.remove("unknown");
+  const actions = current?.point?.actions || [];
+  const actionCounts = actions.reduce((counts, action) => {
+    const name = action.action || "action";
+    counts[name] = (counts[name] || 0) + 1;
+    return counts;
+  }, {});
+  const summary = Object.entries(actionCounts).map(([name, count]) => `${count} ${name}`).join(" · ");
+  $("#pointActions").textContent = `Pose actions: ${summary || "unavailable"}`;
+  updateNativeFullscreenCue();
 }
 
 function matchPlayerName(playerId) {
@@ -681,9 +672,39 @@ function renderMatchSetup(job) {
   roster.forEach((player) => {
     const wrap = document.createElement("div");
     wrap.className = "match-player";
-    const badge = document.createElement("span");
+    const visual = document.createElement("div");
+    visual.className = "match-player-visual";
+    const gallery = document.createElement("div");
+    gallery.className = "match-player-gallery";
+    const thumbnails = Array.isArray(player.thumbnails) ? player.thumbnails : [];
+    thumbnails.forEach((thumbnail, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "match-player-thumb";
+      button.title = Number.isFinite(Number(thumbnail.time_s))
+        ? `Verify ${player.id} at ${fmtTime(Number(thumbnail.time_s))}`
+        : `Verify ${player.id}`;
+      const image = document.createElement("img");
+      image.src = thumbnail.url;
+      image.loading = "lazy";
+      image.alt = `${player.name || player.id} reference ${index + 1}`;
+      button.appendChild(image);
+      if (Number.isFinite(Number(thumbnail.time_s))) {
+        button.addEventListener("click", () => seekOriginal(Number(thumbnail.time_s)));
+      }
+      gallery.appendChild(button);
+    });
+    if (!thumbnails.length) {
+      const missing = document.createElement("span");
+      missing.className = "match-player-thumb-missing";
+      missing.textContent = "No clear crop";
+      gallery.appendChild(missing);
+    }
+    const badge = document.createElement("a");
     badge.className = "match-player-id";
-    badge.textContent = player.id;
+    badge.href = player.signal_gallery_url || `/jobs/${job.id}/signals/players/${player.id}`;
+    badge.textContent = `${player.id} · all crops →`;
+    visual.append(gallery, badge);
     const label = document.createElement("label");
     const team = player.team_id ? ` · ${player.team_id}` : "";
     label.append(document.createTextNode(`Player name${team}`));
@@ -694,10 +715,365 @@ function renderMatchSetup(job) {
     input.dataset.playerId = player.id;
     input.addEventListener("input", () => { $("#saveMatchRoster").disabled = false; });
     label.appendChild(input);
-    wrap.append(badge, label);
+    wrap.append(visual, label);
     box.appendChild(wrap);
   });
   $("#saveMatchRoster").disabled = !roster.length;
+}
+
+function signalChip(text, stateClass = "") {
+  const chip = document.createElement("span");
+  chip.className = `signal-chip ${stateClass}`.trim();
+  chip.textContent = text;
+  return chip;
+}
+
+function renderSignalDecision(container, title, detail, stateClass = "") {
+  const item = document.createElement("div");
+  item.className = `signal-decision ${stateClass}`.trim();
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  const body = document.createElement("p");
+  body.textContent = detail || "No additional evidence recorded";
+  item.append(heading, body);
+  container.appendChild(item);
+}
+
+function renderSignals(data) {
+  state.signalData = data;
+  const job = data.job || {};
+  $("#signalsTitle").textContent = `Pipeline signals · ${job.filename || "video"}`;
+  const processing = job.processing || {};
+  const stage = data.current_stage || processing.stage || "waiting";
+  const percent = Math.max(0, Math.min(100, Number(processing.percent) || 0));
+  $("#signalsMeta").textContent = `${fmtDur(Number(data.duration) || 0)} · ${job.status || "unknown"} · ${stage.replaceAll("_", " ")} · ${Math.round(percent)}%${data.live ? " · live" : ""}`;
+  $("#signalsBackJob").href = `/jobs/${job.id}`;
+
+  const rail = $("#signalStageRail");
+  rail.replaceChildren();
+  (data.stage_summary || []).forEach((stage) => {
+    const card = document.createElement("div");
+    card.className = `signal-stage ${stage.status || "recorded"}`;
+    const name = document.createElement("strong");
+    name.textContent = String(stage.name || "stage").replaceAll("_", " ");
+    const status = document.createElement("span");
+    status.textContent = stage.status || "recorded";
+    if (stage.reason) card.title = stage.reason;
+    card.append(name, status);
+    rail.appendChild(card);
+  });
+  if (!(data.stage_summary || []).length) {
+    rail.innerHTML = '<p class="muted small">Waiting for the first completed analysis stage…</p>';
+  }
+
+  const timeline = data.pose_timeline || {};
+  const candidates = data.candidate_generation || {};
+  const timelineView = $("#signalTimeline");
+  timelineView.replaceChildren();
+  if (Object.keys(timeline).length) {
+    timelineView.append(
+      signalChip(`${timeline.coarse_frames ?? 0} coarse frames`),
+      signalChip(`${timeline.refined_frames ?? 0} refined frames`),
+      signalChip(`${timeline.pose_records ?? 0} player poses`),
+      signalChip(`${(timeline.actors || []).length} actors`),
+      signalChip(`${timeline.frames_with_both_ends ?? 0} two-sided frames`),
+      signalChip(`${(timeline.between_like_intervals || []).length} between-point runs`),
+      signalChip(`${(timeline.engaged_like_intervals || []).length} engaged-play runs`),
+      signalChip(`${candidates.count ?? 0} point hypotheses`, candidates.count ? "ok" : "bad"),
+      signalChip(timeline.reused_player_detections ? "tracker boxes reused" : "box source unknown"),
+      signalChip(timeline.audio_used ? "audio used" : "audio disabled", timeline.audio_used ? "bad" : "ok"),
+      signalChip(timeline.ball_tracking_used ? "ball used" : "ball disabled", timeline.ball_tracking_used ? "bad" : "ok"),
+    );
+  } else {
+    timelineView.append(signalChip("waiting for pose timeline"));
+  }
+
+  const players = $("#signalPlayers");
+  players.replaceChildren();
+  (data.players || []).forEach((player) => {
+    const link = document.createElement("a");
+    link.className = "signal-player-card";
+    link.href = player.signal_gallery_url || `/jobs/${job.id}/signals/players/${encodeURIComponent(player.id)}`;
+    const image = document.createElement("img");
+    const images = player.inspection_images || player.thumbnails || [];
+    if (images[0]?.url) image.src = images[0].url;
+    image.alt = `${player.name || player.id} crop`;
+    image.loading = "lazy";
+    const text = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = player.name || player.id;
+    const detail = document.createElement("span");
+    detail.textContent = `${player.id} · ${player.team_id || "team unknown"} · ${images.length} retained crops`;
+    text.append(name, detail);
+    link.append(image, text);
+    players.appendChild(link);
+  });
+  if (!(data.players || []).length) {
+    players.innerHTML = '<p class="muted">No persistent player identities were published.</p>';
+  }
+
+  const serveStage = data.serve_pose || {};
+  const serves = serveStage.observations || [];
+  $("#signalServeSummary").textContent = `${serves.length} proposals · ${serves.filter((item) => item.pose_accepted).length} pose/formation accepted`;
+  const serveGrid = $("#signalServes");
+  serveGrid.replaceChildren();
+  serves.forEach((serve) => {
+    const card = document.createElement("article");
+    card.className = `signal-serve-card ${serve.pose_accepted ? "accept" : "reject"}`;
+    if (serve.image) {
+      const image = document.createElement("img");
+      image.src = serve.image;
+      image.loading = "lazy";
+      image.alt = `Serve proposal ${serve.index + 1}`;
+      card.appendChild(image);
+    } else {
+      const missing = document.createElement("div");
+      missing.className = "signal-image-placeholder";
+      missing.textContent = "Annotated frame unavailable for this older result";
+      card.appendChild(missing);
+    }
+    const body = document.createElement("div");
+    body.className = "signal-serve-body";
+    const head = document.createElement("div");
+    head.className = "signal-serve-head";
+    const title = document.createElement("strong");
+    title.textContent = `Proposal ${serve.index + 1} · ${fmtTime(Number(serve.time) || 0)}`;
+    const decision = signalChip(serve.pose_accepted ? "accepted" : "rejected",
+      serve.pose_accepted ? "ok" : "bad");
+    head.append(title, decision);
+    const chips = document.createElement("div");
+    chips.className = "signal-chip-row";
+    chips.append(
+      signalChip(`sequence ${serve.serve_sequence ? "yes" : "no"}`, serve.serve_sequence ? "ok" : "bad"),
+      signalChip(`wrist rise ${Number(serve.wrist_rise_span || 0).toFixed(2)} torso`, Number(serve.wrist_rise_span) > 0 ? "ok" : "bad"),
+      signalChip(`server load ${serve.server_load_frames}`),
+      signalChip(`bent knee ${serve.knee_bend_frames}`),
+      signalChip(`leg drive ${serve.leg_drive_frames}`),
+      signalChip(`baseline ${serve.server_baseline_frames}`),
+      signalChip(`opposed formation ${serve.opposed_formation_frames}`, serve.opposed_formation_frames >= 2 ? "ok" : "bad"),
+      signalChip(`racket ${serve.racket_wrist_associated ? "observed" : "pose proxy"}`, serve.racket_wrist_associated ? "ok" : ""),
+      signalChip(`server court x ${serve.server_court_x_m == null ? "unknown" : Number(serve.server_court_x_m).toFixed(2) + "m"}`),
+      signalChip(`pose frames ${serve.pose_frames}/${serve.sampled_frames}`),
+    );
+    body.append(head, chips);
+    card.appendChild(body);
+    serveGrid.appendChild(card);
+  });
+  if (!serves.length) {
+    serveGrid.innerHTML = '<p class="muted">This result predates persisted serve-pose observations or produced no proposals.</p>';
+  }
+
+  const actionStage = data.racket_actions || {};
+  const actions = actionStage.actions || [];
+  const decisions = actionStage.decisions || [];
+  const acceptedActions = actions.filter((item) => item.accepted !== false);
+  const rejectedActions = actions.filter((item) => item.accepted === false);
+  $("#signalActionSummary").textContent = `${actionStage.raw_action_proposals ?? "—"} raw proposals → ${actions.length} stroke episodes → ${acceptedActions.length} sequence-accepted · ${decisions.filter((item) => item.accepted).length}/${decisions.length} rallies kept`;
+  const actionGrid = $("#signalActions");
+  actionGrid.replaceChildren();
+  actions.forEach((action) => {
+    const card = document.createElement("article");
+    const accepted = action.accepted !== false;
+    card.className = `signal-serve-card ${accepted ? "accept" : "reject"}`;
+    if (action.image) {
+      const image = document.createElement("img");
+      image.src = action.image;
+      image.loading = "lazy";
+      image.alt = `${action.action || "stroke"} by ${action.actor_id || "player"}`;
+      card.appendChild(image);
+    }
+    const body = document.createElement("div");
+    body.className = "signal-serve-body";
+    const head = document.createElement("div");
+    head.className = "signal-serve-head";
+    const title = document.createElement("strong");
+    title.textContent = `${action.action || "stroke"} · ${action.actor_id || "unassigned"} · ${fmtTime(Number(action.time) || 0)}`;
+    head.append(title,
+      signalChip(accepted ? "sequence accepted" : "rejected", accepted ? "ok" : "bad"),
+      signalChip(`${Math.round(Number(action.confidence || 0) * 100)}%`, accepted ? "ok" : "bad"));
+    const chips = document.createElement("div");
+    chips.className = "signal-chip-row";
+    chips.append(
+      signalChip(`${action.hand || "?"} hand`),
+      signalChip(`backswing ${Number(action.backswing_body_lengths || 0).toFixed(2)}`),
+      signalChip(`forward ${Number(action.forward_span_body_lengths || 0).toFixed(2)}`),
+      signalChip(`follow ${Number(action.follow_through_body_lengths || 0).toFixed(2)}`),
+      signalChip(`speed ${Number(action.forward_speed_body_lengths_s || 0).toFixed(2)} torso/s`),
+      signalChip(`actor ${action.actor_end || "unknown"} end`),
+      signalChip(`racket ${action.racket_wrist_associated ? "observed" : "pose proxy"}`, action.racket_wrist_associated ? "ok" : ""),
+      signalChip(`${action.proposal_count || 1} local peak${Number(action.proposal_count || 1) === 1 ? "" : "s"}`),
+      ...(action.rejection_reason ? [signalChip(String(action.rejection_reason).replaceAll("_", " "), "bad")] : []),
+    );
+    body.append(head, chips);
+    card.appendChild(body);
+    actionGrid.appendChild(card);
+  });
+  decisions.forEach((decision, index) => renderSignalDecision(
+    actionGrid,
+    `Point window ${index + 1} · ${String(decision.classification || (decision.accepted ? "accepted" : "rejected")).replaceAll("_", " ")}`,
+    `${decision.reason || "no reason"} · ${decision.raw_action_count || 0} raw proposals · ${decision.action_count || 0} episodes · ${decision.accepted_action_count || 0} sequence-accepted · endpoint ${decision.endpoint_source ? String(decision.endpoint_source).replaceAll("_", " ") : "none"}${decision.endpoint_confidence ? ` (${decision.endpoint_confidence})` : ""}`,
+    decision.accepted ? "accept" : "reject",
+  ));
+  decisions.forEach((decision, index) => {
+    (decision.service_attempts || []).forEach((attempt) => renderSignalDecision(
+      actionGrid,
+      `Window ${index + 1} · service attempt ${Number(attempt.attempt_index) + 1} · ${fmtTime(Number(attempt.time))}`,
+      `${String(attempt.disposition || "unresolved").replaceAll("_", " ")} · ${attempt.server_end || "unknown"} end / ${attempt.server_court_half || "unknown"} half · ${attempt.rule_limit || "ball outcome unavailable"}`,
+      attempt.disposition === "playable_service_candidate" ? "accept" : "recorded",
+    ));
+    (decision.state_transitions || []).forEach((transition) => renderSignalDecision(
+      actionGrid,
+      `State · ${transition.from || "?"} → ${transition.to || "?"} · ${fmtTime(Number(transition.time))}`,
+      transition.reason || "No transition evidence recorded",
+      transition.to === "LIVE_POINT" ? "accept" : "recorded",
+    ));
+  });
+  if (!actions.length && !decisions.length) renderSignalDecision(actionGrid, "No racket actions", actionStage.reason || "No pose-confirmed point windows were published");
+
+  const endpoints = data.endpoints || {};
+  const endpointList = $("#signalEndpoints");
+  endpointList.replaceChildren();
+  const semantic = endpoints.semantic_rule_endpoints || endpoints.records || [];
+  const presentation = endpoints.visual_presentation_endpoints || [];
+  semantic.forEach((item) => renderSignalDecision(
+    endpointList,
+    `Point ${Number(item.point_index) + 1} · ${item.rule_event || "rule endpoint"}`,
+    `event ${fmtTime(Number(item.event_time))} · previous end ${fmtTime(Number(item.previous_end))}`,
+    "accept",
+  ));
+  presentation.forEach((item) => renderSignalDecision(
+    endpointList,
+    `Point ${Number(item.point_index) + 1} · presentation trim`,
+    `${fmtTime(Number(item.presentation_time))} · ${String(item.visual_dead_signal || item.semantic_rule_event || "player transition cue").replaceAll("_", " ")}${item.endpoint_confidence ? ` · ${item.endpoint_confidence} confidence` : ""}`,
+    "recorded",
+  ));
+  const quality = data.quality_control || {};
+  if (Object.keys(quality).length) renderSignalDecision(
+    endpointList,
+    `Output quality guard · ${quality.status || "recorded"}`,
+    `${Math.round(Number(quality.retention_fraction || 0) * 100)}% retained before guard · ${Math.round(Number(quality.zero_post_serve_stroke_fraction || 0) * 100)}% without observed post-serve strokes · ${Number(quality.boundary_invariant_violations || 0)} boundary violations${quality.reason ? ` · ${quality.reason}` : ""}${(quality.warnings || []).length ? ` · ${quality.warnings.join(" · ")}` : ""}`,
+    quality.status === "rejected" ? "reject" : "accept",
+  );
+  if (!semantic.length && !presentation.length) {
+    (data.points || []).forEach((point, index) => {
+      const termination = point.termination || {};
+      renderSignalDecision(endpointList, `Point ${index + 1} · ${termination.rule_event || "unknown"}`,
+        termination.evidence?.join(" · ") || "No terminal rule evidence");
+    });
+  }
+  if (!endpointList.children.length) renderSignalDecision(endpointList, "No endpoint evidence", "No validated points were published");
+  $("#signalRaw").textContent = JSON.stringify(data, null, 2);
+}
+
+async function openSignals(jobId) {
+  stopGoldenPolling();
+  stopPolling();
+  stopProcessingClock();
+  stopSignalPolling();
+  const generation = state.signalGeneration;
+  showView("signals");
+  window.scrollTo(0, 0);
+  try {
+    const data = await api(`/api/jobs/${jobId}/signals`, { cache: "no-store" });
+    if (generation !== state.signalGeneration || $("#signalsView").classList.contains("hidden")) return;
+    renderSignals(data);
+    state.signalRevision = signalRevision(data);
+    scheduleSignalPoll(jobId, null, generation, data);
+  } catch (error) {
+    toast(`Could not load signals: ${error.message}`, "error");
+  }
+}
+
+function renderPlayerSignals(data, jobId) {
+    const player = data.player || {};
+    $("#playerSignalsBack").href = `/jobs/${jobId}/signals`;
+    $("#playerSignalsTitle").textContent = player.name || player.id || "Player";
+    const images = player.inspection_images || player.thumbnails || [];
+    const stage = data.current_stage ? ` · ${String(data.current_stage).replaceAll("_", " ")}` : "";
+    $("#playerSignalsMeta").textContent = `${player.id || ""} · ${player.team_id || "team unknown"} · ${images.length} retained identity observations${stage}${data.live ? " · live" : ""}`;
+    const gallery = $("#playerSignalGallery");
+    gallery.replaceChildren();
+    images.forEach((image, index) => {
+      const figure = document.createElement("figure");
+      figure.className = "player-signal-item";
+      const link = document.createElement("a");
+      const time = Number(image.time_s);
+      link.href = `/jobs/${jobId}${Number.isFinite(time) ? `?seek=${encodeURIComponent(time)}` : ""}`;
+      const element = document.createElement("img");
+      element.src = image.url;
+      element.loading = "lazy";
+      element.alt = `${player.name || player.id} observation ${index + 1}`;
+      link.appendChild(element);
+      const caption = document.createElement("figcaption");
+      const count = document.createElement("span");
+      count.textContent = `#${index + 1}`;
+      const timestamp = document.createElement("span");
+      timestamp.textContent = Number.isFinite(time) ? fmtTime(time) : "time unknown";
+      caption.append(count, timestamp);
+      figure.append(link, caption);
+      gallery.appendChild(figure);
+    });
+    $("#playerSignalEmpty").classList.toggle("hidden", Boolean(images.length));
+}
+
+async function openPlayerSignals(jobId, playerId) {
+  stopGoldenPolling();
+  stopPolling();
+  stopProcessingClock();
+  stopSignalPolling();
+  const generation = state.signalGeneration;
+  showView("player-signals");
+  window.scrollTo(0, 0);
+  try {
+    const data = await api(`/api/jobs/${jobId}/signals/players/${encodeURIComponent(playerId)}`, { cache: "no-store" });
+    if (generation !== state.signalGeneration || $("#playerSignalsView").classList.contains("hidden")) return;
+    renderPlayerSignals(data, jobId);
+    state.signalRevision = signalRevision(data);
+    scheduleSignalPoll(jobId, playerId, generation, data);
+  } catch (error) {
+    toast(`Could not load player signals: ${error.message}`, "error");
+  }
+}
+
+function stopSignalPolling() {
+  clearTimeout(state.signalPollTimer);
+  state.signalPollTimer = null;
+  state.signalGeneration += 1;
+  state.signalRevision = "";
+}
+
+function signalRevision(data) {
+  const processing = data?.job?.processing || {};
+  return JSON.stringify([
+    data?.updated_at, data?.job?.status, data?.current_stage,
+    processing.stage, processing.percent, processing.detail,
+  ]);
+}
+
+function scheduleSignalPoll(jobId, playerId, generation, data) {
+  const processing = ["queued", "running"].includes(data?.job?.status);
+  if (state.signalPollTimer || generation !== state.signalGeneration) return;
+  state.signalPollTimer = setTimeout(async () => {
+    state.signalPollTimer = null;
+    if (generation !== state.signalGeneration) return;
+    const path = playerId
+      ? `/api/jobs/${jobId}/signals/players/${encodeURIComponent(playerId)}`
+      : `/api/jobs/${jobId}/signals`;
+    try {
+      const fresh = await api(path, { cache: "no-store" });
+      if (generation !== state.signalGeneration) return;
+      const revision = signalRevision(fresh);
+      if (revision !== state.signalRevision) {
+        if (playerId) renderPlayerSignals(fresh, jobId);
+        else renderSignals(fresh);
+        state.signalRevision = revision;
+      }
+      scheduleSignalPoll(jobId, playerId, generation, fresh);
+    } catch (error) {
+      if (generation !== state.signalGeneration) return;
+      scheduleSignalPoll(jobId, playerId, generation, data);
+    }
+  }, processing ? 1500 : 5000);
 }
 
 async function saveMatchRoster() {
@@ -791,7 +1167,7 @@ async function loadWaveform(id, generation = state.detailGeneration) {
   try {
     waveform = await api(`/api/jobs/${id}/waveform`);
   } catch (_) {
-    waveform = { duration: (state.current?.result || {}).total_seconds || 0, strikes: [], segments: [] };
+    waveform = { duration: (state.current?.result || {}).total_seconds || 0, serves: [], segments: [] };
   }
   if (!detailRequestIsCurrent(id, generation)) return false;
   state.waveform = waveform;
@@ -831,9 +1207,9 @@ function drawTimeline() {
       const w = Math.max(1.5, x(e) - x0);
       ctx.fillRect(x0, H * 0.22, w, H * 0.6);
     }
-    // strikes
+    // visually confirmed service actions
     ctx.fillStyle = "rgba(184,84,42,0.9)";
-    for (const t of wf.strikes || []) ctx.fillRect(x(t), H * 0.08, 1, H * 0.24);
+    for (const t of wf.serves || []) ctx.fillRect(x(t), H * 0.08, 1, H * 0.24);
 
     // playhead
     const ov = $("#originalVideo");
@@ -844,7 +1220,7 @@ function drawTimeline() {
   }
   const segN = (state.editSegments || wf.segments || []).length;
   $("#timelineMeta").textContent =
-    `${fmtDur(dur)} total · ${(wf.strikes || []).length} strikes · ${segN} rallies` +
+    `${fmtDur(dur)} total · ${(wf.serves || []).length} visual serves · ${segN} rallies` +
     (dur ? " · click to seek" : "");
   cv._seekDur = dur;
 }
@@ -866,7 +1242,60 @@ function setupTimelineInteractions() {
     $("#outTime").textContent = fmtTime($("#outputVideo").currentTime);
     updateOutputOverlay();
   });
-  window.addEventListener("resize", () => { if (state.waveform) drawTimeline(); });
+  ["loadedmetadata", "seeked", "pause"].forEach((eventName) => {
+    $("#outputVideo").addEventListener(eventName, updateOutputOverlay);
+  });
+  window.addEventListener("resize", () => {
+    if (state.waveform) drawTimeline();
+  });
+}
+
+function updateNativeFullscreenCue() {
+  const cue = state.fullscreenTelemetryCue;
+  if (!cue) return;
+  cue.text = [
+    $("#pointOutcome").textContent,
+    $("#pointActions").textContent,
+  ].filter(Boolean).join("\n");
+}
+
+function syncNativeFullscreenOverlay() {
+  const output = $("#outputVideo");
+  const activeElement = document.fullscreenElement || document.webkitFullscreenElement || null;
+  const active = activeElement === output || state.webkitVideoFullscreen;
+  if (state.fullscreenTelemetryTrack) {
+    state.fullscreenTelemetryTrack.mode = active ? "showing" : "disabled";
+  }
+  updateNativeFullscreenCue();
+}
+
+function setupNativeFullscreenOverlay(output) {
+  if (typeof window.VTTCue !== "function" || typeof output.addTextTrack !== "function") return;
+  try {
+    const track = output.addTextTrack("captions", "Rally point result", "en");
+    const cue = new VTTCue(0, 24 * 60 * 60, "");
+    cue.line = 1;
+    cue.position = 98;
+    cue.align = "end";
+    cue.size = 58;
+    track.addCue(cue);
+    track.mode = "disabled";
+    state.fullscreenTelemetryTrack = track;
+    state.fullscreenTelemetryCue = cue;
+    document.addEventListener("fullscreenchange", syncNativeFullscreenOverlay);
+    document.addEventListener("webkitfullscreenchange", syncNativeFullscreenOverlay);
+    output.addEventListener("webkitbeginfullscreen", () => {
+      state.webkitVideoFullscreen = true;
+      syncNativeFullscreenOverlay();
+    });
+    output.addEventListener("webkitendfullscreen", () => {
+      state.webkitVideoFullscreen = false;
+      syncNativeFullscreenOverlay();
+    });
+  } catch (_error) {
+    state.fullscreenTelemetryTrack = null;
+    state.fullscreenTelemetryCue = null;
+  }
 }
 
 function setupVideoPlayer() {
@@ -887,6 +1316,9 @@ function setupVideoPlayer() {
   // requires a double-click to avoid accidental point jumps.
   previous.addEventListener("click", (e) => { if (e.detail === 0) seekOutputPoint(-1); });
   next.addEventListener("click", (e) => { if (e.detail === 0) seekOutputPoint(1); });
+
+  const output = $("#outputVideo");
+  setupNativeFullscreenOverlay(output);
 
 }
 
@@ -1435,45 +1867,18 @@ document.addEventListener("keydown", (e) => {
 // --------------------------------------------------------------------------- //
 // boot                                                                        //
 // --------------------------------------------------------------------------- //
-// Reflect optional-feature availability from the backend: disable the ball-arbiter
-// toggle (and note why) when TrackNet weights / PyTorch aren't installed, so the user
-// isn't surprised by a silent fallback mid-job.
-async function loadCapabilities() {
-  const box = $("#ballArbiter");
-  if (!box) return;
-  try {
-    const caps = await api("/api/capabilities");
-    const ba = caps.ball_arbiter || {};
-    const label = box.closest("label");
-    if (!ba.available) {
-      box.checked = false;
-      box.disabled = true;
-      if (label) {
-        label.classList.add("disabled");
-        if (ba.hint) label.title = ba.hint;
-        if (!label.querySelector(".cap-note")) {
-          const note = document.createElement("span");
-          note.className = "cap-note";
-          note.textContent = " (weights not installed)";
-          label.appendChild(note);
-        }
-      }
-    }
-    const players = caps.players || {};
-    const playerBox = $("#detectPlayers");
-    if (playerBox && !players.available) {
-      playerBox.checked = false;
-      playerBox.disabled = true;
-      const playerLabel = playerBox.closest("label");
-      if (playerLabel) {
-        playerLabel.classList.add("disabled");
-        playerLabel.title = players.hint || "Player detector unavailable";
-      }
-    }
-  } catch (_) { /* capabilities are best-effort; leave the toggle as-is */ }
+function initialRoute() {
+  const path = window.location.pathname;
+  let match = path.match(/^\/jobs\/([0-9a-f-]+)\/signals\/players\/([^/]+)$/i);
+  if (match) return { view: "player-signals", jobId: match[1], playerId: decodeURIComponent(match[2]) };
+  match = path.match(/^\/jobs\/([0-9a-f-]+)\/signals\/?$/i);
+  if (match) return { view: "signals", jobId: match[1] };
+  match = path.match(/^\/jobs\/([0-9a-f-]+)\/?$/i);
+  if (match) return { view: "detail", jobId: match[1] };
+  return { view: "gallery" };
 }
 
-function init() {
+async function init() {
   setupUpload();
   setupDetailActions();
   setupSegmentEditor();
@@ -1481,7 +1886,17 @@ function init() {
   setupVideoPlayer();
   $("#saveMatchRoster").addEventListener("click", saveMatchRoster);
   setupLabeling();
-  loadCapabilities();
-  refreshGallery();
+  const route = initialRoute();
+  if (route.view === "signals") {
+    await openSignals(route.jobId);
+  } else if (route.view === "player-signals") {
+    await openPlayerSignals(route.jobId, route.playerId);
+  } else if (route.view === "detail") {
+    await openDetail(route.jobId);
+    const seek = Number(new URLSearchParams(window.location.search).get("seek"));
+    if (Number.isFinite(seek)) seekOriginal(seek);
+  } else {
+    refreshGallery();
+  }
 }
 document.addEventListener("DOMContentLoaded", init);

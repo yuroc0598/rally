@@ -2,35 +2,29 @@
 #
 # One-shot setup for rally-web.
 #
-# Installs all Python dependencies and prepares the three inference checkpoints used by
-# the accuracy-first pipeline: TrackNet, YOLO12, and RTMPose. Idempotent — safe to re-run;
+# Installs all Python dependencies and prepares every inference checkpoint used by the
+# vision-first pipeline: court landmarks, YOLO12 target-player identity tracking, and a
+# shared RTMPose all-player timeline with focused serve/stroke refinement.
+# Idempotent — safe to re-run;
 # existing checkpoints are checksum-verified and reused.
 #
 #   ./setup.sh
 #
 # Overrides (env vars):
 #   PYTHON=python3.12        pick a specific interpreter
-#   WEIGHTS_DRIVE_ID=<id>    use a different Google Drive file id for the weights
-#   WEIGHTS_SHA256=<digest>   expected identity (set empty only for an intentionally unpinned custom model)
 #   YOLO_MODEL_NAME=<name>    Ultralytics detection checkpoint (default: yolo12n.pt)
 #   YOLO_SHA256=<digest>      expected YOLO identity (empty permits a custom checkpoint)
 #   RTMPOSE_URL=<url>         RTMPose ONNX SDK zip download
 #   RTMPOSE_ZIP_SHA256=<hex>  expected archive identity (empty permits a custom archive)
 #   RTMPOSE_SHA256=<hex>      expected extracted ONNX identity
+#   COURT_DRIVE_ID=<id>       pinned ResNet50 14-landmark court checkpoint
+#   COURT_PATH=<path>         court-checkpoint install path
+#   COURT_SHA256=<hex>        required court-checkpoint identity
 #
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PY="${PYTHON:-python3}"
-WEIGHTS_DRIVE_ID="${WEIGHTS_DRIVE_ID:-1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl}"
-if [ "${WEIGHTS_SHA256+x}" = x ]; then
-  WEIGHTS_SHA256="$WEIGHTS_SHA256"
-elif [ "$WEIGHTS_DRIVE_ID" = "1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl" ]; then
-  WEIGHTS_SHA256="c735bc1a1b13a35f179c6492f778ef4ebb9bffd512a96f4d970b32e076653076"
-else
-  WEIGHTS_SHA256=""
-fi
-WEIGHTS_PATH="models/tracknet.pt"
 YOLO_MODEL_NAME="${YOLO_MODEL_NAME:-yolo12n.pt}"
 YOLO_PATH="${YOLO_PATH:-models/$YOLO_MODEL_NAME}"
 if [ "${YOLO_SHA256+x}" != x ]; then
@@ -46,6 +40,9 @@ RTMPOSE_ARCHIVE="${RTMPOSE_ARCHIVE:-models/${RTMPOSE_BASENAME}.zip}"
 RTMPOSE_PATH="${RTMPOSE_PATH:-models/${RTMPOSE_BASENAME}.onnx}"
 RTMPOSE_ZIP_SHA256="${RTMPOSE_ZIP_SHA256-f7fbb6c5c11a1bb70f3d445e4ddec5d144ea89ad5649c081ef976f9b24a0b741}"
 RTMPOSE_SHA256="${RTMPOSE_SHA256-5c0a4bf67953e6d2ac43ce15e77dc9d5d354ae18430a47d2c5963a7bc5683e3c}"
+COURT_DRIVE_ID="${COURT_DRIVE_ID:-1QrTOF1ToQ4plsSZbkBs3zOLkVt3MBlta}"
+COURT_PATH="${COURT_PATH:-models/court_keypoints_resnet50.pth}"
+COURT_SHA256="${COURT_SHA256:-16ebb7e46dc88247440c86b388e4f07f0d4abb76ce0a01a22925d3163f7fb7f3}"
 
 mkdir -p models
 
@@ -129,7 +126,7 @@ fi
 # the headless wheel. It was installed above with the server extra; removing only the GUI
 # distribution and force-reinstalling headless keeps one deterministic cv2 implementation
 # while retaining player/pose inference for match-state validation.
-echo "[setup] player geometry + serve-pose validation enabled with headless OpenCV."
+echo "[setup] player identity tracking + shared pose-timeline inference enabled with headless OpenCV."
 
 # RTMLib uses ONNX Runtime for RTMPose. The server extra installs the universally
 # compatible CPU wheel. CUDA acceleration is optional; a failed GPU-wheel upgrade keeps
@@ -204,11 +201,11 @@ else
   fi
 fi
 
-# 3) YOLO12 person-detection weights. Ultralytics owns the release download logic; setup
+# 3) YOLO12 person/racket detection weights. Ultralytics owns the release download logic; setup
 #    forces the download now instead of making the first video-processing job wait for it.
 #    A pinned default digest prevents a changed/corrupt asset from silently affecting the
 #    target-court and serve-setup signals. Custom names may set YOLO_SHA256="".
-echo "[setup] preparing YOLO12 player detector at $YOLO_PATH ..."
+echo "[setup] preparing YOLO12 player/racket detector at $YOLO_PATH ..."
 if ! YOLO_MODEL_NAME="$YOLO_MODEL_NAME" YOLO_PATH="$YOLO_PATH" YOLO_SHA256="$YOLO_SHA256" \
   "$PY" - <<'PYEOF'
 import hashlib
@@ -251,7 +248,11 @@ if not target.is_file():
 actual = digest(target)
 if expected and actual != expected:
     raise RuntimeError(f"YOLO SHA-256 mismatch: expected {expected}, got {actual}")
-YOLO(str(target))  # parse the checkpoint now so an incompatible file fails setup
+model = YOLO(str(target))  # parse the checkpoint now so an incompatible file fails setup
+names = model.names or {}
+label = names.get(38) if isinstance(names, dict) else (names[38] if len(names) > 38 else None)
+if str(label).lower().replace("_", " ") != "tennis racket":
+    raise RuntimeError("YOLO checkpoint lacks COCO tennis-racket class 38")
 print(f"[setup] YOLO ready: {target} (sha256={actual})")
 PYEOF
 then
@@ -395,41 +396,29 @@ then
   exit 1
 fi
 
-# 5) ball-tracking weights (auto-discovered from models/). fetch_models verifies the
-#    checkpoint loads into BallTrackerNet before installing it.
-#    TrackNet is required by the accuracy-first web server. External-host or verification
-#    failures are fatal so setup can never report success for an audio-only installation.
-if [ -f "$WEIGHTS_PATH" ]; then
-  echo "[setup] weights already present at $WEIGHTS_PATH — verifying ..."
-  if [ -n "$WEIGHTS_SHA256" ]; then
-    if ! "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH" --sha256 "$WEIGHTS_SHA256"; then
-      INVALID_PATH="${WEIGHTS_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
-      mv "$WEIGHTS_PATH" "$INVALID_PATH"
-      echo "[setup] invalid checkpoint quarantined at $INVALID_PATH" >&2
-    fi
-  else
-    if ! "$PY" -m rally.tools.fetch_models --verify "$WEIGHTS_PATH"; then
-      INVALID_PATH="${WEIGHTS_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
-      mv "$WEIGHTS_PATH" "$INVALID_PATH"
-      echo "[setup] invalid checkpoint quarantined at $INVALID_PATH" >&2
-    fi
+# 5) Learned court landmarks. This is mandatory; the independent line/homography path is
+#    retained as an inference fallback, not as an excuse for an incomplete installation.
+if [ -f "$COURT_PATH" ]; then
+  echo "[setup] court keypoint weights already present at $COURT_PATH — verifying ..."
+  if ! "$PY" -m rally.tools.fetch_models --backend court \
+      --verify "$COURT_PATH" --dest "$COURT_PATH" --sha256 "$COURT_SHA256"; then
+    INVALID_PATH="${COURT_PATH}.invalid.$(date +%Y%m%d%H%M%S)"
+    mv "$COURT_PATH" "$INVALID_PATH"
+    echo "[setup] invalid court checkpoint quarantined at $INVALID_PATH" >&2
   fi
 fi
-if [ ! -f "$WEIGHTS_PATH" ]; then
-  echo "[setup] fetching TrackNet ball-tracking weights ..."
-  if [ -n "$WEIGHTS_SHA256" ]; then
-    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID" --sha256 "$WEIGHTS_SHA256"
-  else
-    "$PY" -m rally.tools.fetch_models --drive-id "$WEIGHTS_DRIVE_ID"
-  fi
+if [ ! -f "$COURT_PATH" ]; then
+  echo "[setup] fetching pinned tennis-court keypoint weights ..."
+  "$PY" -m rally.tools.fetch_models --backend court \
+    --drive-id "$COURT_DRIVE_ID" --dest "$COURT_PATH" --sha256 "$COURT_SHA256"
 fi
 
 echo
 echo "[setup] running strict server preflight ..."
 "$PY" -m rally.preflight \
-  --tracknet "$WEIGHTS_PATH" --yolo "$YOLO_PATH" --rtmpose "$RTMPOSE_PATH"
-echo "[setup] ✅ TrackNet ready: $WEIGHTS_PATH"
-echo "[setup] ✅ YOLO player detection ready: $YOLO_PATH"
-echo "[setup] ✅ RTMPose serve-pose validation ready: $RTMPOSE_PATH"
+  --yolo "$YOLO_PATH" --rtmpose "$RTMPOSE_PATH" --court "$COURT_PATH"
+echo "[setup] ✅ YOLO player/racket detection ready: $YOLO_PATH"
+echo "[setup] ✅ RTMPose temporal serve/stroke poses ready: $RTMPOSE_PATH"
+echo "[setup] ✅ learned court-keypoint detection ready: $COURT_PATH"
 echo "  Web UI:  $PY -m rally.web.app        # then open http://127.0.0.1:8000"
 echo "  CLI:     $PY -m rally.cli match.mp4 -o rallies.mp4 --json rallies.json"

@@ -43,7 +43,13 @@ class Court:
         court = np.array([[0, 0], [DOUBLES_W, 0], [DOUBLES_W, NET_Y], [0, NET_Y]],
                          dtype=np.float32)
         H = cv2.getPerspectiveTransform(img, court)
-        return cls(H_img2court=H, H_court2img=np.linalg.inv(H), corners_img=img)
+        inverse = np.linalg.inv(H)
+        outer_court = np.array(
+            [[0, 0], [DOUBLES_W, 0], [DOUBLES_W, COURT_L], [0, COURT_L]],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        outer_img = cv2.perspectiveTransform(outer_court, inverse).reshape(-1, 2)
+        return cls(H_img2court=H, H_court2img=inverse, corners_img=outer_img)
 
     @classmethod
     def from_image_corners(cls, near_left, near_right, far_right, far_left) -> "Court":

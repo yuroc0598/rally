@@ -16,54 +16,40 @@ dependencies = [
 
 [project.optional-dependencies]
 headless = ["opencv-python-headless>=4.8"]
-players = ["opencv-python>=4.8", "ultralytics>=8.3.78"]
+players = ["opencv-python>=4.8", "ultralytics>=8.3.78", "lap>=0.5.12"]
 pose = ["rtmlib>=0.0.15", "onnxruntime>=1.17"]
-ball = ["torch>=2.0", "gdown>=5.0"]
 web = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
 ]
 dev = ["pytest>=7.0", "httpx>=0.27"]
-training = ["scikit-learn>=1.3", "joblib>=1.3"]
 server = [
     "opencv-python-headless>=4.8",
     "ultralytics>=8.3.78",
+    "lap>=0.5.12",
     "rtmlib>=0.0.15",
     "onnxruntime>=1.17",
     "torch>=2.0",
+    "torchvision>=0.15",
     "gdown>=5.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
-    "httpx>=0.27",
 ]
 desktop = [
     "opencv-python>=4.8",
     "ultralytics>=8.3.78",
+    "lap>=0.5.12",
     "rtmlib>=0.0.15",
     "onnxruntime>=1.17",
     "torch>=2.0",
+    "torchvision>=0.15",
     "gdown>=5.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
-    "httpx>=0.27",
 ]
-# Backward-compatible alias for the headless/server feature set.
-all = [
-    "opencv-python-headless>=4.8",
-    "ultralytics>=8.3.78",
-    "rtmlib>=0.0.15",
-    "onnxruntime>=1.17",
-    "torch>=2.0",
-    "gdown>=5.0",
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "python-multipart>=0.0.9",
-    "httpx>=0.27",
-]
-
 [project.scripts]
 rally = "rally.cli:main"
 rally-web = "rally.web.app:main"
@@ -73,6 +59,7 @@ rally-evaluate = "rally.tools.evaluate:main"
 include = ["rally*"]
 
 [tool.setuptools.package-data]
+"rally" = ["trackers/*.yaml"]
 "rally.web" = ["static/*"]
 
 [tool.pytest.ini_options]
