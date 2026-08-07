@@ -64,10 +64,9 @@ def _validate_paths(input_path: str, output_path: str | None, json_path: str | N
         return left.resolve(strict=False) == right.resolve(strict=False)
 
     for index, (left_name, left) in enumerate(present):
-        for right_name, right in present[index + 1:]:
+        for right_name, right in present[index + 1 :]:
             if aliases(left, right):
-                raise ValueError(
-                    f"{left_name} and {right_name} paths must differ: {left}")
+                raise ValueError(f"{left_name} and {right_name} paths must differ: {left}")
 
 
 def _resolve_court(input_path: str, cfg: RallyConfig, progress: Progress):
@@ -165,28 +164,19 @@ def _continuous_pose_stage(
         progress_callback=progress,
         cancel_check=cancel_check,
     )
-    between_intervals: list[list[float]] = []
-    engaged_intervals: list[list[float]] = []
-    between_start: float | None = None
-    engaged_start: float | None = None
+    relaxed_intervals: list[list[float]] = []
+    relaxed_start: float | None = None
     prior_time = 0.0
     for frame in timeline.frames:
         frame_time = float(frame["time"])
-        if frame.get("between_like") and between_start is None:
-            between_start = frame_time
-        elif not frame.get("between_like") and between_start is not None:
-            between_intervals.append([round(between_start, 3), round(prior_time, 3)])
-            between_start = None
-        if frame.get("engaged_like") and engaged_start is None:
-            engaged_start = frame_time
-        elif not frame.get("engaged_like") and engaged_start is not None:
-            engaged_intervals.append([round(engaged_start, 3), round(prior_time, 3)])
-            engaged_start = None
+        if frame.get("relaxed_sample") and relaxed_start is None:
+            relaxed_start = frame_time
+        elif not frame.get("relaxed_sample") and relaxed_start is not None:
+            relaxed_intervals.append([round(relaxed_start, 3), round(prior_time, 3)])
+            relaxed_start = None
         prior_time = frame_time
-    if between_start is not None:
-        between_intervals.append([round(between_start, 3), round(prior_time, 3)])
-    if engaged_start is not None:
-        engaged_intervals.append([round(engaged_start, 3), round(prior_time, 3)])
+    if relaxed_start is not None:
+        relaxed_intervals.append([round(relaxed_start, 3), round(prior_time, 3)])
     state.stages["pose_timeline"] = {
         "status": "used",
         "backend": "rtmpose_coco17_in_tracker_owned_boxes",
@@ -198,16 +188,16 @@ def _continuous_pose_stage(
         "pose_records": timeline.sampled_boxes,
         "actors": sorted(timeline.records_by_actor),
         "pose_records_by_actor": {
-            actor: len(records)
-            for actor, records in sorted(timeline.records_by_actor.items())
+            actor: len(records) for actor, records in sorted(timeline.records_by_actor.items())
         },
         "frames_with_pose": sum(
-            int(frame.get("visible_players", 0) > 0) for frame in timeline.frames),
+            int(frame.get("visible_players", 0) > 0) for frame in timeline.frames
+        ),
         "frames_with_both_ends": sum(
-            set(frame.get("ends") or []) == {"near", "far"}
-            for frame in timeline.frames),
-        "between_like_intervals": between_intervals,
-        "engaged_like_intervals": engaged_intervals,
+            set(frame.get("ends") or []) == {"near", "far"} for frame in timeline.frames
+        ),
+        "relaxed_pose_sample_intervals": relaxed_intervals,
+        "point_state_decided_per_frame": False,
         "reused_player_detections": True,
         "audio_used": False,
         "ball_tracking_used": False,
@@ -216,7 +206,8 @@ def _continuous_pose_stage(
     serves = detect_serves(timeline, cfg)
     raw_actions, stroke_episodes = detect_strokes(timeline, serves, cfg)
     segments, points, reports = decode_pose_points(
-        timeline, serves, raw_actions, stroke_episodes, duration, cfg)
+        timeline, serves, raw_actions, stroke_episodes, duration, cfg
+    )
     state.stages["serve_pose"] = reports["serve_pose"]
     observations = state.stages["serve_pose"].get("observations") or []
     state.serve_times = np.asarray(
@@ -224,6 +215,8 @@ def _continuous_pose_stage(
         dtype=float,
     )
     publish_stage("serve_pose")
+    state.stages["live_windows"] = reports["live_windows"]
+    publish_stage("live_windows")
     state.stages["candidate_generation"] = reports["candidate_generation"]
     publish_stage("candidate_generation")
     state.stages["racket_actions"] = reports["racket_actions"]
@@ -235,7 +228,8 @@ def _continuous_pose_stage(
     state.used.extend(["shared_all_player_pose_timeline", "pose_tennis_state_decoder"])
     if cfg.skip_intro_s > 0:
         retained = [
-            (segment, point) for segment, point in zip(segments, points, strict=True)
+            (segment, point)
+            for segment, point in zip(segments, points, strict=True)
             if segment[0] >= cfg.skip_intro_s
         ]
         segments = [item[0] for item in retained]
@@ -271,7 +265,9 @@ def trim(
     state.frame_size = (int(info.width), int(info.height))
 
     def publish_signals(
-        current_stage: str, *, points: list[dict] | None = None,
+        current_stage: str,
+        *,
+        points: list[dict] | None = None,
         segments: list[Segment] | None = None,
     ) -> None:
         """Expose only completed, JSON-compatible evidence to an optional observer."""
@@ -284,13 +280,16 @@ def trim(
             "match": deepcopy(state.match_profile),
             "points": deepcopy(points or []),
             "segments": [
-                {"index": index, "start": round(start, 3), "end": round(end, 3),
-                 "duration": round(end - start, 3)}
+                {
+                    "index": index,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "duration": round(end - start, 3),
+                }
                 for index, (start, end) in enumerate(segments or [])
             ],
             "timings_seconds": {
-                name: round(float(seconds), 3)
-                for name, seconds in state.timings.items()
+                name: round(float(seconds), 3) for name, seconds in state.timings.items()
             },
         }
         try:
@@ -311,14 +310,16 @@ def trim(
     state.stages["court"] = {
         "status": "used" if state.court is not None else "unavailable",
         "source": "manual" if cfg.court_corners is not None else "automatic",
-        **({"corners": np.asarray(state.court.corners_img).round(3).tolist()}
-           if state.court is not None else {}),
+        **(
+            {"corners": np.asarray(state.court.corners_img).round(3).tolist()}
+            if state.court is not None
+            else {}
+        ),
     }
     publish_signals("court")
     cancel_check()
     with _timed(state, "visual", progress):
-        _visual_channels(
-            input_path, cfg, timeline, detect_players, state, progress, cancel_check)
+        _visual_channels(input_path, cfg, timeline, detect_players, state, progress, cancel_check)
     publish_signals("visual")
 
     if state.court is not None and state.frame_size is not None:
@@ -346,8 +347,8 @@ def trim(
     cancel_check()
     with _timed(state, "pose_timeline_and_decode", progress):
         segments, points = _continuous_pose_stage(
-            input_path, duration, state, cfg, progress, cancel_check,
-            publish_signals)
+            input_path, duration, state, cfg, progress, cancel_check, publish_signals
+        )
 
     kept = total_kept_seconds(segments)
     state.timings["analysis_total"] = time.perf_counter() - started

@@ -44,7 +44,7 @@ class RallyResult:
                 for name, seconds in self.timings.items()
             },
             "config": self.config,
-            "analysis_schema_version": "rally.pose_timeline_points.v3",
+            "analysis_schema_version": "rally.pose_window_points.v4",
             "match": self.match,
             "points": self.points,
             "segments": [

@@ -2239,6 +2239,13 @@ def _signal_payload(job: dict[str, Any]) -> dict[str, Any]:
             "overhead_ratio": raw.get("overhead_max_ratio"),
             "wrist_rise_span": raw.get("wrist_rise_span"),
             "hand_speed_body_s": raw.get("hand_speed_body_s"),
+            "serve_hand": raw.get("serve_hand"),
+            "follow_through_body_lengths": raw.get(
+                "follow_through_body_lengths"),
+            "follow_through_horizontal_body_lengths": raw.get(
+                "follow_through_horizontal_body_lengths"),
+            "arm_completion_evidence": bool(raw.get("arm_completion_evidence")),
+            "drive_phase_evidence": bool(raw.get("drive_phase_evidence")),
             "knee_bend_frames": int(raw.get("knee_bend_frames") or 0),
             "server_load_frames": int(raw.get("server_load_frames") or 0),
             "leg_drive_frames": int(raw.get("leg_drive_frames") or 0),
@@ -2274,7 +2281,8 @@ def _signal_payload(job: dict[str, Any]) -> dict[str, Any]:
     quality_stage = (stages.get("quality_control")
                      if isinstance(stages.get("quality_control"), dict) else {})
     stage_order = (
-        "audio", "court", "visual", "match_format", "pose_timeline", "serve_pose", "candidate_generation",
+        "audio", "court", "visual", "match_format", "pose_timeline", "serve_pose",
+        "live_windows", "candidate_generation",
         "racket_actions", "endpoints", "quality_control",
     )
     stage_summary = []
@@ -2299,6 +2307,7 @@ def _signal_payload(job: dict[str, Any]) -> dict[str, Any]:
         "visual": stages.get("visual") or {},
         "match_format": stages.get("match_format") or {},
         "pose_timeline": stages.get("pose_timeline") or {},
+        "live_windows": stages.get("live_windows") or {},
         "candidate_generation": stages.get("candidate_generation") or {},
         "players": match.get("roster") or [],
         "teams": match.get("teams") or [],

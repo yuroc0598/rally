@@ -767,6 +767,7 @@ function renderSignals(data) {
   }
 
   const timeline = data.pose_timeline || {};
+  const liveWindows = data.live_windows || {};
   const candidates = data.candidate_generation || {};
   const timelineView = $("#signalTimeline");
   timelineView.replaceChildren();
@@ -777,8 +778,12 @@ function renderSignals(data) {
       signalChip(`${timeline.pose_records ?? 0} player poses`),
       signalChip(`${(timeline.actors || []).length} actors`),
       signalChip(`${timeline.frames_with_both_ends ?? 0} two-sided frames`),
-      signalChip(`${(timeline.between_like_intervals || []).length} between-point runs`),
-      signalChip(`${(timeline.engaged_like_intervals || []).length} engaged-play runs`),
+      signalChip(`${liveWindows.window_seconds ?? 2}s sliding windows`),
+      signalChip(`${liveWindows.state_counts?.LIVE_SEED ?? 0} live seeds`,
+        liveWindows.state_counts?.LIVE_SEED ? "ok" : "bad"),
+      signalChip(`${liveWindows.state_counts?.LIVE_SUPPORT ?? 0} continuation windows`),
+      signalChip(`${liveWindows.state_counts?.BETWEEN_POINTS ?? 0} between-point windows`),
+      signalChip(`${liveWindows.state_counts?.UNKNOWN ?? 0} unknown windows`),
       signalChip(`${candidates.count ?? 0} point hypotheses`, candidates.count ? "ok" : "bad"),
       signalChip(timeline.reused_player_detections ? "tracker boxes reused" : "box source unknown"),
       signalChip(timeline.audio_used ? "audio used" : "audio disabled", timeline.audio_used ? "bad" : "ok"),
@@ -846,6 +851,10 @@ function renderSignals(data) {
     chips.append(
       signalChip(`sequence ${serve.serve_sequence ? "yes" : "no"}`, serve.serve_sequence ? "ok" : "bad"),
       signalChip(`wrist rise ${Number(serve.wrist_rise_span || 0).toFixed(2)} torso`, Number(serve.wrist_rise_span) > 0 ? "ok" : "bad"),
+      signalChip(`${serve.serve_hand || "?"} serving arm`),
+      signalChip(`follow ${Number(serve.follow_through_body_lengths || 0).toFixed(2)} torso`, serve.arm_completion_evidence ? "ok" : "bad"),
+      signalChip(`cross-body ${Number(serve.follow_through_horizontal_body_lengths || 0).toFixed(2)} torso`),
+      signalChip(`drive ${serve.drive_phase_evidence ? "yes" : "no"}`, serve.drive_phase_evidence ? "ok" : "bad"),
       signalChip(`server load ${serve.server_load_frames}`),
       signalChip(`bent knee ${serve.knee_bend_frames}`),
       signalChip(`leg drive ${serve.leg_drive_frames}`),
